@@ -68,7 +68,7 @@ def get_hip_config(config: Config, layer_idx: int):
         ]
 
         args = HiPAttentionArgs(
-            sliding_window_size=1024,
+            sliding_window_size=config.sliding_window,
             sink_token_size=1024,
             using_extend=False,
             need_apply_rope=False,
