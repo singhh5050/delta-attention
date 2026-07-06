@@ -1,0 +1,4 @@
+# Pinned commit of https://github.com/NVIDIA/RULER vendored at third_party/RULER.
+# Resolved from origin/HEAD on 2026-07-06. env/setup.sh checks out exactly this
+# commit on every run; change it only deliberately and re-run the smoke gates.
+38da79d79519ef87aa46ae804f838e1eab7f86d7

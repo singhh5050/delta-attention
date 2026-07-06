@@ -265,6 +265,10 @@ def main():
 
     load_hf(config)
 
+    # WP-0 §4 startup validation gate: no entrypoint may skip it.
+    from delta_attention.validation import server_startup_validation
+    server_startup_validation(config, STATE["model"].model, STATE["model"].tokenizer)
+
     import uvicorn
     uvicorn.run(app, port=config.port, log_level="info")
 

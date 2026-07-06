@@ -1,0 +1,151 @@
+# Delta Attention Extensions — Experiment Matrix
+# Agents execute rows verbatim. Editing values = human-only.
+# All configs: model=meta-llama/Llama-3.1-8B-Instruct, seed=0, temperature=0, max_new_tokens=128
+
+defaults: &defaults
+  attn_implementation: window        # Streaming-LLM-style: sink 1024 + sliding window
+  sliding_window: 2048
+  mode: delta                        # prefill mode
+  delta_lambda: 64                   # prefill gamma
+  decode_mode: dense                 # repo default (sdpa_rectangle)
+  stride_policy: fixed
+  context_lengths: [4096, 32768, 131072]
+  tasks: [niah_single_1, niah_single_2, niah_single_3, niah_multikey_1, niah_multikey_2,
+          niah_multikey_3, niah_multivalue, niah_multiquery, vt, fwe, qa_1, qa_2]
+  n_samples: 250
+  log_drift: false
+
+smoke_overrides:
+  context_lengths: [4096]
+  tasks: [niah_single_1, niah_multikey_2, qa_1]
+  n_samples: 50
+
+configs:
+  # ---- baselines (paper reproduction; our Table-1 columns) ----
+  - name: base_dense_fa2
+    <<: *defaults
+    attn_implementation: flash_attention_2
+    mode: none
+    expected_anchor: {4096: 96.7, 32768: 85.8, 131072: 73.2}   # paper Table 1, tolerance ±3pt at full samples
+  - name: base_sparse_only
+    <<: *defaults
+    mode: sparse-only
+    expected_anchor: {4096: 90.5, 32768: 30.3, 131072: 27.5}
+  - name: base_delta_g64
+    <<: *defaults
+    log_drift: true                  # prefill inter-anchor telemetry on
+    expected_anchor: {4096: 96.5, 32768: 81.3, 131072: 64.4}
+  - name: base_delta_g128
+    <<: *defaults
+    delta_lambda: 128
+
+  # ---- Track 3: delta decode (prefill fixed at delta g64) ----
+  - name: t3_sparse_decode
+    <<: *defaults
+    decode_mode: sparse
+  - name: t3_delta_dec_g8
+    <<: *defaults
+    decode_mode: delta
+    gamma_dec: 8
+    refresh_policy: fixed
+    log_drift: true
+  - name: t3_delta_dec_g16
+    <<: *defaults
+    decode_mode: delta
+    gamma_dec: 16
+    refresh_policy: fixed
+    log_drift: true
+  - name: t3_delta_dec_g32
+    <<: *defaults
+    decode_mode: delta
+    gamma_dec: 32
+    refresh_policy: fixed
+    log_drift: true
+  - name: t3_delta_dec_g64
+    <<: *defaults
+    decode_mode: delta
+    gamma_dec: 64
+    refresh_policy: fixed
+    log_drift: true
+  - name: t3_delta_dec_drift90
+    <<: *defaults
+    decode_mode: delta
+    refresh_policy: drift
+    drift_threshold: 0.90
+    gamma_dec_max: 128
+    log_drift: true
+  - name: t3_delta_dec_drift95
+    <<: *defaults
+    decode_mode: delta
+    refresh_policy: drift
+    drift_threshold: 0.95
+    gamma_dec_max: 128
+    log_drift: true
+  - name: t3_latency
+    <<: *defaults
+    decode_mode: delta
+    gamma_dec: 32
+    refresh_policy: fixed
+    log_drift: false               # clean latency numbers
+    context_lengths: [131072]
+    tasks: [niah_single_1]
+    n_samples: 25
+    max_new_tokens: 512
+
+  # ---- Track 1: dynamic stride (decode stays dense) ----
+  - name: t1_fixed_g32
+    <<: *defaults
+    delta_lambda: 32
+  - name: t1_fixed_g256
+    <<: *defaults
+    delta_lambda: 256
+  - name: t1_adaptive_thr90
+    <<: *defaults
+    stride_policy: adaptive
+    adapt_threshold: 0.90
+    gamma_min: 16
+    gamma_max: 256
+    adapt_chunk: 4096
+    log_drift: true
+  - name: t1_adaptive_thr95
+    <<: *defaults
+    stride_policy: adaptive
+    adapt_threshold: 0.95
+    gamma_min: 16
+    gamma_max: 256
+    adapt_chunk: 4096
+    log_drift: true
+  - name: t1_adaptive_thr98
+    <<: *defaults
+    stride_policy: adaptive
+    adapt_threshold: 0.98
+    gamma_min: 16
+    gamma_max: 256
+    adapt_chunk: 4096
+    log_drift: true
+
+  # ---- Track 2: post-training evals (checkpoints from WP-2; run after training) ----
+  - name: t2_ce_15k_g64
+    <<: *defaults
+    checkpoint: CHECKPOINT_PATH_CE_15K
+    log_drift: true
+  - name: t2_ce_15k_g128
+    <<: *defaults
+    delta_lambda: 128
+    checkpoint: CHECKPOINT_PATH_CE_15K
+  - name: t2_distill_15k_g64
+    <<: *defaults
+    checkpoint: CHECKPOINT_PATH_DISTILL_15K
+    log_drift: true
+  - name: t2_distill_15k_g128
+    <<: *defaults
+    delta_lambda: 128
+    checkpoint: CHECKPOINT_PATH_DISTILL_15K
+
+groups:
+  night1_all: [base_dense_fa2, base_sparse_only, base_delta_g64, t3_sparse_decode,
+               t3_delta_dec_g16, t3_delta_dec_g32, t3_delta_dec_g64, t1_adaptive_thr95, t1_fixed_g32]
+  t3_full:    [t3_sparse_decode, t3_delta_dec_g8, t3_delta_dec_g16, t3_delta_dec_g32,
+               t3_delta_dec_g64, t3_delta_dec_drift90, t3_delta_dec_drift95, t3_latency]
+  t1_full:    [t1_fixed_g32, base_delta_g64, base_delta_g128, t1_fixed_g256,
+               t1_adaptive_thr90, t1_adaptive_thr95, t1_adaptive_thr98]

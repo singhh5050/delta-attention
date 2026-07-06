@@ -65,3 +65,57 @@ options:
   primaryClass  = {cs.LG},
   url       = {https://arxiv.org/abs/2505.11254}
 }`
+
+## Extension harness (WP-0)
+
+Infrastructure for the extension work packages (see `docs/00_MASTER_PLAN.md`;
+the experiment matrix is `experiments.yaml` — its values are human-edited only).
+
+### Setup (fresh GPU instance)
+
+```bash
+export HF_TOKEN=...          # gated access to meta-llama/Llama-3.1-8B-Instruct
+export WANDB_ENTITY=... WANDB_PROJECT=...
+bash env/setup.sh            # installs pins, verifies hip-attn + HF access,
+                             # clones RULER at third_party/RULER.lock's pin,
+                             # ends by running Gate 1 (per-test PASS/FAIL)
+```
+
+### Running experiments
+
+```bash
+# Gate 2 — single-sample end-to-end through the real server + RULER client:
+python eval/smoke_e2e.py
+
+# Gate 3 — smoke mini-matrix (4K, 3 tasks, 50 samples) + assertions:
+python eval/run_matrix.py --configs night1_all --smoke
+python eval/check_smoke.py
+
+# Full runs (only after Gates 1–3 are green):
+python eval/run_matrix.py --configs night1_all
+python eval/run_matrix.py --configs t3_full,t1_full
+```
+
+`--configs` accepts config names, group names (from `experiments.yaml`
+`groups:`), or `all`. `--smoke` applies `smoke_overrides` verbatim — same code
+path, smaller numbers; there are no separate smoke scripts.
+
+### Adding a config
+
+Add a row under `configs:` in `experiments.yaml` (copy an existing row; use
+`<<: *defaults`). The runner passes YAML keys that exist as
+`delta_attention/config.py::Config` fields to the server as CLI flags; other
+keys are recorded in results and wandb. A config that needs a server feature
+that hasn't landed yet (e.g. `decode_mode: delta` before WP-3) is recorded as
+`status=unsupported` and skipped — it becomes runnable automatically once the
+Config field lands.
+
+### Where results land
+
+- `results/results.csv` — exactly one row per config run (schema:
+  `results/SCHEMA.md`); server logs under `results/server_logs/`.
+- wandb — one run per config (entity/project from `WANDB_ENTITY`/
+  `WANDB_PROJECT`), logging the mandatory metric set from the master plan.
+
+Every entrypoint runs the startup validation gate
+(`delta_attention/validation.py`) in its first minute and exits(1) on failure.
