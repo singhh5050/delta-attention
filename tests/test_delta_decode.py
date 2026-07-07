@@ -120,14 +120,16 @@ def test_t7_gamma1_matches_dense_decode(model_and_tokenizer):
 
     _reset(model)
     with _decode_override(model.config, decode_mode="dense"):
-        ids_dense = _generate_ids(model, tokenizer, prompt)
+        ids_dense = _generate_ids(model, tokenizer, prompt, max_new_tokens=48)
     _reset(model)
     with _decode_override(model.config, decode_mode="delta", gamma_dec=1,
                           refresh_policy="fixed"):
-        ids_delta = _generate_ids(model, tokenizer, prompt)
+        ids_delta = _generate_ids(model, tokenizer, prompt, max_new_tokens=48)
 
     assert ids_delta == ids_dense, (
         f"T7: gamma_dec=1 diverged from dense decode\n{ids_dense}\n{ids_delta}")
+    # 48 tokens: the 36-char UUID needs ~20 tokens plus preamble (32 was
+    # enough for token-equality but truncated the needle by 2 chars)
     assert NIAH_UUID in tokenizer.decode(ids_delta)
 
 
