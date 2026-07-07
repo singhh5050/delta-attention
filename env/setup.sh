@@ -35,10 +35,24 @@ if [[ -n "${VIRTUAL_ENV:-}" || -n "${CONDA_PREFIX:-}" ]]; then
   log "using already-active environment: ${VIRTUAL_ENV:-$CONDA_PREFIX}"
   PY=python
 else
-  PY_BOOT="$(command -v python3.12 || command -v python3.11 || command -v python3.10 || command -v python3 || true)"
-  [[ -n "${PY_BOOT}" ]] || die "no python3 found"
-  "${PY_BOOT}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
-    || die "python 3.10+ required, found $(${PY_BOOT} --version)"
+  # requirements.txt pins (e.g. contourpy==1.3.3) require python >= 3.11.
+  find_py() { command -v python3.12 || command -v python3.11 || true; }
+  PY_BOOT="$(find_py)"
+  if [[ -z "${PY_BOOT}" ]] && command -v apt-get >/dev/null; then
+    log "no python3.11+ found; installing python3.11 via deadsnakes PPA"
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq software-properties-common
+    sudo add-apt-repository -y ppa:deadsnakes/ppa
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
+    PY_BOOT="$(find_py)"
+  fi
+  [[ -n "${PY_BOOT}" ]] || die "python 3.11+ required (requirements.txt pins demand it) and could not be installed"
+  # a stale venv built with an older python must be rebuilt
+  if [[ -x "${VENV_DIR}/bin/python" ]] && ! "${VENV_DIR}/bin/python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+    log "removing stale venv (python < 3.11)"
+    rm -rf "${VENV_DIR}"
+  fi
   if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
     log "creating venv at ${VENV_DIR} with ${PY_BOOT}"
     "${PY_BOOT}" -m venv "${VENV_DIR}"
