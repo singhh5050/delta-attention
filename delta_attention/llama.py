@@ -600,6 +600,12 @@ class LlamaAttention(nn.Module):
         # take difference
         dense_sparse_diff = dense_attn_output - sparse_out_diff_states
 
+        if getattr(self.config, "log_drift", False):
+            from .drift import drift_summary
+
+            # consumed (and cleared) by model_wrapper after each generate call
+            self._drift_stats = drift_summary(dense_sparse_diff, self.layer_idx, lambd, s)
+
         dense_sparse_diff = dense_sparse_diff.reshape(b, s_p // lambd, 1, h, d)
         sparse_attn_output = sparse_attn_output.reshape(b, s_p // lambd, lambd, h, d)
 

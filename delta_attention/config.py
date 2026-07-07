@@ -30,6 +30,11 @@ class Config:
     delta_lambda: int = 64          # delta lambda window
     sliding_window: int = 2048      # sliding window size
 
+    # prefill drift telemetry (delta_interanchor_cos). Presence-only CLI flag;
+    # per-request summaries are appended to the JSONL file named by the
+    # DELTA_DRIFT_LOG env var (see delta_attention/drift.py).
+    log_drift: bool = False
+
     # when using the hip_attention interface as the sparse attention method,
     # the first few layers are set as dense as well as a few dense tokens 
     # before starting dense decode.

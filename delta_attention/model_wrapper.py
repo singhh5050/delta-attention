@@ -26,6 +26,7 @@ class HuggingFaceModel:
         self.model.config.sliding_window = config.sliding_window
         self.model.config.hip_attention_dense_layers = config.hip_attention_dense_layers
         self.model.config.hip_attention_last_dense = config.hip_attention_last_dense
+        self.model.config.log_drift = config.log_drift
 
         self.tokenizer = tokenizer
 
@@ -37,6 +38,26 @@ class HuggingFaceModel:
             self.tokenizer.padding_side = "left"
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+    def _flush_drift_stats(self) -> None:
+        """Append per-layer drift summaries (set by delta_forward when
+        log_drift is on) to the DELTA_DRIFT_LOG sidecar, then clear them."""
+        drift_path = os.environ.get("DELTA_DRIFT_LOG")
+        collected = []
+        for m in self.model.modules():
+            stats = getattr(m, "_drift_stats", None)
+            if stats is not None:
+                collected.append(stats)
+                m._drift_stats = None
+        if not collected:
+            return
+        if not drift_path:
+            return  # telemetry computed but no sink configured (direct server use)
+        import json
+
+        with open(drift_path, "a", encoding="utf-8") as f:
+            for stats in sorted(collected, key=lambda s: s["layer"]):
+                f.write(json.dumps(stats) + "\n")
 
     def __call__(self, prompt: str, **kwargs) -> dict:
         return self.process_batch(prompt, **kwargs)[0]
@@ -58,6 +79,7 @@ class HuggingFaceModel:
             generated_texts = self.tokenizer.batch_decode(
                 generated_ids, skip_special_tokens=True
             )
+            self._flush_drift_stats()
 
         results = []
 

@@ -268,8 +268,15 @@ def build_server_cmd(
 
     cmd = [sys.executable, str(REPO_ROOT / "server_hf.py")]
     for key, val in passed.items():
-        # argparse_dataclass exposes fields as --dashed-names (see README usage block)
-        cmd += [f"--{key.replace('_', '-')}", str(val)]
+        # argparse_dataclass exposes fields as --dashed-names (see README usage
+        # block). Bools are presence-only store_true flags: emit the flag for
+        # True, nothing for False ("--log-drift True" is a parse error).
+        flag = f"--{key.replace('_', '-')}"
+        if isinstance(val, bool):
+            if val:
+                cmd.append(flag)
+        else:
+            cmd += [flag, str(val)]
     return cmd, passed, unknown, notes
 
 
@@ -278,11 +285,13 @@ def build_server_cmd(
 # ===========================================================================
 
 class ServerHandle:
-    def __init__(self, proc: subprocess.Popen, port: int, gpu: str, log_path: Path):
+    def __init__(self, proc: subprocess.Popen, port: int, gpu: str, log_path: Path,
+                 drift_path: Optional[Path] = None):
         self.proc = proc
         self.port = port
         self.gpu = gpu
         self.log_path = log_path
+        self.drift_path = drift_path
         self.url = f"http://127.0.0.1:{port}"
 
 
@@ -319,6 +328,11 @@ def start_server(row: Dict[str, Any], gpu: str, server_fields: frozenset,
     log_path = log_dir / f"{row['name']}_gpu{gpu}_port{port}.log"
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = gpu
+    drift_path = None
+    if row.get("log_drift"):
+        drift_path = log_dir / f"{row['name']}_gpu{gpu}_port{port}_drift.jsonl"
+        drift_path.unlink(missing_ok=True)
+        env["DELTA_DRIFT_LOG"] = str(drift_path)
     logf = open(log_path, "w", encoding="utf-8")
     proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
                             env=env, cwd=str(REPO_ROOT))
@@ -326,7 +340,7 @@ def start_server(row: Dict[str, Any], gpu: str, server_fields: frozenset,
         print(f"[run_matrix] NOTE: {n}")
     print(f"[run_matrix] started server for {row['name']!r} on GPU {gpu} port {port} "
           f"(pid {proc.pid}, log {log_path})")
-    return ServerHandle(proc, port, gpu, log_path), unknown, notes
+    return ServerHandle(proc, port, gpu, log_path, drift_path), unknown, notes
 
 
 def wait_healthy(handle: ServerHandle, timeout_s: int = SERVER_STARTUP_TIMEOUT_S) -> None:
@@ -368,6 +382,39 @@ def _log_tail(path: Path, n: int = 30) -> str:
         return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-n:])
     except OSError:
         return "<log unreadable>"
+
+
+def log_drift_telemetry(run, handles: Sequence[ServerHandle]) -> Optional[Dict[str, float]]:
+    """Ingest DELTA_DRIFT_LOG sidecars and log per-layer delta_interanchor_cos
+    histograms + means to wandb. Returns {layer: mean} or None if no telemetry."""
+    from delta_attention.drift import aggregate_drift, hist_bin_edges
+
+    lines: List[Dict[str, Any]] = []
+    for h in handles:
+        if h.drift_path is None or not h.drift_path.exists():
+            continue
+        with open(h.drift_path, "r", encoding="utf-8") as f:
+            lines += [json.loads(ln) for ln in f if ln.strip()]
+    if not lines:
+        return None
+    agg = aggregate_drift(lines)
+    edges = hist_bin_edges()
+    payload: Dict[str, Any] = {}
+    try:
+        import wandb  # noqa: PLC0415
+        for layer, a in sorted(agg.items()):
+            payload[f"delta_interanchor_cos/hist_layer_{layer:02d}"] = wandb.Histogram(
+                np_histogram=(a["hist"], edges))
+    except ImportError:
+        pass  # wandb_init already enforced wandb presence; keep means regardless
+    means = {layer: a["mean"] for layer, a in sorted(agg.items())}
+    for layer, mean in means.items():
+        payload[f"delta_interanchor_cos/mean_layer_{layer:02d}"] = mean
+    run.log(payload)
+    print(f"[run_matrix] drift telemetry: {sum(a['requests'] for a in agg.values())} "
+          f"layer-records over {len(agg)} layers; per-layer mean cos "
+          f"min={min(means.values()):.4f} max={max(means.values()):.4f}")
+    return means
 
 
 def count_ooms(handles: Sequence[ServerHandle]) -> int:
@@ -574,6 +621,10 @@ def run_config(row: Dict[str, Any], smoke: bool, gpus: List[str],
                 })
                 print(f"[run_matrix] {row['name']} ctx={ctx} task={task}: "
                       f"acc={acc:.2f} n={n_ok} failures={failures} ({cell_secs:.1f}s)")
+
+        drift_means = log_drift_telemetry(run, handles)
+        if drift_means is not None:
+            result_extra["drift_mean_by_layer"] = drift_means
 
         accs = [c["accuracy"] for c in per_task]
         result.update(
