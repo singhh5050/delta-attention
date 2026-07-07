@@ -35,6 +35,15 @@ class Config:
     # DELTA_DRIFT_LOG env var (see delta_attention/drift.py).
     log_drift: bool = False
 
+    # WP-1 dynamic stride (delta_attention/stride.py). "fixed" reproduces the
+    # paper's uniform gamma; "adaptive" re-plans the anchor stride per
+    # adapt_chunk rows from the measured inter-anchor delta cosine.
+    stride_policy: str = "fixed"        # ["fixed", "adaptive"]
+    gamma_min: int = 16
+    gamma_max: int = 256
+    adapt_chunk: int = 4096
+    adapt_threshold: float = 0.95
+
     # when using the hip_attention interface as the sparse attention method,
     # the first few layers are set as dense as well as a few dense tokens 
     # before starting dense decode.
