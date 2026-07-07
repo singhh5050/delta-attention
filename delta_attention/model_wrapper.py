@@ -32,6 +32,11 @@ class HuggingFaceModel:
         self.model.config.gamma_max = config.gamma_max
         self.model.config.adapt_chunk = config.adapt_chunk
         self.model.config.adapt_threshold = config.adapt_threshold
+        self.model.config.decode_mode = config.decode_mode
+        self.model.config.gamma_dec = config.gamma_dec
+        self.model.config.refresh_policy = config.refresh_policy
+        self.model.config.drift_threshold = config.drift_threshold
+        self.model.config.gamma_dec_max = config.gamma_dec_max
 
         self.tokenizer = tokenizer
 
@@ -55,6 +60,11 @@ class HuggingFaceModel:
                 if stats is not None:
                     collected.append(stats)
                     setattr(m, attr, None)
+            pts = getattr(m, "_dec_drift_points", None)
+            if pts:
+                collected.append({"kind": "decode_drift",
+                                  "layer": int(m.layer_idx), "points": pts})
+                m._dec_drift_points = None
         if not collected:
             return
         if not drift_path:

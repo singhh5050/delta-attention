@@ -3,7 +3,8 @@
 # Usage: bash eval/run_wp.sh <wp1|wp2|wp3>
 # Writes one line per stage to ~/wp_status; designed for nohup.
 set -uo pipefail
-WP="${1:?usage: run_wp.sh <wp1|wp2|wp3>}"
+WP="${1:?usage: run_wp.sh <wp1|wp2|wp3|eval32k>}"
+SMOKE=""; SMOKE_RAW=""
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 STATUS=~/wp_status
@@ -17,6 +18,8 @@ case "$WP" in
        SMOKE="t3_sparse_decode,t3_delta_dec_g16,t3_delta_dec_g64" ;;
   wp2) TESTS="tests/test_flex_delta.py"
        SMOKE="" ;;  # WP-2's smoke is the T13/T14 gate itself; training comes later
+  eval32k) TESTS="tests/test_variable_stride.py tests/test_delta_decode.py"
+       SMOKE_RAW="poc32k" ;;  # 32K rows run as-written (no --smoke shrink)
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -35,6 +38,12 @@ if [ -n "$SMOKE" ]; then
   stage "wp-smoke:running"
   python eval/run_matrix.py --configs "$SMOKE" --smoke || { stage "wp-smoke:FAILED"; exit 1; }
   stage "wp-smoke:PASS"
+fi
+
+if [ -n "$SMOKE_RAW" ]; then
+  stage "wp-eval:running"
+  python eval/run_matrix.py --configs "$SMOKE_RAW" || { stage "wp-eval:FAILED"; exit 1; }
+  stage "wp-eval:PASS"
 fi
 
 stage "ALL-DONE"

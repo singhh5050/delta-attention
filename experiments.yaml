@@ -142,7 +142,70 @@ configs:
     delta_lambda: 128
     checkpoint: CHECKPOINT_PATH_DISTILL_15K
 
+  # ---- PoC-32K (user-approved 2026-07-07): first real-signal runs for all
+  # inference tracks at the context length where drift is smooth (cos 0.6-0.7).
+  # thr60 is the data-informed adaptive threshold (measured drift means);
+  # thr95 (the original spec value) is retained as the collapse-to-min arm.
+  - name: p32_dense_fa2
+    <<: *defaults
+    attn_implementation: flash_attention_2
+    mode: none
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+  - name: p32_delta_g64
+    <<: *defaults
+    log_drift: true
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+  - name: p32_fixed_g256
+    <<: *defaults
+    delta_lambda: 256
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+  - name: p32_adaptive_thr60
+    <<: *defaults
+    stride_policy: adaptive
+    adapt_threshold: 0.60
+    gamma_min: 16
+    gamma_max: 256
+    adapt_chunk: 4096
+    log_drift: true
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+  - name: p32_adaptive_thr95
+    <<: *defaults
+    stride_policy: adaptive
+    adapt_threshold: 0.95
+    gamma_min: 16
+    gamma_max: 256
+    adapt_chunk: 4096
+    log_drift: true
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+  - name: p32_sparse_decode
+    <<: *defaults
+    decode_mode: sparse
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+  - name: p32_delta_dec_g16
+    <<: *defaults
+    decode_mode: delta
+    gamma_dec: 16
+    refresh_policy: fixed
+    log_drift: true
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+
 groups:
+  poc32k:     [p32_dense_fa2, p32_delta_g64, p32_fixed_g256, p32_adaptive_thr60,
+               p32_adaptive_thr95, p32_sparse_decode, p32_delta_dec_g16]
   night1_all: [base_dense_fa2, base_sparse_only, base_delta_g64, t3_sparse_decode,
                t3_delta_dec_g16, t3_delta_dec_g32, t3_delta_dec_g64, t1_adaptive_thr95, t1_fixed_g32]
   t3_full:    [t3_sparse_decode, t3_delta_dec_g8, t3_delta_dec_g16, t3_delta_dec_g32,
