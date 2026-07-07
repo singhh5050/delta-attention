@@ -188,9 +188,13 @@ if [[ -d "${JSON_DIR}" ]]; then
   fi
   if [[ ! -f "${JSON_DIR}/squad.json" && -f "${JSON_DIR}/download_qa_dataset.sh" ]]; then
     log "downloading RULER QA datasets (squad/hotpotqa)"
-    (cd "${JSON_DIR}" && bash download_qa_dataset.sh) \
-      || die "RULER QA dataset download failed — qa_1/qa_2 generation will not work"
+    (cd "${JSON_DIR}" && bash download_qa_dataset.sh) || true
   fi
+  # squad feeds qa_1 (in the smoke set) — required. hotpotqa feeds qa_2 only
+  # (full matrix), and its primary host (curtis.ml.cmu.edu) is flaky — warn.
+  [[ -f "${JSON_DIR}/squad.json" ]] || die "squad.json missing — qa_1 generation will not work"
+  [[ -f "${JSON_DIR}/hotpotqa.json" ]] \
+    || log "WARN: hotpotqa.json missing — qa_2 unavailable (not needed for the PoC smoke set); re-run setup later to retry"
 else
   die "RULER layout unexpected: ${JSON_DIR} missing. Upstream changed; update env/setup.sh and eval/ruler_client.py together."
 fi
