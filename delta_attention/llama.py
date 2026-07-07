@@ -509,6 +509,13 @@ class LlamaAttention(nn.Module):
 
         b, _, s, d = query_states.size()
 
+        # WP-3: route single-token decode steps to the sparse/delta decode
+        # path. Prefill never arrives here (it runs under window/hip/FA2).
+        if s == 1 and getattr(self.config, "decode_mode", "dense") != "dense":
+            return self.delta_decode_forward(
+                module, query_states, key_states, value_states, scaling=scaling
+            )
+
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
@@ -527,6 +534,94 @@ class LlamaAttention(nn.Module):
         )
         attn_output = attn_output.transpose(1, 2).contiguous()
         return attn_output, None
+
+    def _decode_sparse_row(self, q, k, v, scaling):
+        """Single decode row under the StreamingLLM pattern: attend to the
+        sink tokens (first 1024) + the last sliding_window keys of the cache,
+        with softmax over exactly that set. k/v are already repeat_kv'd."""
+        n_keys = k.size(2)
+        sink = 1024
+        window = int(self.config.sliding_window)
+        if n_keys <= sink + window:
+            k_sel, v_sel = k, v
+        else:
+            k_sel = torch.cat((k[:, :, :sink], k[:, :, n_keys - window:]), dim=2)
+            v_sel = torch.cat((v[:, :, :sink], v[:, :, n_keys - window:]), dim=2)
+        return sdpa(q, k_sel, v_sel, is_causal=False, scale=scaling)
+
+    def delta_decode_forward(
+        self, module, query_states, key_states, value_states, scaling=1.0, **kwargs
+    ):
+        """WP-3: decode step with sparse attention + cached delta correction.
+
+        Per layer state (reset by _sample at every new generate call):
+          _dec_state = {last_delta, steps (since anchor), last_sparse}
+        Anchor when: no delta yet | fixed policy & steps >= gamma_dec |
+        drift policy & cos(sparse_t, sparse_{t-1}) < drift_threshold |
+        steps >= gamma_dec_max (starvation guard). Anchors output the exact
+        dense row (mirroring prefill anchor exactness); other steps output
+        sparse + cached delta. Nothing is ever evicted from the KV cache.
+        """
+        assert query_states.size(0) == 1, "sparse/delta decode supports batch size 1 only"
+        mode = self.config.decode_mode
+        assert mode in ("sparse", "delta"), mode
+
+        q = query_states  # [1, h, 1, d]
+        k = repeat_kv(key_states, self.num_key_value_groups)
+        v = repeat_kv(value_states, self.num_key_value_groups)
+        sparse_out = self._decode_sparse_row(q, k, v, scaling)
+
+        if mode == "sparse":
+            return sparse_out.transpose(1, 2).contiguous(), None
+
+        st = getattr(self, "_dec_state", None) or {
+            "last_delta": None, "steps": 0, "last_sparse": None}
+        log_drift = bool(getattr(self.config, "log_drift", False))
+        policy = getattr(self.config, "refresh_policy", "fixed")
+
+        def _cos(a, b):
+            return torch.nn.functional.cosine_similarity(
+                a.flatten().float(), b.flatten().float(), dim=0).item()
+
+        # steps_since_anchor for THIS token: the step right after an anchor is 1
+        if st["last_delta"] is None:
+            anchor, cur = True, 0
+        else:
+            cur = st["steps"] + 1
+            anchor = cur >= int(getattr(self.config, "gamma_dec_max", 128))
+            if policy == "fixed" and cur >= int(self.config.gamma_dec):
+                anchor = True
+            if not anchor and policy == "drift" and st["last_sparse"] is not None \
+                    and _cos(sparse_out, st["last_sparse"]) < float(self.config.drift_threshold):
+                anchor = True
+
+        # the dense row is needed at anchors, and every step in measurement mode
+        dense_out = None
+        if anchor or log_drift:
+            dense_out = sdpa(q, k, v, is_causal=False, scale=scaling)
+
+        if anchor:
+            st["last_delta"] = dense_out - sparse_out
+            st["steps"] = 0
+            out = dense_out
+        else:
+            out = sparse_out + st["last_delta"]
+            st["steps"] = cur
+
+        if log_drift:
+            true_delta = dense_out - sparse_out
+            pts = getattr(self, "_dec_drift_points", None) or []
+            pts.append({
+                "steps_since_anchor": int(cur),
+                "anchor": bool(anchor),
+                "drift_cos": _cos(true_delta, st["last_delta"]),
+                "applied_vs_true_cos": _cos(out, dense_out),
+            })
+            self._dec_drift_points = pts
+
+        st["last_sparse"] = sparse_out
+        self._dec_state = st
+        return out.transpose(1, 2).contiguous(), None
 
     def delta_forward(
         self,

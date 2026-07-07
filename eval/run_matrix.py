@@ -395,6 +395,30 @@ def log_drift_telemetry(run, handles: Sequence[ServerHandle]) -> Optional[Dict[s
             continue
         with open(h.drift_path, "r", encoding="utf-8") as f:
             lines += [json.loads(ln) for ln in f if ln.strip()]
+    # WP-3 decode-drift point records share the sidecar (kind == "decode_drift")
+    dec_lines = [ln for ln in lines if ln.get("kind") == "decode_drift"]
+    lines = [ln for ln in lines if ln.get("kind") is None]
+    if dec_lines:
+        rows = [[ln["layer"], p["steps_since_anchor"], p["drift_cos"],
+                 p["applied_vs_true_cos"], p["anchor"]]
+                for ln in dec_lines for p in ln["points"]]
+        n_anchors = sum(1 for r in rows if r[4])
+        cap = 20000
+        if len(rows) > cap:
+            stride = len(rows) // cap + 1
+            print(f"[run_matrix] decode drift: downsampling {len(rows)} points by 1/{stride}")
+            rows = rows[::stride]
+        try:
+            import wandb  # noqa: PLC0415
+            run.log({
+                "decode_drift_points": wandb.Table(
+                    columns=["layer", "steps_since_anchor", "drift_cos",
+                             "applied_vs_true_cos", "anchor"], data=rows),
+                "decode_anchor_rate_per_100": 100.0 * n_anchors / max(
+                    sum(len(ln["points"]) for ln in dec_lines), 1),
+            })
+        except ImportError:
+            pass
     if not lines:
         return None
     agg = aggregate_drift(lines)

@@ -35,6 +35,15 @@ class Config:
     # DELTA_DRIFT_LOG env var (see delta_attention/drift.py).
     log_drift: bool = False
 
+    # WP-3 delta decode: sparse decode with a periodically refreshed cached
+    # delta (docs/WP3_delta_decode.md). "dense" is the repo's original
+    # sdpa_rectangle decode. Batch size 1 only for sparse/delta.
+    decode_mode: str = "dense"       # ["dense", "sparse", "delta"]
+    gamma_dec: int = 32              # anchor stride under refresh_policy=fixed
+    refresh_policy: str = "fixed"    # ["fixed", "drift"]
+    drift_threshold: float = 0.95    # drift trigger: cos of consecutive sparse rows
+    gamma_dec_max: int = 128         # hard anchor cap so drift mode can't starve
+
     # when using the hip_attention interface as the sparse attention method,
     # the first few layers are set as dense as well as a few dense tokens 
     # before starting dense decode.
