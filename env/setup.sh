@@ -78,9 +78,11 @@ ${PY} -m pip install "${FA_WHL}" \
        ${PY} -m pip install flash_attn==2.8.3 --no-build-isolation; }
 ${PY} -m pip install -r "${REPO_ROOT}/requirements.txt" --no-build-isolation
 # Harness extras not in the paper repo's pin list (additive; never upgrades pins):
-#   wandb                    — mandatory metric sink (master plan)
-#   wonderwords html2text nltk tenacity — RULER synthetic data generation deps
-${PY} -m pip install wandb wonderwords html2text nltk tenacity
+#   wandb — mandatory metric sink (master plan)
+#   RULER synthetic data-gen deps (audited against the pinned commit's imports):
+#   wonderwords html2text nltk tenacity beautifulsoup4 (essay download),
+#   scipy (freq_words_extraction uses scipy.special.zeta)
+${PY} -m pip install wandb wonderwords html2text nltk tenacity beautifulsoup4 scipy
 
 ${PY} - <<'EOF'
 import torch, triton, transformers, hip_attn  # noqa: F401
@@ -193,7 +195,9 @@ else
   die "RULER layout unexpected: ${JSON_DIR} missing. Upstream changed; update env/setup.sh and eval/ruler_client.py together."
 fi
 
-${PY} -c "import nltk; nltk.download('punkt', quiet=True)" || true
+# niah/vt use nltk sent_tokenize, which needs punkt AND punkt_tab (prepare.py
+# only auto-downloads them when punkt itself is missing — get both up front).
+${PY} -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_tab', quiet=True)" || true
 
 # ------------------------------------------------------------ 5. Gate 1
 log "running Gate 1: pytest tests/test_math_identities.py -v (per-test PASS/FAIL below)"
