@@ -15,11 +15,14 @@ Everything stays in the graph; ``detach_delta=True`` exists ONLY as the
 ablation arm (gradient flows through the sparse path but not the reused
 correction).
 
-Equivalence caveat (T13): hip-attn's window path applies the sliding window
-at *block* granularity (block_size_q/k), so a handful of extra keys near the
-window edge are attended relative to this exact mask. If T13 fails, the fix
-is to reconcile THIS mask_mod to hip's block-granular semantics — never to
-loosen the tolerance.
+Mask semantics (reconciled to hip-attn 1.2.9, attention_extend_bsa.py,
+BLOCKWISE_MASKING=1 default): within each query block of Q_BLOCK rows the
+window is anchored at the block's LAST row (`seq_len = max(pos_tdst)`), so a
+key is attended iff  causal AND (kv < sink OR kv + window > block_last_row).
+Earlier rows in a block therefore see up to Q_BLOCK-1 fewer of their oldest
+window keys than a per-row window would give. This was verified against the
+kernel source after T13 initially failed at mean cos 0.9938 with a per-row
+window mask. If T13 regresses again: reconcile THIS mask, not the tolerance.
 """
 
 from __future__ import annotations
@@ -41,12 +44,20 @@ def _get_flex():
     return _flex
 
 
+Q_BLOCK = 64  # hip's block_sparse_block_size_q (config.get_hip_config, last stage)
+
+
 @functools.lru_cache(maxsize=8)
 def get_block_mask(s: int, window: int, sink: int, device: str):
-    """Block mask for causal StreamingLLM sparsity; cached per (s, window, sink)."""
+    """Causal StreamingLLM mask with hip's block-anchored window; cached.
+
+    Window anchored at the last row of each Q_BLOCK query block, matching
+    hip-attn's BLOCKWISE_MASKING kernel semantics (see module docstring).
+    """
 
     def mask_mod(b, h, q_idx, kv_idx):
-        return (q_idx >= kv_idx) & ((kv_idx < sink) | (q_idx - kv_idx < window))
+        block_last = (q_idx // Q_BLOCK) * Q_BLOCK + (Q_BLOCK - 1)
+        return (q_idx >= kv_idx) & ((kv_idx < sink) | (kv_idx + window > block_last))
 
     return create_block_mask(mask_mod, B=None, H=None, Q_LEN=s, KV_LEN=s, device=device)
 
@@ -74,6 +85,9 @@ def delta_forward_train(
     Returns [b, s, h, d] to match inference delta_forward's output layout.
     """
     b, h, s, d = q.shape
+    assert s % Q_BLOCK == 0, (
+        f"s={s} must be a multiple of {Q_BLOCK} (hip block-anchored window "
+        "semantics are only reconciled for full query blocks)")
     if k.size(1) != h:
         rep = h // k.size(1)
         k = k.repeat_interleave(rep, dim=1)
