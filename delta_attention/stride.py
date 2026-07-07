@@ -62,17 +62,26 @@ def next_gamma(cos_mean: float, gamma_c: int, *, threshold: float,
     return gamma_c
 
 
+def _sparse_pass_cost(s: int, window: int, sink: int) -> int:
+    """Causally-clipped key count of the StreamingLLM pass: row i attends
+    min(i+1, window+sink) keys. The uncapped (window+sink)*s estimate goes
+    NEGATIVE at short contexts (observed at 4K in WP-1 run 1)."""
+    w = min(window + sink, s)
+    ramp = w * (w - 1) // 2          # rows 0..w-2 attend i+1 keys
+    flat = (s - (w - 1)) * w         # remaining rows attend w keys
+    return ramp + flat
+
+
 def effective_sparsity(anchor_idx, s: int, window: int, sink: int = 1024) -> float:
-    """1 - (window*s + sum of anchor row costs) / (s^2 / 2).
+    """1 - (clipped window cost + sum of anchor row costs) / (s^2 / 2).
 
     Anchor row i attends to i+1 keys (causal dense row). Comparable across
     fixed and adaptive configs; the dense tail rows are included by the
     caller via ``anchor_idx`` covering them.
     """
     dense_cost = int(anchor_idx.sum().item()) + anchor_idx.numel()  # sum(i+1)
-    sparse_cost = min(window + sink, s) * s
     full = s * s / 2.0
-    return 1.0 - (sparse_cost + dense_cost) / full
+    return 1.0 - (_sparse_pass_cost(s, window, sink) + dense_cost) / full
 
 
 def plan_chunks(s_p: int, chunk: int) -> List[Tuple[int, int]]:
@@ -91,6 +100,5 @@ def uniform_effective_sparsity(s: int, gamma: int, window: int, sink: int = 1024
     n = (s_p + gamma - 1) // gamma
     anchor_cost = gamma * n * (n - 1) // 2 + n              # sum(i+1) over anchors
     tail_cost = (s * (s + 1) - s_p * (s_p + 1)) // 2        # sum(i+1) over tail rows
-    sparse_cost = min(window + sink, s) * s
     full = s * s / 2.0
-    return 1.0 - (sparse_cost + anchor_cost + tail_cost) / full
+    return 1.0 - (_sparse_pass_cost(s, window, sink) + anchor_cost + tail_cost) / full

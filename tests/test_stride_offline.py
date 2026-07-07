@@ -36,6 +36,7 @@ def test_uniform_effective_sparsity():
     # WP1's formula also charges the window pass (unlike the paper's 98.5%
     # queries-only figure): at 131K the window costs ~4.7%, anchors ~1.6%.
     assert 0.90 < es[64] < 0.96
-    # at 4K with a 2K window+sinks, sparsity is low — matches why 4K can't
+    # at 4K with a 2K window+sinks, sparse+anchors costs ~as much as dense —
+    # near-zero (can dip slightly negative); matches why 4K can't
     # discriminate gammas (PoC run 1 observation)
-    assert uniform_effective_sparsity(4096, 64, 2048) < 0.4
+    assert -0.1 < uniform_effective_sparsity(4096, 64, 2048) < 0.1
