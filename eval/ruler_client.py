@@ -49,7 +49,7 @@ MODEL_STR = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_TEMPLATE = "meta-llama3"  # RULER's llama-3 chat template key
 
 _PREPARE = RULER_DIR / "scripts" / "data" / "prepare.py"
-_SYNTHETIC_YAML = RULER_DIR / "scripts" / "data" / "synthetic.yaml"
+_SYNTHETIC_YAML = RULER_DIR / "scripts" / "synthetic.yaml"  # prepare.py reads ../synthetic.yaml
 _TEMPLATE_PY = RULER_DIR / "scripts" / "data" / "template.py"
 _EVAL_CONSTANTS = RULER_DIR / "scripts" / "eval" / "synthetic" / "constants.py"
 _EVALUATE_PY = RULER_DIR / "scripts" / "eval" / "evaluate.py"
@@ -133,16 +133,40 @@ def metric_fn_for(task: str):
 
 
 def postprocess_pred_fn():
-    """RULER's own prediction postprocessing (scripts/eval/evaluate.py)."""
-    mod = _import_by_path("_ruler_evaluate", _require(_EVALUATE_PY, "evaluate.py"))
-    fn = getattr(mod, "postprocess_pred", None)
-    if fn is None:
+    """RULER's own prediction postprocessing (scripts/eval/evaluate.py).
+
+    evaluate.py imports nemo at module level (not installed — huge dep), so we
+    extract the self-contained ``postprocess_pred`` function from its source
+    via AST and exec just that. Still RULER's logic verbatim, not a rewrite.
+    Signature at the pinned commit: postprocess_pred(predict_str, task_config)
+    (task_config is unused in the body; we pass an empty dict).
+    """
+    import ast
+    import re  # noqa: F401 - needed by the exec'd function body
+
+    src = _require(_EVALUATE_PY, "evaluate.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn_node = next(
+        (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "postprocess_pred"),
+        None,
+    )
+    if fn_node is None:
         raise RulerSetupError(
             f"{_EVALUATE_PY} has no postprocess_pred — RULER internals changed. "
             "Point ruler_client.postprocess_pred_fn at the new location; do NOT "
             "reimplement the heuristic."
         )
-    return fn
+    ns: Dict[str, Any] = {"re": re}
+    exec(compile(ast.Module(body=[fn_node], type_ignores=[]), str(_EVALUATE_PY), "exec"), ns)
+    fn = ns["postprocess_pred"]
+    n_args = fn.__code__.co_argcount
+    if n_args == 1:
+        return fn
+    if n_args == 2:
+        return lambda text: fn(text, {})
+    raise RulerSetupError(
+        f"postprocess_pred in {_EVALUATE_PY} takes {n_args} args — RULER internals "
+        "changed; update the adapter in postprocess_pred_fn().")
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +213,11 @@ def prepare_task_data(
             )
         save_dir.mkdir(parents=True, exist_ok=True)
         print(f"[ruler_client] preparing data: {' '.join(cmd)}")
-        proc = subprocess.run(cmd, cwd=str(_PREPARE.parent), capture_output=True, text=True)
+        # prepare.py shells out to bare `python`; make sure our interpreter's
+        # bin dir is first on PATH (Ubuntu has no `python` outside a venv).
+        env = dict(os.environ)
+        env["PATH"] = f"{Path(sys.executable).parent}:{env.get('PATH', '')}"
+        proc = subprocess.run(cmd, cwd=str(_PREPARE.parent), capture_output=True, text=True, env=env)
         if proc.returncode != 0 or not jsonl.exists():
             raise RulerSetupError(
                 f"RULER prepare.py failed for task={task} ctx={context_length} "
