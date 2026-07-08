@@ -136,10 +136,18 @@ def main():
             store = {}
             handles = [l.input_layernorm.register_forward_hook(make_hook(i, store))
                        for i, l in enumerate(layers)]
-            with torch.no_grad():
-                base(ids)
-            for h in handles:
-                h.remove()
+            try:
+                with torch.no_grad():
+                    base(ids)
+            except torch.OutOfMemoryError:
+                print(f"[probe] SKIP doc{di} s={s}: OOM on this GPU "
+                      f"(40GB A100 is borderline at 131K) — rerun on 80GB for this length",
+                      flush=True)
+                torch.cuda.empty_cache()
+                continue
+            finally:
+                for h in handles:
+                    h.remove()
             for li, curve in store.items():
                 results[f"{di}/{s}/{li}"] = curve
                 curves.setdefault((s, li), []).append(curve)
