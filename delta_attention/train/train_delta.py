@@ -82,22 +82,24 @@ def build_model(args):
     return model.cuda(), tokenizer
 
 
-def packed_pg19(tokenizer, seq_len, skip_docs=0):
-    """Stream PG19 and yield packed [1, seq_len] id tensors."""
+def packed_pg19(tokenizer, seq_len, seed=0, max_chunks_per_doc=4):
+    """Stream PG19 (shuffled) and yield packed [1, seq_len] id tensors.
+
+    Shuffle + a per-document chunk cap force corpus diversity: without them
+    the smoke run trained 50/50 steps on PG19 document #1 (the King James
+    Bible, 1.15M tokens — memorized, loss floor ~0.06, zero signal).
+    """
     from datasets import load_dataset
 
     # deepmind/pg19 is a legacy script dataset (unsupported by modern
     # `datasets`); emozilla/pg19 is the standard parquet mirror of the same
     # corpus (verified present on the Hub).
     ds = load_dataset("emozilla/pg19", split="train", streaming=True)
-    buf = []
-    for i, doc in enumerate(ds):
-        if i < skip_docs:
-            continue
-        buf.extend(tokenizer.encode(doc["text"], add_special_tokens=False))
-        while len(buf) >= seq_len:
-            chunk, buf = buf[:seq_len], buf[seq_len:]
-            yield torch.tensor([chunk], dtype=torch.long)
+    ds = ds.shuffle(seed=seed, buffer_size=64)
+    for doc in ds:
+        toks = tokenizer.encode(doc["text"], add_special_tokens=False)
+        for c in range(min(len(toks) // seq_len, max_chunks_per_doc)):
+            yield torch.tensor([toks[c * seq_len:(c + 1) * seq_len]], dtype=torch.long)
 
 
 def probe_drift(model, batch, gamma, window):
@@ -156,14 +158,29 @@ def probe_drift(model, batch, gamma, window):
     return means
 
 
-def probe_anchor_grad_ratio(gamma, window):
+def probe_anchor_grad_ratio(model, batch, gamma, window):
+    """anchor_grad_ratio on MODEL-DERIVED q/k/v (layer 0 of the current
+    weights, real data). The smoke-run version used fixed random tensors,
+    which is weights-independent and therefore constant across training —
+    useless as a trajectory metric (0.407 at every probe)."""
+    from delta_attention.llama import apply_rotary_pos_emb
     from delta_attention.train.flex_delta import anchor_grad_ratio, delta_forward_train
 
-    torch.manual_seed(0)
-    q = torch.randn(1, 32, 4096, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    k = torch.randn(1, 8, 4096, 128, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(1, 8, 4096, 128, device="cuda", dtype=torch.bfloat16)
-    out = delta_forward_train(q, k, v, gamma=gamma, window=window)
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    layer = base.model.layers[0]
+    with torch.no_grad():
+        hidden = base.model.embed_tokens(batch.cuda())
+        hidden = layer.input_layernorm(hidden)
+        attn = layer.self_attn
+        hs = hidden.shape[:-1]
+        q = attn.q_proj(hidden).view(*hs, -1, attn.head_dim).transpose(1, 2)
+        k = attn.k_proj(hidden).view(*hs, -1, attn.head_dim).transpose(1, 2)
+        v = attn.v_proj(hidden).view(*hs, -1, attn.head_dim).transpose(1, 2)
+        pos = torch.arange(q.size(2), device=q.device).unsqueeze(0)
+        cos, sin = base.model.rotary_emb(v.transpose(1, 2), pos)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+    q = q.detach().requires_grad_(True)
+    out = delta_forward_train(q, k.detach(), v.detach(), gamma=gamma, window=window)
     out.float().pow(2).mean().backward()
     return anchor_grad_ratio(q.grad, gamma)
 
@@ -239,7 +256,8 @@ def main():
         log = {"loss": loss.item(), "ppl": math.exp(min(loss.item(), 20.0)),
                "lr": sched.get_last_lr()[0], "tokens_per_sec": tps, "step": step}
         if step % args.probe_every == 0 or step == args.steps:
-            log["anchor_grad_ratio"] = probe_anchor_grad_ratio(args.gamma, args.window)
+            log["anchor_grad_ratio"] = probe_anchor_grad_ratio(
+                model, heldout[0], args.gamma, args.window)
             drift = {}
             for hb in heldout:
                 for layer, m in probe_drift(model, hb, args.gamma, args.window).items():
