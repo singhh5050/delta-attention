@@ -24,6 +24,9 @@ case "$WP" in
   wp2pilot-delta|wp2pilot-dense|wp2pilot-detach)
        ARM="${WP#wp2pilot-}"
        TESTS="tests/test_flex_delta.py"; PILOT=1 ;;
+  wp2pilot-all)  # all three arms sequentially on one box
+       ARM="all"
+       TESTS="tests/test_flex_delta.py"; PILOT=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 TRAIN="${TRAIN:-}"; PROBE="${PROBE:-}"; PILOT="${PILOT:-}"
@@ -67,11 +70,14 @@ if [ -n "$PROBE" ]; then
 fi
 
 if [ -n "$PILOT" ]; then
-  stage "pilot-$ARM:running"
-  python -m delta_attention.train.train_delta --steps 2000 --seq-len 8192 \
-    --probe-every 100 --arm "$ARM" --save-dir "checkpoints/pilot_$ARM" \
-    || { stage "pilot-$ARM:FAILED"; exit 1; }
-  stage "pilot-$ARM:PASS"
+  if [ "$ARM" = "all" ]; then ARMS="delta dense detach"; else ARMS="$ARM"; fi
+  for A in $ARMS; do
+    stage "pilot-$A:running"
+    python -m delta_attention.train.train_delta --steps 2000 --seq-len 8192 \
+      --probe-every 100 --arm "$A" --save-dir "checkpoints/pilot_$A" \
+      || { stage "pilot-$A:FAILED"; exit 1; }
+    stage "pilot-$A:PASS"
+  done
 fi
 
 stage "ALL-DONE"
