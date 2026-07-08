@@ -107,8 +107,7 @@ def probe_drift(model, batch, gamma, window):
     import torch.nn.functional as F
 
     from delta_attention.llama import LlamaAttention, apply_rotary_pos_emb, repeat_kv
-    from delta_attention.train.flex_delta import anchor_layout, get_block_mask
-    from torch.nn.attention.flex_attention import flex_attention
+    from delta_attention.train.flex_delta import _get_flex, anchor_layout, get_block_mask
 
     base = model.get_base_model() if hasattr(model, "get_base_model") else model
     layers = base.model.layers
@@ -140,8 +139,11 @@ def probe_drift(model, batch, gamma, window):
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
             k, v = repeat_kv(k, attn.num_key_value_groups), repeat_kv(v, attn.num_key_value_groups)
             scale = attn.head_dim ** -0.5
+            # MUST be the compiled wrapper: uncompiled flex_attention falls
+            # back to eager and materializes the full [h, s, s] score matrix
+            # (~8.6 GB/layer at s=8192) — guaranteed OOM mid-probe.
             bm = get_block_mask(s, window, 1024, str(q.device))
-            sparse = flex_attention(q, k, v, block_mask=bm, scale=scale).transpose(1, 2)
+            sparse = _get_flex()(q, k, v, block_mask=bm, scale=scale).transpose(1, 2)
             idx, _, s_p = anchor_layout(s, gamma)
             idx = idx.to(q.device)
             key_pos = torch.arange(s, device=q.device)
