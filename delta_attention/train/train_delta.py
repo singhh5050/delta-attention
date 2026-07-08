@@ -82,7 +82,10 @@ def packed_pg19(tokenizer, seq_len, skip_docs=0):
     """Stream PG19 and yield packed [1, seq_len] id tensors."""
     from datasets import load_dataset
 
-    ds = load_dataset("deepmind/pg19", split="train", streaming=True)
+    # deepmind/pg19 is a legacy script dataset (unsupported by modern
+    # `datasets`); emozilla/pg19 is the standard parquet mirror of the same
+    # corpus (verified present on the Hub).
+    ds = load_dataset("emozilla/pg19", split="train", streaming=True)
     buf = []
     for i, doc in enumerate(ds):
         if i < skip_docs:
