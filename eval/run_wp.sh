@@ -20,6 +20,8 @@ case "$WP" in
        SMOKE="" ;;  # WP-2's smoke is the T13/T14 gate itself; training comes later
   eval32k) TESTS="tests/test_variable_stride.py tests/test_delta_decode.py"
        SMOKE_RAW="poc32k" ;;  # 32K rows run as-written (no --smoke shrink)
+  falsify) TESTS="tests/test_delta_decode.py"
+       SMOKE_RAW="p32_delta_dec_g1" ;;  # gamma_dec=1 must reproduce dense decode
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -49,3 +51,26 @@ fi
 stage "ALL-DONE"
 echo; echo "=== results/results.csv (tail) ==="
 tail -n 8 results/results.csv 2>/dev/null || true
+
+# Archive box-local outputs, then self-terminate (ported from wp2 branch).
+if [ -n "${SELF_TERMINATE:-}" ] && [ -n "${LAMBDA_API_KEY:-}" ] && [ -n "${SELF_INSTANCE_ID:-}" ]; then
+  python - <<'PYEOF' || echo "[run_wp] WARN: final-state archive failed (continuing to terminate)"
+import glob, os, wandb
+run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
+                 name=f"box_archive_{os.environ.get('SELF_INSTANCE_ID','?')[:8]}",
+                 job_type="box-archive")
+art = wandb.Artifact("box_final_state", type="box-archive")
+for p in ["results/results.csv", os.path.expanduser("~/wp.log"),
+          os.path.expanduser("~/wp_status")] + glob.glob("results/server_logs/*.jsonl"):
+    if os.path.exists(p):
+        art.add_file(p, name=os.path.basename(p))
+run.log_artifact(art)
+run.finish()
+PYEOF
+  echo "[run_wp] self-terminating instance $SELF_INSTANCE_ID in 120s"
+  sleep 120
+  curl -s -u "$LAMBDA_API_KEY:" \
+    https://cloud.lambdalabs.com/api/v1/instance-operations/terminate \
+    -X POST -H 'Content-Type: application/json' \
+    -d "{\"instance_ids\":[\"$SELF_INSTANCE_ID\"]}" || true
+fi
