@@ -288,8 +288,15 @@ def main():
             print(f"[train] tokens/s {measured:.0f} (floor {floor:.0f})", flush=True)
 
     model.save_pretrained(args.save_dir)
+    # boxes self-terminate on completion — the adapter must outlive the disk.
+    # LoRA r16 on q/k/v/o is ~50MB; wandb artifact is the durable home.
+    artifact = wandb.Artifact(f"wp2_adapter_{args.arm}", type="lora-adapter",
+                              metadata={"steps": args.steps, "seq_len": args.seq_len,
+                                        "gamma": args.gamma, "arm": args.arm})
+    artifact.add_dir(args.save_dir)
+    run.log_artifact(artifact)
     run.summary["final_loss"] = loss.item()
-    run.finish()
+    run.finish()  # blocks until artifact upload completes
     print(f"[train] DONE: {args.steps} steps, final loss {loss.item():.4f}, "
           f"adapter saved to {args.save_dir}", flush=True)
 
