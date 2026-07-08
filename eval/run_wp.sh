@@ -89,6 +89,21 @@ tail -n 8 results/results.csv 2>/dev/null || true
 # SELF_INSTANCE_ID in ~/.delta-env (boxes.sh provides them). Failed chains
 # stay up so logs remain reachable.
 if [ -n "${SELF_TERMINATE:-}" ] && [ -n "${LAMBDA_API_KEY:-}" ] && [ -n "${SELF_INSTANCE_ID:-}" ]; then
+  # archive everything box-local that isn't already durable (results.csv,
+  # chain log/status, raw telemetry sidecars) before the disk disappears
+  python - <<'PYEOF' || echo "[run_wp] WARN: final-state archive failed (continuing to terminate)"
+import glob, os, wandb
+run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
+                 name=f"box_archive_{os.environ.get('SELF_INSTANCE_ID','?')[:8]}",
+                 job_type="box-archive")
+art = wandb.Artifact("box_final_state", type="box-archive")
+for p in ["results/results.csv", os.path.expanduser("~/wp.log"),
+          os.path.expanduser("~/wp_status")] + glob.glob("results/server_logs/*.jsonl"):
+    if os.path.exists(p):
+        art.add_file(p, name=os.path.basename(p))
+run.log_artifact(art)
+run.finish()
+PYEOF
   echo "[run_wp] self-terminating instance $SELF_INSTANCE_ID in 120s (wandb flush grace)"
   sleep 120
   curl -s -u "$LAMBDA_API_KEY:" \
