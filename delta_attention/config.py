@@ -40,9 +40,13 @@ class Config:
     # sdpa_rectangle decode. Batch size 1 only for sparse/delta.
     decode_mode: str = "dense"       # ["dense", "sparse", "delta"]
     gamma_dec: int = 32              # anchor stride under refresh_policy=fixed
-    refresh_policy: str = "fixed"    # ["fixed", "drift"]
-    drift_threshold: float = 0.95    # drift trigger: cos of consecutive sparse rows
-    gamma_dec_max: int = 128         # hard anchor cap so drift mode can't starve
+    refresh_policy: str = "fixed"    # ["fixed", "drift", "drift_rel"]
+    drift_threshold: float = 0.95    # absolute drift trigger (refresh_policy=drift)
+    # drift_rel: anchor when consecutive-sparse cos drops below the rolling
+    # mean - drift_k*std of the last 16 steps (needs >=8 history; the raw
+    # signal has ~±0.07 stationary noise, so absolute cutoffs fire randomly)
+    drift_k: float = 2.0
+    gamma_dec_max: int = 128         # hard anchor cap so drift modes can't starve
 
     # when using the hip_attention interface as the sparse attention method,
     # the first few layers are set as dense as well as a few dense tokens 

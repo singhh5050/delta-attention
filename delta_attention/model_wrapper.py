@@ -31,6 +31,7 @@ class HuggingFaceModel:
         self.model.config.gamma_dec = config.gamma_dec
         self.model.config.refresh_policy = config.refresh_policy
         self.model.config.drift_threshold = config.drift_threshold
+        self.model.config.drift_k = config.drift_k
         self.model.config.gamma_dec_max = config.gamma_dec_max
 
         self.tokenizer = tokenizer

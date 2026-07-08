@@ -575,7 +575,7 @@ class LlamaAttention(nn.Module):
             return sparse_out.transpose(1, 2).contiguous(), None
 
         st = getattr(self, "_dec_state", None) or {
-            "last_delta": None, "steps": 0, "last_sparse": None}
+            "last_delta": None, "steps": 0, "last_sparse": None, "cos_hist": []}
         log_drift = bool(getattr(self.config, "log_drift", False))
         policy = getattr(self.config, "refresh_policy", "fixed")
 
@@ -591,9 +591,19 @@ class LlamaAttention(nn.Module):
             anchor = cur >= int(getattr(self.config, "gamma_dec_max", 128))
             if policy == "fixed" and cur >= int(self.config.gamma_dec):
                 anchor = True
-            if not anchor and policy == "drift" and st["last_sparse"] is not None \
-                    and _cos(sparse_out, st["last_sparse"]) < float(self.config.drift_threshold):
-                anchor = True
+            if not anchor and policy in ("drift", "drift_rel") and st["last_sparse"] is not None:
+                c = _cos(sparse_out, st["last_sparse"])
+                if policy == "drift":
+                    anchor = c < float(self.config.drift_threshold)
+                else:
+                    # statistical trigger: deviation below the rolling baseline
+                    hist = st["cos_hist"]
+                    if len(hist) >= 8:
+                        mu = sum(hist) / len(hist)
+                        sd = (sum((x - mu) ** 2 for x in hist) / len(hist)) ** 0.5
+                        anchor = c < mu - float(getattr(self.config, "drift_k", 2.0)) * sd
+                    hist.append(c)
+                    del hist[:-16]  # rolling window of 16
 
         # the dense row is needed at anchors, and every step in measurement mode
         dense_out = None
