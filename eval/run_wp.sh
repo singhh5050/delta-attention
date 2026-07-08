@@ -50,9 +50,17 @@ if [ -n "$TRAIN" ]; then
 fi
 
 if [ -n "$PROBE" ]; then
-  stage "drift-probe:running"
-  python eval/drift_probe.py || { stage "drift-probe:FAILED"; exit 1; }
-  stage "drift-probe:PASS"
+  stage "drift-probe-ruler:running"
+  python eval/drift_probe.py --data ruler --ruler-task niah_single_1 \
+    --context-lengths 32768,65536,131072 --n-docs 3 \
+    --out results/drift_probe/probe_ruler.json \
+    || { stage "drift-probe-ruler:FAILED"; exit 1; }
+  stage "drift-probe-ruler:PASS"
+  stage "drift-probe-pg19-long:running"
+  python eval/drift_probe.py --data pg19 --context-lengths 65536,131072 --n-docs 3 \
+    --out results/drift_probe/probe_pg19_long.json \
+    || { stage "drift-probe-pg19-long:FAILED"; exit 1; }
+  stage "drift-probe-pg19-long:PASS"
 fi
 
 stage "ALL-DONE"

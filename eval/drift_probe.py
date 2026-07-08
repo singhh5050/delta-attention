@@ -36,6 +36,8 @@ def parse_args():
     p.add_argument("--n-docs", type=int, default=3)
     p.add_argument("--gamma", type=int, default=64)
     p.add_argument("--window", type=int, default=2048)
+    p.add_argument("--data", choices=["pg19", "ruler"], default="pg19")
+    p.add_argument("--ruler-task", type=str, default="niah_single_1")
     p.add_argument("--out", type=str, default="results/drift_probe/probe.json")
     return p.parse_args()
 
@@ -118,7 +120,23 @@ def main():
     layers = base.layers
     rotary = base.rotary_emb
     scaling = layers[0].self_attn.head_dim ** -0.5
-    docs = long_docs(tokenizer, max(lengths), args.n_docs)
+    if args.data == "ruler":
+        # identical measurement code; only the input text changes. RULER
+        # prompts are generated per target length, then truncated to the
+        # nearest multiple of 64 tokens (their own effective s).
+        from eval.ruler_client import prepare_task_data
+
+        docs, per_doc_lengths = [], []
+        for s in lengths:
+            for i, smp in enumerate(prepare_task_data(
+                    args.ruler_task, s, args.n_docs, seed=0)):
+                toks = tokenizer.encode(smp["input"], add_special_tokens=False)
+                s_eff = min(len(toks) // 64 * 64, s)
+                docs.append((f"{args.ruler_task}@{s}#{i}", toks))
+                per_doc_lengths.append([s_eff])
+    else:
+        docs = long_docs(tokenizer, max(lengths), args.n_docs)
+        per_doc_lengths = [lengths] * len(docs)
     print(f"[probe] docs: {[t for t, _ in docs]}", flush=True)
 
     results = {}  # f"{doc_i}/{s}/{layer}" -> [cos...]
@@ -131,7 +149,7 @@ def main():
         return fn
 
     for di, (title, toks) in enumerate(docs):
-        for s in lengths:
+        for s in per_doc_lengths[di]:
             ids = torch.tensor([toks[:s]], dtype=torch.long, device="cuda")
             store = {}
             handles = [l.input_layernorm.register_forward_hook(make_hook(i, store))
