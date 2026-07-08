@@ -19,9 +19,11 @@ case "$WP" in
        SMOKE="" ;;  # WP-2's smoke is the T13/T14 gate itself; training comes later
   wp2train) TESTS="tests/test_flex_delta.py"
        SMOKE=""; TRAIN=1 ;;
+  driftprobe) TESTS="tests/test_flex_delta.py"
+       SMOKE=""; PROBE=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
-TRAIN="${TRAIN:-}"
+TRAIN="${TRAIN:-}"; PROBE="${PROBE:-}"
 
 stage "setup+gate1:running"
 bash env/setup.sh || { stage "setup+gate1:FAILED"; exit 1; }
@@ -45,6 +47,12 @@ if [ -n "$TRAIN" ]; then
   python -m delta_attention.train.train_delta --steps 50 --seq-len 8192 \
     || { stage "train-smoke:FAILED"; exit 1; }
   stage "train-smoke:PASS"
+fi
+
+if [ -n "$PROBE" ]; then
+  stage "drift-probe:running"
+  python eval/drift_probe.py || { stage "drift-probe:FAILED"; exit 1; }
+  stage "drift-probe:PASS"
 fi
 
 stage "ALL-DONE"
