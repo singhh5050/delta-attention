@@ -75,6 +75,10 @@ def build_model(args):
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False})
     model.enable_input_require_grads()
+    # from_pretrained returns eval mode; the checkpointing branch in
+    # LlamaModel.forward requires self.training — without train() it silently
+    # no-ops and all activations stay resident (OOM'd a 40GB A100 at s=4096).
+    model.train()
     return model.cuda(), tokenizer
 
 
