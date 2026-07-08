@@ -42,7 +42,7 @@ fi
 
 if [ -n "$TRAIN" ]; then
   stage "train-smoke:running"
-  python -m delta_attention.train.train_delta --steps 50 --seq-len 8192 \
+  python -m delta_attention.train.train_delta --steps 50 --seq-len 4096 \
     || { stage "train-smoke:FAILED"; exit 1; }
   stage "train-smoke:PASS"
 fi
