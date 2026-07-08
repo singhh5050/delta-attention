@@ -6,6 +6,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <wp1|wp2|wp3>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+SMOKE=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
