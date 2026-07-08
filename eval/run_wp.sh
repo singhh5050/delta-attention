@@ -21,9 +21,12 @@ case "$WP" in
        SMOKE=""; TRAIN=1 ;;
   driftprobe) TESTS="tests/test_flex_delta.py"
        SMOKE=""; PROBE=1 ;;
+  wp2pilot-delta|wp2pilot-dense|wp2pilot-detach)
+       ARM="${WP#wp2pilot-}"
+       TESTS="tests/test_flex_delta.py"; PILOT=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
-TRAIN="${TRAIN:-}"; PROBE="${PROBE:-}"
+TRAIN="${TRAIN:-}"; PROBE="${PROBE:-}"; PILOT="${PILOT:-}"
 
 stage "setup+gate1:running"
 bash env/setup.sh || { stage "setup+gate1:FAILED"; exit 1; }
@@ -63,6 +66,27 @@ if [ -n "$PROBE" ]; then
   stage "drift-probe-pg19-long:PASS"
 fi
 
+if [ -n "$PILOT" ]; then
+  stage "pilot-$ARM:running"
+  python -m delta_attention.train.train_delta --steps 2000 --seq-len 8192 \
+    --probe-every 100 --arm "$ARM" --save-dir "checkpoints/pilot_$ARM" \
+    || { stage "pilot-$ARM:FAILED"; exit 1; }
+  stage "pilot-$ARM:PASS"
+fi
+
 stage "ALL-DONE"
 echo; echo "=== results/results.csv (tail) ==="
 tail -n 8 results/results.csv 2>/dev/null || true
+
+# Self-terminate when the chain completes cleanly (idle finished boxes have
+# cost ~$19 so far). Requires SELF_TERMINATE=1 + LAMBDA_API_KEY +
+# SELF_INSTANCE_ID in ~/.delta-env (boxes.sh provides them). Failed chains
+# stay up so logs remain reachable.
+if [ -n "${SELF_TERMINATE:-}" ] && [ -n "${LAMBDA_API_KEY:-}" ] && [ -n "${SELF_INSTANCE_ID:-}" ]; then
+  echo "[run_wp] self-terminating instance $SELF_INSTANCE_ID in 120s (wandb flush grace)"
+  sleep 120
+  curl -s -u "$LAMBDA_API_KEY:" \
+    https://cloud.lambdalabs.com/api/v1/instance-operations/terminate \
+    -X POST -H 'Content-Type: application/json' \
+    -d "{\"instance_ids\":[\"$SELF_INSTANCE_ID\"]}" || true
+fi

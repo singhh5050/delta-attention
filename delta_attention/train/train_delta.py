@@ -40,7 +40,12 @@ def parse_args():
     p.add_argument("--gamma", type=int, default=64)
     p.add_argument("--window", type=int, default=2048)
     p.add_argument("--probe-every", type=int, default=25)
-    p.add_argument("--detach-delta", action="store_true", help="ablation arm")
+    p.add_argument("--arm", choices=["delta", "dense", "detach"], default="delta",
+                   help="delta: train with the delta pipeline in-graph; "
+                        "dense: standard attention (data/optimizer control); "
+                        "detach: pipeline active but gradient blocked through "
+                        "the reused correction (mechanism control)")
+    p.add_argument("--detach-delta", action="store_true", help="same as --arm detach")
     p.add_argument("--min-tokens-per-sec", type=float, default=0.0,
                    help="0 = derive floor from first timing steps * 0.5")
     p.add_argument("--save-dir", type=str, default="checkpoints/smoke")
@@ -63,8 +68,11 @@ def build_model(args):
     model.config.delta_lambda = args.gamma
     model.config.sliding_window = args.window
     model.config.log_drift = False
-    model.config.detach_delta = args.detach_delta
-    model.config._attn_implementation = "flex_delta_train"
+    model.config.detach_delta = args.arm == "detach" or args.detach_delta
+    # dense arm trains with standard attention: same data/optimizer/probes,
+    # no delta pipeline — isolates "long-text training" from the mechanism
+    model.config._attn_implementation = (
+        "sdpa" if args.arm == "dense" else "flex_delta_train")
     model.config.use_cache = False
 
     lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.0, bias="none",
@@ -218,8 +226,7 @@ def main():
     import wandb
 
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
-                     name=f"wp2_smoke_s{args.seq_len}_n{args.steps}"
-                          + ("_detach" if args.detach_delta else ""),
+                     name=f"wp2_{args.arm}_s{args.seq_len}_n{args.steps}",
                      config=vars(args))
 
     model, tokenizer = build_model(args)
