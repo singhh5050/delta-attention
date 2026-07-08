@@ -40,3 +40,20 @@ def test_uniform_effective_sparsity():
     # near-zero (can dip slightly negative); matches why 4K can't
     # discriminate gammas (PoC run 1 observation)
     assert -0.1 < uniform_effective_sparsity(4096, 64, 2048) < 0.1
+
+
+def test_next_gamma_relative():
+    from delta_attention.stride import next_gamma_relative
+
+    kw = dict(k=2.0, gamma_min=16, gamma_max=256)
+    # needs history to act
+    assert next_gamma_relative(0.2, [], 64, **kw) == 64
+    assert next_gamma_relative(0.2, [0.6], 64, **kw) == 64
+    # flat plateau ~0.6 with small noise: staying near the mean holds gamma
+    hist = [0.60, 0.62, 0.58, 0.61, 0.59]
+    assert next_gamma_relative(0.60, hist, 64, **kw) == 64
+    # genuine dip far below trailing mean - 2*std halves
+    assert next_gamma_relative(0.30, hist, 64, **kw) == 32
+    # genuine rise doubles, clamped at gamma_max
+    assert next_gamma_relative(0.95, hist, 256, **kw) == 256
+    assert next_gamma_relative(0.95, hist, 128, **kw) == 256

@@ -32,6 +32,8 @@ class HuggingFaceModel:
         self.model.config.gamma_max = config.gamma_max
         self.model.config.adapt_chunk = config.adapt_chunk
         self.model.config.adapt_threshold = config.adapt_threshold
+        self.model.config.stride_trigger = config.stride_trigger
+        self.model.config.adapt_k = config.adapt_k
 
         self.tokenizer = tokenizer
 

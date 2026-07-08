@@ -641,7 +641,8 @@ class LlamaAttention(nn.Module):
         cut_n tail is computed exactly as in the fixed path.
         """
         from .stride import (apply_delta_variable, effective_sparsity,
-                             interanchor_cos, next_gamma, plan_chunks)
+                             interanchor_cos, next_gamma, next_gamma_relative,
+                             plan_chunks)
 
         cfg = self.config
         device = query_states.device
@@ -649,6 +650,8 @@ class LlamaAttention(nn.Module):
         value_rep = repeat_kv(value_states, self.num_key_value_groups)
 
         gamma_c = int(cfg.delta_lambda)  # first chunk starts at the fixed default
+        trigger = getattr(cfg, "stride_trigger", "absolute")
+        cos_history = []
         idx_parts, dense_parts, chunk_log = [], [], []
         for start, end in plan_chunks(s_p, int(cfg.adapt_chunk)):
             c_idx = torch.arange(start, end, step=gamma_c, device=device)
@@ -662,10 +665,17 @@ class LlamaAttention(nn.Module):
                 "start": int(start), "gamma": int(gamma_c), "cos_mean": cos_mean,
                 "cos_min": cos_min, "n_anchors": int(c_idx.numel()),
             })
-            gamma_c = next_gamma(
-                cos_mean, gamma_c, threshold=float(cfg.adapt_threshold),
-                gamma_min=int(cfg.gamma_min), gamma_max=int(cfg.gamma_max),
-            )
+            if trigger == "relative":
+                gamma_c = next_gamma_relative(
+                    cos_mean, cos_history, gamma_c, k=float(getattr(cfg, "adapt_k", 2.0)),
+                    gamma_min=int(cfg.gamma_min), gamma_max=int(cfg.gamma_max),
+                )
+                cos_history.append(cos_mean)
+            else:
+                gamma_c = next_gamma(
+                    cos_mean, gamma_c, threshold=float(cfg.adapt_threshold),
+                    gamma_min=int(cfg.gamma_min), gamma_max=int(cfg.gamma_max),
+                )
 
         idx = torch.cat(idx_parts)
         dense_sel = torch.cat(dense_parts, dim=1)

@@ -62,6 +62,30 @@ def next_gamma(cos_mean: float, gamma_c: int, *, threshold: float,
     return gamma_c
 
 
+def next_gamma_relative(cos_mean: float, history: List[float], gamma_c: int, *,
+                        k: float, gamma_min: int, gamma_max: int) -> int:
+    """Statistical trigger: react to DEVIATIONS from the sequence's own
+    running drift baseline, not an absolute cutoff.
+
+    Motivated by the drift probe (2026-07-08): the drift signal is a flat
+    plateau whose absolute level (~0.6 at 32K) sits far below any of the
+    spec'd absolute thresholds (0.90-0.98), so absolute triggers saturate
+    and gamma pins at gamma_min. Here: halve when the chunk's cos drops
+    below trailing_mean - k*std, double when above trailing_mean + k*std,
+    hold otherwise. Needs >=2 history entries to act.
+    """
+    if len(history) < 2:
+        return gamma_c
+    mu = sum(history) / len(history)
+    var = sum((x - mu) ** 2 for x in history) / len(history)
+    sd = var ** 0.5
+    if cos_mean < mu - k * sd:
+        return max(gamma_c // 2, gamma_min)
+    if cos_mean > mu + k * sd:
+        return min(gamma_c * 2, gamma_max)
+    return gamma_c
+
+
 def _sparse_pass_cost(s: int, window: int, sink: int) -> int:
     """Causally-clipped key count of the StreamingLLM pass: row i attends
     min(i+1, window+sink) keys. The uncapped (window+sink)*s estimate goes
