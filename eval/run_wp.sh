@@ -22,6 +22,8 @@ case "$WP" in
        SMOKE_RAW="poc32k" ;;  # 32K rows run as-written (no --smoke shrink)
   falsify) TESTS="tests/test_delta_decode.py"
        SMOKE_RAW="p32_delta_dec_g1" ;;  # gamma_dec=1 must reproduce dense decode
+  decsweep) TESTS="tests/test_delta_decode.py"
+       SMOKE_RAW="decsweep" ;;  # staleness curve gamma_dec in {2,4,8,64} at 32K
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 

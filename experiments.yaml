@@ -213,8 +213,43 @@ configs:
     context_lengths: [32768]
     tasks: [niah_single_1, niah_multikey_2, qa_1]
     n_samples: 50
+  # staleness curve (user-approved 2026-07-08): how fast does decode accuracy
+  # decay with delta staleness between the exact g1 (78.0) and g16 (24.7)?
+  - name: p32_delta_dec_g2
+    <<: *defaults
+    decode_mode: delta
+    gamma_dec: 2
+    refresh_policy: fixed
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+  - name: p32_delta_dec_g4
+    <<: *defaults
+    decode_mode: delta
+    gamma_dec: 4
+    refresh_policy: fixed
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+  - name: p32_delta_dec_g8
+    <<: *defaults
+    decode_mode: delta
+    gamma_dec: 8
+    refresh_policy: fixed
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+  - name: p32_delta_dec_g64
+    <<: *defaults
+    decode_mode: delta
+    gamma_dec: 64
+    refresh_policy: fixed
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
 
 groups:
+  decsweep:    [p32_delta_dec_g2, p32_delta_dec_g4, p32_delta_dec_g8, p32_delta_dec_g64]
   poc32k:     [p32_dense_fa2, p32_delta_g64, p32_fixed_g256, p32_adaptive_thr60,
                p32_adaptive_thr95, p32_sparse_decode, p32_delta_dec_g16]
   night1_all: [base_dense_fa2, base_sparse_only, base_delta_g64, t3_sparse_decode,
