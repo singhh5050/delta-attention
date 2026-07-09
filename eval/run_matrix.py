@@ -395,8 +395,18 @@ def log_drift_telemetry(run, handles: Sequence[ServerHandle]) -> Optional[Dict[s
             continue
         with open(h.drift_path, "r", encoding="utf-8") as f:
             lines += [json.loads(ln) for ln in f if ln.strip()]
+    # WP-1 adaptive-stride records share the sidecar (kind == "stride")
+    stride_lines = [ln for ln in lines if ln.get("kind") == "stride"]
+    lines = [ln for ln in lines if ln.get("kind") is None]
+    out: Dict[str, Any] = {}
+    if stride_lines:
+        es = sum(ln["effective_sparsity"] for ln in stride_lines) / len(stride_lines)
+        out["effective_sparsity"] = es
+        run.log({"effective_sparsity": es,
+                 "stride_n_anchors_mean": sum(ln["n_anchors"] for ln in stride_lines) / len(stride_lines)})
+        run.summary["effective_sparsity"] = es
     if not lines:
-        return None
+        return out or None
     agg = aggregate_drift(lines)
     edges = hist_bin_edges()
     payload: Dict[str, Any] = {}
@@ -414,7 +424,8 @@ def log_drift_telemetry(run, handles: Sequence[ServerHandle]) -> Optional[Dict[s
     print(f"[run_matrix] drift telemetry: {sum(a['requests'] for a in agg.values())} "
           f"layer-records over {len(agg)} layers; per-layer mean cos "
           f"min={min(means.values()):.4f} max={max(means.values()):.4f}")
-    return means
+    out["drift_mean_by_layer"] = means
+    return out
 
 
 def count_ooms(handles: Sequence[ServerHandle]) -> int:
@@ -622,9 +633,20 @@ def run_config(row: Dict[str, Any], smoke: bool, gpus: List[str],
                 print(f"[run_matrix] {row['name']} ctx={ctx} task={task}: "
                       f"acc={acc:.2f} n={n_ok} failures={failures} ({cell_secs:.1f}s)")
 
-        drift_means = log_drift_telemetry(run, handles)
-        if drift_means is not None:
-            result_extra["drift_mean_by_layer"] = drift_means
+        telemetry = log_drift_telemetry(run, handles) or {}
+        if "drift_mean_by_layer" in telemetry:
+            result_extra["drift_mean_by_layer"] = telemetry["drift_mean_by_layer"]
+        if "effective_sparsity" in telemetry:  # adaptive stride: measured
+            result["effective_sparsity"] = round(telemetry["effective_sparsity"], 6)
+        elif row["mode"] == "delta" and row.get("stride_policy", "fixed") == "fixed" \
+                and row["attn_implementation"] == "window":
+            # fixed stride: analytic, so fixed/adaptive frontiers are comparable
+            from delta_attention.stride import uniform_effective_sparsity
+            vals = [uniform_effective_sparsity(int(ctx), int(row["delta_lambda"]),
+                                               int(row["sliding_window"]))
+                    for ctx in row["context_lengths"]]
+            result["effective_sparsity"] = round(sum(vals) / len(vals), 6)
+            run.summary["effective_sparsity"] = result["effective_sparsity"]
 
         accs = [c["accuracy"] for c in per_task]
         result.update(

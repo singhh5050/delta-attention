@@ -27,6 +27,13 @@ class HuggingFaceModel:
         self.model.config.hip_attention_dense_layers = config.hip_attention_dense_layers
         self.model.config.hip_attention_last_dense = config.hip_attention_last_dense
         self.model.config.log_drift = config.log_drift
+        self.model.config.stride_policy = config.stride_policy
+        self.model.config.gamma_min = config.gamma_min
+        self.model.config.gamma_max = config.gamma_max
+        self.model.config.adapt_chunk = config.adapt_chunk
+        self.model.config.adapt_threshold = config.adapt_threshold
+        self.model.config.stride_trigger = config.stride_trigger
+        self.model.config.adapt_k = config.adapt_k
 
         self.tokenizer = tokenizer
 
@@ -45,10 +52,11 @@ class HuggingFaceModel:
         drift_path = os.environ.get("DELTA_DRIFT_LOG")
         collected = []
         for m in self.model.modules():
-            stats = getattr(m, "_drift_stats", None)
-            if stats is not None:
-                collected.append(stats)
-                m._drift_stats = None
+            for attr in ("_drift_stats", "_stride_stats"):
+                stats = getattr(m, attr, None)
+                if stats is not None:
+                    collected.append(stats)
+                    setattr(m, attr, None)
         if not collected:
             return
         if not drift_path:

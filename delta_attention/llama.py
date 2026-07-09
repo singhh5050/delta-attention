@@ -567,6 +567,17 @@ class LlamaAttention(nn.Module):
         if mode == "sparse-only": # return the sparse output only
             return sparse_attn_output, None
 
+        # WP-1: adaptive anchor placement replaces the uniform-stride path.
+        # The sparse pass above and the dense cut_n tail are unchanged.
+        if getattr(self.config, "stride_policy", "fixed") == "adaptive":
+            return (
+                self.delta_adaptive_forward(
+                    query_states, key_states, value_states,
+                    sparse_attn_output, s, s_p, cut_n, scaling,
+                ),
+                None,
+            )
+
         sparse_attn_output = sparse_attn_output[:, :s_p]
         if cut_n > 0:
             idx = torch.arange(0, s_p, step=lambd, device=query_states.device)
@@ -616,6 +627,73 @@ class LlamaAttention(nn.Module):
         window_attn_output = torch.cat((sparse_attn_output, last_states), dim=1)
 
         return window_attn_output, None
+
+    def delta_adaptive_forward(
+        self, query_states, key_states, value_states, sparse_attn_output,
+        s, s_p, cut_n, scaling,
+    ):
+        """WP-1 Task B: chunked adaptive anchor placement.
+
+        Anchors are placed at the current local stride within each
+        adapt_chunk-row window; the stride is re-planned from the measured
+        mean consecutive-anchor delta cosine (fast drift -> halve, smooth ->
+        double). Correction uses the variable-stride broadcast; the dense
+        cut_n tail is computed exactly as in the fixed path.
+        """
+        from .stride import (apply_delta_variable, effective_sparsity,
+                             interanchor_cos, next_gamma, next_gamma_relative,
+                             plan_chunks)
+
+        cfg = self.config
+        device = query_states.device
+        key_rep = repeat_kv(key_states, self.num_key_value_groups)
+        value_rep = repeat_kv(value_states, self.num_key_value_groups)
+
+        gamma_c = int(cfg.delta_lambda)  # first chunk starts at the fixed default
+        trigger = getattr(cfg, "stride_trigger", "absolute")
+        cos_history = []
+        idx_parts, dense_parts, chunk_log = [], [], []
+        for start, end in plan_chunks(s_p, int(cfg.adapt_chunk)):
+            c_idx = torch.arange(start, end, step=gamma_c, device=device)
+            dense_c = qsa_kernel(
+                query_states[:, :, c_idx], key_rep, value_rep, c_idx.unsqueeze(0), scaling
+            ).transpose(1, 2)
+            cos_mean, cos_min = interanchor_cos(dense_c - sparse_attn_output[:, c_idx])
+            idx_parts.append(c_idx)
+            dense_parts.append(dense_c)
+            chunk_log.append({
+                "start": int(start), "gamma": int(gamma_c), "cos_mean": cos_mean,
+                "cos_min": cos_min, "n_anchors": int(c_idx.numel()),
+            })
+            if trigger == "relative":
+                gamma_c = next_gamma_relative(
+                    cos_mean, cos_history, gamma_c, k=float(getattr(cfg, "adapt_k", 2.0)),
+                    gamma_min=int(cfg.gamma_min), gamma_max=int(cfg.gamma_max),
+                )
+                cos_history.append(cos_mean)
+            else:
+                gamma_c = next_gamma(
+                    cos_mean, gamma_c, threshold=float(cfg.adapt_threshold),
+                    gamma_min=int(cfg.gamma_min), gamma_max=int(cfg.gamma_max),
+                )
+
+        idx = torch.cat(idx_parts)
+        dense_sel = torch.cat(dense_parts, dim=1)
+        corrected = apply_delta_variable(sparse_attn_output[:, :s_p], dense_sel, idx, s_p)
+
+        # dense cut_n tail, mirroring the fixed path's always-recomputed block
+        tail_idx = torch.arange(s_p, s, device=device)
+        tail_dense = qsa_kernel(
+            query_states[:, :, tail_idx], key_rep, value_rep, tail_idx.unsqueeze(0), scaling
+        ).transpose(1, 2)
+
+        self._stride_stats = {
+            "kind": "stride", "layer": int(self.layer_idx), "seq_len": int(s),
+            "effective_sparsity": effective_sparsity(
+                torch.cat((idx, tail_idx)), s, int(cfg.sliding_window)),
+            "n_anchors": int(idx.numel()), "chunks": chunk_log,
+        }
+        return torch.cat((corrected, tail_dense), dim=1)
 
     def forward(
         self,
