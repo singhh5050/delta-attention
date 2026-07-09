@@ -296,5 +296,14 @@ def init_model(config):
 
             layer_idx += 1
 
+    # WP-2 post-training eval: merge a LoRA adapter into the served weights
+    ckpt = getattr(config, "checkpoint", "") or ""
+    if ckpt:
+        from peft import PeftModel
+
+        print(f"[init_model] merging LoRA adapter from {ckpt}", flush=True)
+        model = PeftModel.from_pretrained(model, ckpt)
+        model = model.merge_and_unload()
+
     model._sample = types.MethodType(_sample, model)
     return model, tokenizer

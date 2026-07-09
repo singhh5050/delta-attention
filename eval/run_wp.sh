@@ -9,7 +9,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -32,6 +32,7 @@ case "$WP" in
        ARM="${WP#wp2pilot-}"; TESTS="tests/test_flex_delta.py"; PILOT=1 ;;
   wp2pilot-all)
        ARM="all"; TESTS="tests/test_flex_delta.py"; PILOT=1 ;;
+  t2eval) TESTS=""; T2EVAL=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -90,6 +91,25 @@ if [ -n "$PILOT" ]; then
       || { stage "pilot-$A:FAILED"; exit 1; }
     stage "pilot-$A:PASS"
   done
+fi
+
+if [ -n "$T2EVAL" ]; then
+  stage "adapter-fetch:running"
+  python - <<'PYEOF' || { stage "adapter-fetch:FAILED"; exit 1; }
+import wandb
+api = wandb.Api()
+for arm in ("delta", "dense", "detach"):
+    api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest").download(root=f"checkpoints/pilot_{arm}")
+    print("fetched", arm)
+PYEOF
+  stage "adapter-fetch:PASS"
+  stage "posttrain-ppl:running"
+  python eval/ppl_eval.py --arms base,delta,dense,detach --chunks 16 \
+    || { stage "posttrain-ppl:FAILED"; exit 1; }
+  stage "posttrain-ppl:PASS"
+  stage "posttrain-ruler:running"
+  python eval/run_matrix.py --configs t2eval || { stage "posttrain-ruler:FAILED"; exit 1; }
+  stage "posttrain-ruler:PASS"
 fi
 
 stage "ALL-DONE"

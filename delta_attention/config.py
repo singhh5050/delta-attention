@@ -30,6 +30,11 @@ class Config:
     delta_lambda: int = 64          # delta lambda window
     sliding_window: int = 2048      # sliding window size
 
+    # WP-2 post-training eval: path to a saved LoRA adapter directory. When
+    # set, init_model wraps the base model with the adapter and merges it, so
+    # the server serves the fine-tuned weights through the normal pipeline.
+    checkpoint: str = ""
+
     # prefill drift telemetry (delta_interanchor_cos). Presence-only CLI flag;
     # per-request summaries are appended to the JSONL file named by the
     # DELTA_DRIFT_LOG env var (see delta_attention/drift.py).
