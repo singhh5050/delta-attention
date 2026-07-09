@@ -632,6 +632,28 @@ class LlamaAttention(nn.Module):
         st["last_sparse"] = sparse_out
         self._dec_state = st
         return out.transpose(1, 2).contiguous(), None
+    def flex_delta_train_forward(
+        self,
+        module: nn.Module,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        dropout: float = 0.0,
+        scaling: float = 1.0,
+        **kwargs,
+    ):
+        """WP-2: autograd-capable delta forward (train/flex_delta.py)."""
+        from .train.flex_delta import delta_forward_train
+
+        out = delta_forward_train(
+            query_states, key_states, value_states,
+            gamma=int(self.config.delta_lambda),
+            window=int(self.config.sliding_window),
+            scaling=scaling,
+            detach_delta=bool(getattr(self.config, "detach_delta", False)),
+        )
+        return out, None
 
     def delta_forward(
         self,
@@ -842,6 +864,9 @@ class LlamaAttention(nn.Module):
             if self.config._attn_implementation == "sdpa_rectangle":
                 attention_interface = self.sdpa_rectangle_forward
                 kwargs.update({"sin": sin, "cos": cos})
+            elif self.config._attn_implementation == "flex_delta_train":
+                # WP-2: differentiable delta path for training
+                attention_interface = self.flex_delta_train_forward
             elif self.config._attn_implementation in ["window", "hip_attention"]:
                 if self.config._attn_implementation == "hip_attention" and self.layer_idx in self.config.hip_attention_dense_layers:
                     attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
