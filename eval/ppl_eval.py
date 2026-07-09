@@ -97,7 +97,12 @@ def main():
         print(f"[ppl] {arm}: loss {loss:.4f}  ppl {ppl:.3f}  "
               f"({args.chunks} held-out PG19-test chunks @ {args.seq_len})", flush=True)
         run.log({f"ppl/{arm}": ppl, f"loss/{arm}": loss})
+        # the _sample monkey-patch creates a self-reference cycle, so refcount
+        # freeing never fires — collect explicitly or the next arm OOMs on 40GB
+        model._sample = None
         del model
+        import gc
+        gc.collect()
         torch.cuda.empty_cache()
 
     run.summary.update({f"ppl_{k}": v[1] for k, v in results.items()})
