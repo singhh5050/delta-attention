@@ -143,6 +143,11 @@ def _sample(
 
         setattr(self, "no_lm_head", True)
         if is_prefill:
+            # WP-3 state hygiene (T9): decode-delta state never leaks across
+            # generate calls.
+            for m in self.modules():
+                if isinstance(m, LlamaAttention):
+                    m._dec_state = None
             if self.config.mode in ["delta", "recompute", "sparse-only"]:
                 inputs = model_inputs["input_ids"]
 
