@@ -166,11 +166,16 @@ def probe_drift(model, batch, gamma, window):
     return means
 
 
-def probe_anchor_grad_ratio(model, batch, gamma, window):
+def probe_anchor_grad_ratio(model, batch, gamma, window, detach_delta=False):
     """anchor_grad_ratio on MODEL-DERIVED q/k/v (layer 0 of the current
     weights, real data). The smoke-run version used fixed random tensors,
     which is weights-independent and therefore constant across training —
-    useless as a trajectory metric (0.407 at every probe)."""
+    useless as a trajectory metric (0.407 at every probe).
+
+    detach_delta must mirror the arm's training forward: without it the
+    probe always measures the full-graph ratio, so detach-arm logs say
+    nothing about that arm's actual gradient path (pilot runs atyhqiir/
+    2hepajmg both logged the full-graph value)."""
     from delta_attention.llama import apply_rotary_pos_emb
     from delta_attention.train.flex_delta import anchor_grad_ratio, delta_forward_train
 
@@ -188,7 +193,8 @@ def probe_anchor_grad_ratio(model, batch, gamma, window):
         cos, sin = base.model.rotary_emb(v.transpose(1, 2), pos)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
     q = q.detach().requires_grad_(True)
-    out = delta_forward_train(q, k.detach(), v.detach(), gamma=gamma, window=window)
+    out = delta_forward_train(q, k.detach(), v.detach(), gamma=gamma, window=window,
+                              detach_delta=detach_delta)
     out.float().pow(2).mean().backward()
     return anchor_grad_ratio(q.grad, gamma)
 
@@ -264,7 +270,13 @@ def main():
                "lr": sched.get_last_lr()[0], "tokens_per_sec": tps, "step": step}
         if step % args.probe_every == 0 or step == args.steps:
             log["anchor_grad_ratio"] = probe_anchor_grad_ratio(
-                model, heldout[0], args.gamma, args.window)
+                model, heldout[0], args.gamma, args.window,
+                detach_delta=model.config.detach_delta)
+            # decomposition for the delta arm: how much of the ratio is the
+            # gamma-fold summed correction vs the anchor's key-dense forward
+            if not model.config.detach_delta:
+                log["anchor_grad_ratio_detached"] = probe_anchor_grad_ratio(
+                    model, heldout[0], args.gamma, args.window, detach_delta=True)
             drift = {}
             for hb in heldout:
                 for layer, m in probe_drift(model, hb, args.gamma, args.window).items():
