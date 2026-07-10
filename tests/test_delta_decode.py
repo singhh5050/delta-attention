@@ -61,8 +61,8 @@ def _reset(model):
             m._dec_drift_points = None
 
 
-def _decode_step(model, q, k, v):
-    module = model.model.layers[0].self_attn
+def _decode_step(model, q, k, v, layer_idx=0):
+    module = model.model.layers[layer_idx].self_attn
     with torch.no_grad():
         out, _ = module.sdpa_rectangle_forward(
             module, q, k, v, scaling=module.head_dim ** -0.5)
@@ -156,6 +156,42 @@ def test_t8_zero_delta_is_sparse(model_and_tokenizer):
         out_sparse = _decode_step(model, q2, k, v)
 
     assert torch.equal(out_zero, out_sparse), "T8: zero delta != pure sparse decode"
+
+
+# ---------------------------------------------------------------------------
+# Jeff sanity check: each layer owns its delta and fixed gamma refreshes on
+# schedule (gamma_dec=2 means anchor, one reused row, anchor, ...).
+# ---------------------------------------------------------------------------
+
+@cuda_only
+def test_decode_state_is_per_layer_and_refreshes_on_gamma(model_and_tokenizer):
+    model, _ = model_and_tokenizer
+    module0 = model.model.layers[0].self_attn
+    module1 = model.model.layers[1].self_attn
+
+    _reset(model)
+    with _decode_override(model.config, decode_mode="delta", gamma_dec=2,
+                          refresh_policy="fixed", gamma_dec_max=100,
+                          log_drift=True):
+        flags, steps = [], []
+        for seed in (10, 11, 12):
+            q, k, v = _rand_step(seed, n_keys=8192)
+            _decode_step(model, q, k, v, layer_idx=0)
+            flags.append(module0._dec_drift_points[-1]["anchor"])
+            steps.append(module0._dec_state["steps"])
+
+        assert flags == [True, False, True]
+        assert steps == [0, 1, 0]
+        state0 = module0._dec_state
+        assert getattr(module1, "_dec_state", None) is None
+
+        q, k, v = _rand_step(13, n_keys=8192)
+        _decode_step(model, q, k, v, layer_idx=1)
+
+        assert module1._dec_drift_points[-1]["anchor"] is True
+        assert module1._dec_state is not state0
+        assert module1._dec_state["last_delta"] is not None
+        assert module0._dec_state is state0
 
 
 # ---------------------------------------------------------------------------

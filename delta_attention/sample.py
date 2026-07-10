@@ -148,6 +148,7 @@ def _sample(
             for m in self.modules():
                 if isinstance(m, LlamaAttention):
                     m._dec_state = None
+                    m._dec_drift_points = None
             if self.config.mode in ["delta", "recompute", "sparse-only"]:
                 inputs = model_inputs["input_ids"]
 
@@ -281,6 +282,29 @@ def init_model(config):
     )
 
     model.args = config
+    for field in (
+        "mode",
+        "delta_lambda",
+        "sliding_window",
+        "log_drift",
+        "stride_policy",
+        "gamma_min",
+        "gamma_max",
+        "adapt_chunk",
+        "adapt_threshold",
+        "stride_trigger",
+        "adapt_k",
+        "decode_mode",
+        "gamma_dec",
+        "refresh_policy",
+        "drift_threshold",
+        "drift_k",
+        "gamma_dec_max",
+    ):
+        setattr(model.config, field, getattr(config, field))
+    model.config.attn_implementation_original = getattr(
+        config, "attn_implementation_original", config.attn_implementation
+    )
 
     layer_idx = 0
     for m in model.modules():
