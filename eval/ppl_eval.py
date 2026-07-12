@@ -54,7 +54,7 @@ def pipeline_ppl(model, chunks):
         out = model(input_ids=ids.cuda(), labels=ids.cuda(), use_cache=False)
         losses.append(out.loss.item())
     mean = sum(losses) / len(losses)
-    return mean, math.exp(mean)
+    return mean, math.exp(mean), losses
 
 
 def main():
@@ -92,11 +92,13 @@ def main():
 
         if chunks is None:
             chunks = test_chunks(tokenizer, args.seq_len, args.chunks)
-        loss, ppl = pipeline_ppl(model, chunks)
-        results[arm] = (loss, ppl)
+        loss, ppl, per_chunk = pipeline_ppl(model, chunks)
+        results[arm] = (loss, ppl, per_chunk)
         print(f"[ppl] {arm}: loss {loss:.4f}  ppl {ppl:.3f}  "
               f"({args.chunks} held-out PG19-test chunks @ {args.seq_len})", flush=True)
+        print(f"[ppl] {arm} per-chunk: {[round(x, 4) for x in per_chunk]}", flush=True)
         run.log({f"ppl/{arm}": ppl, f"loss/{arm}": loss})
+        run.summary[f"per_chunk_loss_{arm}"] = per_chunk
         # the _sample monkey-patch creates a self-reference cycle, so refcount
         # freeing never fires — collect explicitly or the next arm OOMs on 40GB
         model._sample = None
@@ -106,6 +108,17 @@ def main():
         torch.cuda.empty_cache()
 
     run.summary.update({f"ppl_{k}": v[1] for k, v in results.items()})
+    # paired per-chunk deltas: identical chunks across arms, so mean±std of
+    # the difference is the sensitive test for small gaps between arms
+    arms = list(results)
+    for i, a in enumerate(arms):
+        for b in arms[i + 1:]:
+            d = [x - y for x, y in zip(results[a][2], results[b][2])]
+            m = sum(d) / len(d)
+            sd = (sum((x - m) ** 2 for x in d) / max(len(d) - 1, 1)) ** 0.5
+            run.summary[f"paired_{a}_minus_{b}"] = m
+            print(f"[ppl] paired loss {a}-{b}: {m:+.4f} ± {sd / len(d) ** 0.5:.4f} (sem)",
+                  flush=True)
     run.finish()
     print("[ppl] DONE:", {k: round(v[1], 3) for k, v in results.items()}, flush=True)
 

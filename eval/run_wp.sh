@@ -9,7 +9,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -34,6 +34,7 @@ case "$WP" in
        ARM="all"; TESTS="tests/test_flex_delta.py"; PILOT=1 ;;
   t2eval) TESTS=""; T2EVAL=1 ;;
   longbench) TESTS="tests/test_longbench_offline.py"; LONGBENCH=1 ;;
+  ppl32k) TESTS=""; PPL32K=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -111,6 +112,22 @@ PYEOF
   stage "posttrain-ruler:running"
   python eval/run_matrix.py --configs t2eval || { stage "posttrain-ruler:FAILED"; exit 1; }
   stage "posttrain-ruler:PASS"
+fi
+
+if [ -n "$PPL32K" ]; then
+  stage "adapter-fetch:running"
+  python - <<'PYEOF' || { stage "adapter-fetch:FAILED"; exit 1; }
+import wandb
+api = wandb.Api()
+for arm in ("delta", "dense", "detach"):
+    api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest").download(root=f"checkpoints/pilot_{arm}")
+    print("fetched", arm)
+PYEOF
+  stage "adapter-fetch:PASS"
+  stage "ppl32k:running"
+  python eval/ppl_eval.py --arms base,delta,dense,detach --chunks 32 --seq-len 32768 \
+    || { stage "ppl32k:FAILED"; exit 1; }
+  stage "ppl32k:PASS"
 fi
 
 if [ -n "$LONGBENCH" ]; then
