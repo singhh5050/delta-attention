@@ -2,7 +2,7 @@
 # Unified per-experiment gate chain: setup+Gate1 -> identity tests -> payload.
 # Usage: bash eval/run_wp.sh <mode>
 # Modes: wp1 | wp3 | wp2 | wp2train | driftprobe | eval32k | falsify | decsweep
-#        | wp2pilot-{delta,dense,detach,all} | t2eval | longbench
+#        | wp2pilot-{delta,dense,detach,all} | t2eval | longbench | ppl32k
 # Writes one line per stage to ~/wp_status; designed for nohup; self-terminates
 # + archives on clean completion when SELF_TERMINATE creds are in the env.
 set -uo pipefail
@@ -13,6 +13,16 @@ SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL="
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
+
+fetch_adapters() {  # usage: fetch_adapters <arm>... — one source of truth
+  python - "$@" <<'PYEOF'
+import sys, wandb
+api = wandb.Api()
+for arm in sys.argv[1:]:
+    api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest").download(root=f"checkpoints/pilot_{arm}")
+    print("fetched", arm)
+PYEOF
+}
 
 case "$WP" in
   wp1) TESTS="tests/test_stride_offline.py tests/test_variable_stride.py"
@@ -97,13 +107,7 @@ fi
 
 if [ -n "$T2EVAL" ]; then
   stage "adapter-fetch:running"
-  python - <<'PYEOF' || { stage "adapter-fetch:FAILED"; exit 1; }
-import wandb
-api = wandb.Api()
-for arm in ("delta", "dense", "detach"):
-    api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest").download(root=f"checkpoints/pilot_{arm}")
-    print("fetched", arm)
-PYEOF
+  fetch_adapters delta dense detach || { stage "adapter-fetch:FAILED"; exit 1; }
   stage "adapter-fetch:PASS"
   stage "posttrain-ppl:running"
   python eval/ppl_eval.py --arms base,delta,dense,detach --chunks 16 \
@@ -116,13 +120,7 @@ fi
 
 if [ -n "$PPL32K" ]; then
   stage "adapter-fetch:running"
-  python - <<'PYEOF' || { stage "adapter-fetch:FAILED"; exit 1; }
-import wandb
-api = wandb.Api()
-for arm in ("delta", "dense", "detach"):
-    api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest").download(root=f"checkpoints/pilot_{arm}")
-    print("fetched", arm)
-PYEOF
+  fetch_adapters delta dense detach || { stage "adapter-fetch:FAILED"; exit 1; }
   stage "adapter-fetch:PASS"
   stage "ppl32k:running"
   python eval/ppl_eval.py --arms base,delta,dense,detach --chunks 32 --seq-len 32768 \
@@ -132,13 +130,7 @@ fi
 
 if [ -n "$LONGBENCH" ]; then
   stage "adapter-fetch:running"
-  python - <<'PYEOF' || { stage "adapter-fetch:FAILED"; exit 1; }
-import wandb
-api = wandb.Api()
-for arm in ("delta", "dense"):
-    api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest").download(root=f"checkpoints/pilot_{arm}")
-    print("fetched", arm)
-PYEOF
+  fetch_adapters delta dense || { stage "adapter-fetch:FAILED"; exit 1; }
   stage "adapter-fetch:PASS"
   stage "longbench-smoke:running"
   python eval/longbench_eval.py --suite v1 --n-samples 5 --arms base_delta \
@@ -153,10 +145,8 @@ PYEOF
   python eval/longbench_eval.py --suite v2 --n-samples 200 \
     || { stage "longbench-v2:FAILED"; exit 1; }
   stage "longbench-v2:PASS"
-  stage "ppl-32k:running"
-  python eval/ppl_eval.py --arms base,delta,dense --chunks 8 --seq-len 32768 \
-    || { stage "ppl-32k:FAILED"; exit 1; }
-  stage "ppl-32k:PASS"
+  # 32K perplexity lives in the dedicated ppl32k mode (32 chunks, 4 arms) —
+  # no second, weaker copy of that stage here
 fi
 
 stage "ALL-DONE"
@@ -171,8 +161,8 @@ run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
                  name=f"box_archive_{os.environ.get('SELF_INSTANCE_ID','?')[:8]}",
                  job_type="box-archive")
 art = wandb.Artifact("box_final_state", type="box-archive")
-for p in ["results/results.csv", os.path.expanduser("~/wp.log"),
-          os.path.expanduser("~/wp_status")] + glob.glob("results/server_logs/*.jsonl"):
+for p in [os.path.expanduser("~/wp.log"), os.path.expanduser("~/wp_status")] \
+        + glob.glob("results/*.csv") + glob.glob("results/server_logs/*.jsonl"):
     if os.path.exists(p):
         art.add_file(p, name=os.path.basename(p))
 run.log_artifact(art)

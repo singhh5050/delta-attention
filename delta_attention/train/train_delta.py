@@ -269,12 +269,17 @@ def main():
         log = {"loss": loss.item(), "ppl": math.exp(min(loss.item(), 20.0)),
                "lr": sched.get_last_lr()[0], "tokens_per_sec": tps, "step": step}
         if step % args.probe_every == 0 or step == args.steps:
+            # NOTE: as of this commit anchor_grad_ratio is arm-faithful
+            # (mirrors the arm's detach setting); pilot runs atyhqiir/2hepajmg
+            # logged the full-graph value for every arm — not comparable.
             log["anchor_grad_ratio"] = probe_anchor_grad_ratio(
                 model, heldout[0], args.gamma, args.window,
                 detach_delta=model.config.detach_delta)
-            # decomposition for the delta arm: how much of the ratio is the
-            # gamma-fold summed correction vs the anchor's key-dense forward
-            if not model.config.detach_delta:
+            # decomposition (delta arm only — for dense it is an expensive
+            # no-op unrelated to its sdpa training graph): how much of the
+            # ratio is the gamma-fold summed correction vs the anchor's
+            # key-dense forward
+            if args.arm == "delta" and not model.config.detach_delta:
                 log["anchor_grad_ratio_detached"] = probe_anchor_grad_ratio(
                     model, heldout[0], args.gamma, args.window, detach_delta=True)
             drift = {}

@@ -74,6 +74,21 @@ class Config:
     hip_attention_last_dense = 64
 
 
+# Pipeline knobs the attention modules read from model.config; init_model
+# copies exactly these from Config. New Config fields the pipeline consumes
+# MUST be added here (same file as the field) or model.config silently keeps
+# the stale default. Do NOT fold generation params (temperature/top_k/top_p)
+# in: transformers' legacy path reads those off model.config and it would
+# change generate() behavior.
+PIPELINE_FIELDS = (
+    "mode", "delta_lambda", "sliding_window", "log_drift",
+    "stride_policy", "gamma_min", "gamma_max", "adapt_chunk",
+    "adapt_threshold", "stride_trigger", "adapt_k",
+    "decode_mode", "gamma_dec", "refresh_policy", "drift_threshold",
+    "drift_k", "gamma_dec_max",
+)
+
+
 def get_hip_config(config: Config, layer_idx: int):
     preset_name = os.environ.get("PRESET", "default")
     if preset_name == "default":

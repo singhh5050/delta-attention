@@ -20,7 +20,7 @@ from transformers.generation.utils import GenerateNonBeamOutput
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .llama import LlamaAttention, LlamaConfig, LlamaForCausalLM
-from .config import get_hip_config
+from .config import PIPELINE_FIELDS, get_hip_config
 
 
 def _sample(
@@ -282,25 +282,7 @@ def init_model(config):
     )
 
     model.args = config
-    for field in (
-        "mode",
-        "delta_lambda",
-        "sliding_window",
-        "log_drift",
-        "stride_policy",
-        "gamma_min",
-        "gamma_max",
-        "adapt_chunk",
-        "adapt_threshold",
-        "stride_trigger",
-        "adapt_k",
-        "decode_mode",
-        "gamma_dec",
-        "refresh_policy",
-        "drift_threshold",
-        "drift_k",
-        "gamma_dec_max",
-    ):
+    for field in PIPELINE_FIELDS:
         setattr(model.config, field, getattr(config, field))
     model.config.attn_implementation_original = getattr(
         config, "attn_implementation_original", config.attn_implementation

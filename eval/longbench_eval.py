@@ -30,6 +30,7 @@ import string
 import sys
 import zipfile
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 
 try:  # scorer/truncation stay importable on torch-less boxes (offline tests)
@@ -118,6 +119,7 @@ def qa_f1_score(prediction: str, ground_truths) -> float:
 # newer `datasets` refuses to load; the raw jsonl needs no script)
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=None)  # called once per arm — don't re-parse the zip 4x
 def load_v1(task: str):
     from huggingface_hub import hf_hub_download
 
@@ -177,13 +179,10 @@ def build_model(arm: str, gamma: int, window: int):
     return model, tokenizer
 
 
-def free_model(model):
-    # same reference-cycle break as ppl_eval: the _sample MethodType keeps the
-    # model alive, so the next arm OOMs without an explicit collect
-    model._sample = None
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
+# NOTE: freeing between arms happens inline in main() — `del model` only
+# works from the scope that owns the binding; a free_model(model) helper's
+# local del is a no-op and leaves two 16GB models resident during the next
+# build_model (OOM on 40GB boxes).
 
 
 def generate_answer(model, tokenizer, prompt: str, max_new: int) -> str:
@@ -221,6 +220,8 @@ def run_v1(model, tokenizer, arm: str, n: int, log):
     scores = {}
     for task, (template, max_new) in V1_TASKS.items():
         rows = load_v1(task)[:n]
+        if not rows:
+            raise SystemExit(f"no samples for {task} (n={n})")
         vals = []
         for i, ex in enumerate(rows):
             prompt = template.format(context=ex["context"], input=ex["input"])
@@ -287,17 +288,22 @@ def main():
     fh = out_path.open("a", newline="")
     writer = csv.writer(fh)
     if new_file:
-        writer.writerow(["suite", "task", "arm", "n", "score"])
+        writer.writerow(["suite", "task", "arm", "n", "score", "run_id"])
 
     def log(arm, suite, task, n, score):
-        writer.writerow([suite, task, arm, n, f"{score:.4f}"])
+        # run_id disambiguates rows when a retried chain appends a second set
+        writer.writerow([suite, task, arm, n, f"{score:.4f}", run.id])
         fh.flush()
         run.log({f"longbench/{arm}/{suite}_{task}": score})
         run.summary[f"{suite}_{task}_{arm}"] = score
 
+    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    unknown = [a for a in arms if a not in ARMS]
+    if unknown:  # fail before any model is built, not after arm 1's GPU-hours
+        raise SystemExit(f"unknown arms {unknown}; valid: {ARMS}")
+
     v2_samples = None
-    for arm in args.arms.split(","):
-        assert arm in ARMS, f"unknown arm {arm}"
+    for arm in arms:
         model, tokenizer = build_model(arm, args.gamma, args.window)
         if args.suite == "v1":
             run_v1(model, tokenizer, arm, args.n_samples, log)
@@ -305,8 +311,15 @@ def main():
             if v2_samples is None:
                 v2_samples = select_v2(tokenizer, args.n_samples)
                 print(f"[lb-v2] selected {len(v2_samples)} samples", flush=True)
+                if not v2_samples:
+                    raise SystemExit("no LongBench-v2 samples fit the token budget")
             run_v2(model, tokenizer, arm, v2_samples, log)
-        free_model(model)
+        # break the _sample MethodType reference cycle, then drop OUR binding —
+        # del must run in this scope or the object survives into the next load
+        model._sample = None
+        del model, tokenizer
+        gc.collect()
+        torch.cuda.empty_cache()
 
     fh.close()
     run.finish()
