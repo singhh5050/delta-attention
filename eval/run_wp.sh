@@ -2,14 +2,14 @@
 # Unified per-experiment gate chain: setup+Gate1 -> identity tests -> payload.
 # Usage: bash eval/run_wp.sh <mode>
 # Modes: wp1 | wp3 | wp2 | wp2train | driftprobe | eval32k | falsify | decsweep
-#        | wp2pilot-{delta,dense,detach,all}
+#        | wp2pilot-{delta,dense,detach,all} | t2eval | longbench
 # Writes one line per stage to ~/wp_status; designed for nohup; self-terminates
 # + archives on clean completion when SELF_TERMINATE creds are in the env.
 set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -33,6 +33,7 @@ case "$WP" in
   wp2pilot-all)
        ARM="all"; TESTS="tests/test_flex_delta.py"; PILOT=1 ;;
   t2eval) TESTS=""; T2EVAL=1 ;;
+  longbench) TESTS="tests/test_longbench_offline.py"; LONGBENCH=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -110,6 +111,35 @@ PYEOF
   stage "posttrain-ruler:running"
   python eval/run_matrix.py --configs t2eval || { stage "posttrain-ruler:FAILED"; exit 1; }
   stage "posttrain-ruler:PASS"
+fi
+
+if [ -n "$LONGBENCH" ]; then
+  stage "adapter-fetch:running"
+  python - <<'PYEOF' || { stage "adapter-fetch:FAILED"; exit 1; }
+import wandb
+api = wandb.Api()
+for arm in ("delta", "dense"):
+    api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest").download(root=f"checkpoints/pilot_{arm}")
+    print("fetched", arm)
+PYEOF
+  stage "adapter-fetch:PASS"
+  stage "longbench-smoke:running"
+  python eval/longbench_eval.py --suite v1 --n-samples 5 --arms base_delta \
+    --out results/longbench_smoke.csv \
+    || { stage "longbench-smoke:FAILED"; exit 1; }
+  stage "longbench-smoke:PASS"
+  stage "longbench-v1:running"
+  python eval/longbench_eval.py --suite v1 --n-samples 50 \
+    || { stage "longbench-v1:FAILED"; exit 1; }
+  stage "longbench-v1:PASS"
+  stage "longbench-v2:running"
+  python eval/longbench_eval.py --suite v2 --n-samples 200 \
+    || { stage "longbench-v2:FAILED"; exit 1; }
+  stage "longbench-v2:PASS"
+  stage "ppl-32k:running"
+  python eval/ppl_eval.py --arms base,delta,dense --chunks 8 --seq-len 32768 \
+    || { stage "ppl-32k:FAILED"; exit 1; }
+  stage "ppl-32k:PASS"
 fi
 
 stage "ALL-DONE"
