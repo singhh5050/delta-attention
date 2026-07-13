@@ -9,7 +9,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -45,6 +45,7 @@ case "$WP" in
   t2eval) TESTS=""; T2EVAL=1 ;;
   longbench) TESTS="tests/test_longbench_offline.py"; LONGBENCH=1 ;;
   ppl32k) TESTS=""; PPL32K=1 ;;
+  gap) TESTS="tests/test_longbench_offline.py tests/test_delta_decode.py"; GAP=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -147,6 +148,22 @@ if [ -n "$LONGBENCH" ]; then
   stage "longbench-v2:PASS"
   # 32K perplexity lives in the dedicated ppl32k mode (32 chunks, 4 arms) —
   # no second, weaker copy of that stage here
+fi
+
+if [ -n "$GAP" ]; then
+  stage "adapter-fetch:running"
+  fetch_adapters delta dense detach || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  # 2x2 completion: same 32 chunks (deterministic selection), dense forward
+  stage "ppl32k-dense:running"
+  python eval/ppl_eval.py --forward dense --arms base,delta,dense,detach \
+    --chunks 32 --seq-len 32768 || { stage "ppl32k-dense:FAILED"; exit 1; }
+  stage "ppl32k-dense:PASS"
+  stage "longbench-decode:running"
+  python eval/longbench_eval.py --suite v1 --n-samples 50 \
+    --arms sparse_dec,delta_dec2,delta_dec16 \
+    || { stage "longbench-decode:FAILED"; exit 1; }
+  stage "longbench-decode:PASS"
 fi
 
 stage "ALL-DONE"

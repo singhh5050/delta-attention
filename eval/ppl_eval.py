@@ -25,6 +25,10 @@ sys.path.insert(0, str(REPO_ROOT))
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--arms", type=str, default="base,delta,dense,detach")
+    p.add_argument("--forward", choices=["pipeline", "dense"], default="pipeline",
+                   help="eval-time attention: the delta pipeline forward or plain "
+                        "dense (the missing 2x2 cell: does delta-training help "
+                        "only under the pipeline, or generically?)")
     p.add_argument("--chunks", type=int, default=16)
     p.add_argument("--seq-len", type=int, default=8192)
     p.add_argument("--gamma", type=int, default=64)
@@ -65,28 +69,31 @@ def main():
     from delta_attention.sample import init_model
 
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
-                     name="wp2_posttrain_ppl", config=vars(args))
+                     name=f"wp2_posttrain_ppl_{args.forward}", config=vars(args))
     results = {}
     tokenizer_ref = None
     chunks = None
 
     for arm in args.arms.split(","):
         cfg = Config()
-        cfg.attn_implementation = "window"
-        cfg.mode = "delta"
-        cfg.delta_lambda = args.gamma
-        cfg.sliding_window = args.window
+        if args.forward == "dense":
+            cfg.attn_implementation = "flash_attention_2"
+            cfg.mode = "none"
+        else:
+            cfg.attn_implementation = "window"
+            cfg.mode = "delta"
+            cfg.delta_lambda = args.gamma
+            cfg.sliding_window = args.window
         cfg.attn_implementation_original = cfg.attn_implementation
         if arm != "base":
             path = Path(args.adapters_root) / f"pilot_{arm}"
             assert path.exists(), f"adapter missing: {path} (download from wandb first)"
             cfg.checkpoint = str(path)
         model, tokenizer = init_model(cfg)
-        model.config.delta_lambda = args.gamma
-        model.config.sliding_window = args.window
         model.config.log_drift = False
         model.config.detach_delta = False
-        model.config._attn_implementation = "flex_delta_train"  # pipeline forward, no-grad
+        if args.forward == "pipeline":
+            model.config._attn_implementation = "flex_delta_train"  # pipeline forward, no-grad
         model.config.use_cache = False
         model.eval().cuda()
 

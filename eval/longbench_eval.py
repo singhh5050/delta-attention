@@ -71,9 +71,16 @@ V2_TEMPLATE = (
     "Answer with a single letter (A, B, C, or D)."
 )
 
-ARMS = ("base_dense", "base_delta", "ce_delta", "dense_delta")
+ARMS = ("base_dense", "base_delta", "ce_delta", "dense_delta",
+        # decode arms (base model, delta prefill g64, non-dense decode):
+        # does the RULER decode cliff replicate on QA, or is it
+        # needle-retrieval-specific?
+        "sparse_dec", "delta_dec2", "delta_dec16")
 ADAPTERS = {"ce_delta": "checkpoints/pilot_delta",
             "dense_delta": "checkpoints/pilot_dense"}
+DECODE_ARMS = {"sparse_dec": ("sparse", None),
+               "delta_dec2": ("delta", 2),
+               "delta_dec16": ("delta", 16)}
 
 
 def parse_args():
@@ -168,6 +175,11 @@ def build_model(arm: str, gamma: int, window: int):
         cfg.mode = "delta"
         cfg.delta_lambda = gamma
         cfg.sliding_window = window
+        if arm in DECODE_ARMS:
+            cfg.decode_mode, gd = DECODE_ARMS[arm]
+            if gd is not None:
+                cfg.gamma_dec = gd
+                cfg.refresh_policy = "fixed"
     cfg.attn_implementation_original = cfg.attn_implementation
     if arm in ADAPTERS:
         path = Path(ADAPTERS[arm])
