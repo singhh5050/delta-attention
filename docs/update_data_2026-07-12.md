@@ -252,6 +252,29 @@ the scoring method, is the limitation. Both finetuned arms drop equally
 (again no delta-specific difference). Not a useful arena for this comparison;
 reported for completeness.
 
+### 4c. Delta/sparse decode on LongBench v1 QA (run 2026-07-13, box dc5492fa)
+
+Does the RULER decode cliff (76.7 dense → 20–28 for any sparse/delta decode)
+replicate on QA? Base model, delta prefill γ=64, decode varied; same 4 tasks ×
+50 samples as §4a.
+
+| decode | hotpotqa | 2wikimqa | musique | multifieldqa_en | mean |
+|---|---|---|---|---|---|
+| dense (§4a base_delta) | 0.4541 | 0.4457 | 0.3074 | 0.6086 | 0.4540 |
+| sparse (sink+window only) | 0.4308 | 0.4156 | 0.2829 | 0.5372 | 0.4166 |
+| delta decode γ_dec=2 | 0.4326 | 0.4293 | 0.2984 | 0.5778 | 0.4345 |
+| delta decode γ_dec=16 | 0.4200 | 0.4105 | 0.2920 | 0.5366 | 0.4148 |
+
+Observations:
+1. **The cliff does not replicate on QA.** Pure sparse decode costs 3.7 F1
+   points on LongBench QA (0.454 → 0.417); on RULER the same change collapses
+   accuracy from 76.7 to 20.0. Direct confirmation that the decode failure is
+   needle-retrieval-specific: RULER's exact-string answers need dense readout
+   at generation time; QA answers largely survive window-only decoding.
+2. Delta decode adds little over sparse here (γ_dec=2: +1.8 F1 over sparse,
+   γ_dec=16: ≈ sparse) — consistent with the RULER staleness result, but the
+   stakes are ~2 points instead of ~50.
+
 ---
 
 ## 5. 32K-context perplexity — the reversal (2026-07-12)
@@ -319,7 +342,44 @@ detach: 1.9613 3.0085 2.8934 2.3267 2.5292 2.8086 2.8087 2.1939 2.1580 2.1183
         2.2972 2.2642
 ```
 
-### 5c. Observations
+### 5c. The 2×2 completion: dense-forward eval of the same arms (run
+wp2_posttrain_ppl_dense, 2026-07-13, box dc5492fa)
+
+Same 32 chunks (deterministic selection verified per-chunk), same four arms,
+but evaluated under plain dense attention (flash_attention_2, mode=none) —
+the cell that separates "adapted to the pipeline" from "generically better
+model":
+
+| arm | dense-eval ppl | pipeline-eval ppl (§5b) |
+|---|---|---|
+| base | 11.265 | 12.222 |
+| delta-trained | 9.795 | 10.373 |
+| detach-trained | 9.774 | 10.469 |
+| dense-trained | 9.733 | 10.585 |
+
+Paired per-chunk loss differences under dense eval:
+base−delta +0.1399, base−dense +0.1462, base−detach +0.1420,
+**delta−dense +0.0063**, delta−detach +0.0021, dense−detach −0.0042.
+
+Observations:
+1. **The sign flips.** Under the pipeline, delta-trained beats dense-trained
+   by −0.0202; under dense eval it *loses* by +0.0063. The delta arm's
+   advantage is pipeline-specific, not generic model quality — the crossover
+   is the signature of genuine adaptation (each arm is best under the forward
+   it trained through).
+2. **The ordering reverses monotonically:** pipeline eval delta < detach <
+   dense; dense eval dense < detach < delta. Detach sits in the middle both
+   times.
+3. **Pipeline tax (per-arm loss penalty of pipeline vs dense eval, same
+   chunks):** base 0.0815, dense-trained 0.0838, detach-trained 0.0687,
+   delta-trained **0.0574**. Training through the pipeline cut the
+   approximation cost ~30% vs the dense control; detach (forward-only
+   exposure) cut it ~18% — the tax itself shows the same dose-response.
+4. Trade-off honesty: the delta arm paid a small generic-quality price
+   (+0.006 loss under dense eval) for the pipeline fit (−0.020 under
+   pipeline eval).
+
+### 5d. Observations (pipeline-eval, from §5b)
 
 1. **The delta-trained model beats the dense-trained control on all 32 of 32
    chunks** (paired −0.0202 ± 0.0011, ≈18 sem from zero). The 8K triple-null
