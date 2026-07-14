@@ -6,7 +6,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eval.longbench_eval import (  # noqa: E402
-    f1_score, normalize_answer, qa_f1_score, truncate_middle, V1_TASKS,
+    ENMC_TEMPLATE, enmc_correct_letter, f1_score, normalize_answer,
+    qa_f1_score, truncate_middle, V1_TASKS,
 )
 
 
@@ -60,6 +61,26 @@ def test_v1_task_table():
     for template, max_new in V1_TASKS.values():
         assert "{context}" in template and "{input}" in template
         assert max_new in (32, 64)
+
+
+def test_enmc_template_placeholders():
+    for field in ("{context}", "{question}", "{A}", "{B}", "{C}", "{D}"):
+        assert field in ENMC_TEMPLATE
+
+
+def test_enmc_correct_letter():
+    ex = {"options": ["red", "green", "blue", "yellow"], "answer": ["green"]}
+    assert enmc_correct_letter(ex) == "B"
+    # whitespace on either side must not break the match
+    ex = {"options": ["red ", "green", "blue", "yellow"], "answer": [" red"]}
+    assert enmc_correct_letter(ex) == "A"
+
+
+def test_enmc_correct_letter_unmatched_is_none():
+    assert enmc_correct_letter(
+        {"options": ["a", "b", "c", "d"], "answer": ["e"]}) is None
+    assert enmc_correct_letter(
+        {"options": ["a", "b", "c", "d"], "answer": []}) is None
 
 
 if __name__ == "__main__":

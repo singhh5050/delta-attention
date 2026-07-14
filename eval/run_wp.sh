@@ -2,14 +2,15 @@
 # Unified per-experiment gate chain: setup+Gate1 -> identity tests -> payload.
 # Usage: bash eval/run_wp.sh <mode>
 # Modes: wp1 | wp3 | wp2 | wp2train | driftprobe | eval32k | falsify | decsweep
-#        | wp2pilot-{delta,dense,detach,all} | t2eval | longbench | ppl32k
+#        | wp2pilot-{delta,dense,detach,all} | t2eval | longbench | ppl32k | gap
+#        | train32k | distill | enmc
 # Writes one line per stage to ~/wp_status; designed for nohup; self-terminates
 # + archives on clean completion when SELF_TERMINATE creds are in the env.
 set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -46,6 +47,9 @@ case "$WP" in
   longbench) TESTS="tests/test_longbench_offline.py"; LONGBENCH=1 ;;
   ppl32k) TESTS=""; PPL32K=1 ;;
   gap) TESTS="tests/test_longbench_offline.py tests/test_delta_decode.py"; GAP=1 ;;
+  train32k) TESTS="tests/test_flex_delta.py"; TRAIN32K=1 ;;
+  distill) TESTS="tests/test_flex_delta.py"; DISTILL=1 ;;
+  enmc) TESTS="tests/test_longbench_offline.py"; ENMC=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -164,6 +168,76 @@ if [ -n "$GAP" ]; then
     --arms sparse_dec,delta_dec2,delta_dec16 \
     || { stage "longbench-decode:FAILED"; exit 1; }
   stage "longbench-decode:PASS"
+fi
+
+if [ -n "$TRAIN32K" ]; then
+  # retrain the pilot arms AT the length where the effect lives. 500 steps at
+  # 32K = the 8K pilot's token budget (2000x8192), so "longer sequences" is
+  # the only lever that moved. --tag _32k keeps wp2_adapter_<arm>:latest (the
+  # 8K adapters every existing eval fetches) untouched.
+  stage "train32k-smoke:running"
+  python -m delta_attention.train.train_delta --steps 20 --seq-len 32768 \
+    --probe-every 10 --arm delta --tag _smoke32k --save-dir checkpoints/smoke_32k \
+    || { stage "train32k-smoke:FAILED"; exit 1; }
+  stage "train32k-smoke:PASS"
+  for A in delta dense detach; do
+    stage "train32k-$A:running"
+    python -m delta_attention.train.train_delta --steps 500 --seq-len 32768 \
+      --probe-every 50 --arm "$A" --tag _32k --save-dir "checkpoints/pilot_${A}_32k" \
+      || { stage "train32k-$A:FAILED"; exit 1; }
+    stage "train32k-$A:PASS"
+  done
+  # same deterministic 32 chunks as the 8K-adapter runs -> paired across runs
+  stage "ppl32k-32ktrained:running"
+  python eval/ppl_eval.py --arms base,delta_32k,dense_32k,detach_32k \
+    --chunks 32 --seq-len 32768 || { stage "ppl32k-32ktrained:FAILED"; exit 1; }
+  stage "ppl32k-32ktrained:PASS"
+  stage "ppl32k-32ktrained-dense:running"
+  python eval/ppl_eval.py --forward dense --arms base,delta_32k,dense_32k,detach_32k \
+    --chunks 32 --seq-len 32768 || { stage "ppl32k-32ktrained-dense:FAILED"; exit 1; }
+  stage "ppl32k-32ktrained-dense:PASS"
+fi
+
+if [ -n "$DISTILL" ]; then
+  # distill objective (KL to the frozen dense teacher), same dials as the CE
+  # pilot (2000 steps @8K, identical data/seed) so it is a 4th comparable arm
+  stage "distill-smoke:running"
+  python -m delta_attention.train.train_delta --steps 20 --seq-len 8192 \
+    --probe-every 10 --arm distill --tag _smoke --save-dir checkpoints/smoke_distill \
+    || { stage "distill-smoke:FAILED"; exit 1; }
+  stage "distill-smoke:PASS"
+  stage "distill-train:running"
+  python -m delta_attention.train.train_delta --steps 2000 --seq-len 8192 \
+    --probe-every 100 --arm distill --save-dir checkpoints/pilot_distill \
+    || { stage "distill-train:FAILED"; exit 1; }
+  stage "distill-train:PASS"
+  stage "adapter-fetch:running"
+  fetch_adapters delta dense detach || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  stage "ppl32k-distill:running"
+  python eval/ppl_eval.py --arms base,delta,dense,detach,distill \
+    --chunks 32 --seq-len 32768 || { stage "ppl32k-distill:FAILED"; exit 1; }
+  stage "ppl32k-distill:PASS"
+  stage "ppl32k-distill-dense:running"
+  python eval/ppl_eval.py --forward dense --arms base,delta,dense,detach,distill \
+    --chunks 32 --seq-len 32768 || { stage "ppl32k-distill-dense:FAILED"; exit 1; }
+  stage "ppl32k-distill-dense:PASS"
+fi
+
+if [ -n "$ENMC" ]; then
+  stage "adapter-fetch:running"
+  fetch_adapters delta dense || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  stage "enmc-smoke:running"
+  python eval/longbench_eval.py --suite enmc --n-samples 3 --arms base_delta \
+    --out results/enmc_smoke.csv \
+    || { stage "enmc-smoke:FAILED"; exit 1; }
+  stage "enmc-smoke:PASS"
+  stage "enmc:running"
+  python eval/longbench_eval.py --suite enmc --n-samples 229 \
+    --arms base_dense,base_delta,ce_delta,dense_delta \
+    || { stage "enmc:FAILED"; exit 1; }
+  stage "enmc:PASS"
 fi
 
 stage "ALL-DONE"

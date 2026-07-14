@@ -40,12 +40,19 @@ def parse_args():
     p.add_argument("--gamma", type=int, default=64)
     p.add_argument("--window", type=int, default=2048)
     p.add_argument("--probe-every", type=int, default=25)
-    p.add_argument("--arm", choices=["delta", "dense", "detach"], default="delta",
+    p.add_argument("--arm", choices=["delta", "dense", "detach", "distill"], default="delta",
                    help="delta: train with the delta pipeline in-graph; "
                         "dense: standard attention (data/optimizer control); "
                         "detach: pipeline active but gradient blocked through "
-                        "the reused correction (mechanism control)")
+                        "the reused correction (mechanism control); "
+                        "distill: delta pipeline forward, loss = KL to the frozen "
+                        "dense teacher (adapters disabled) instead of CE")
     p.add_argument("--detach-delta", action="store_true", help="same as --arm detach")
+    p.add_argument("--distill-alpha", type=float, default=0.0,
+                   help="CE weight mixed into the distill loss (0 = pure KL)")
+    p.add_argument("--tag", type=str, default="",
+                   help="suffix for the wandb run/artifact names (e.g. _32k) so "
+                        "re-trainings don't clobber wp2_adapter_<arm>:latest")
     p.add_argument("--min-tokens-per-sec", type=float, default=0.0,
                    help="0 = derive floor from first timing steps * 0.5")
     p.add_argument("--save-dir", type=str, default="checkpoints/smoke")
@@ -108,6 +115,34 @@ def packed_pg19(tokenizer, seq_len, seed=0, max_chunks_per_doc=4):
         toks = tokenizer.encode(doc["text"], add_special_tokens=False)
         for c in range(min(len(toks) // seq_len, max_chunks_per_doc)):
             yield torch.tensor([toks[c * seq_len:(c + 1) * seq_len]], dtype=torch.long)
+
+
+def chunked_ce(logits, labels, chunk=2048):
+    """Shifted CE, fp32 one sequence-chunk at a time. The default labels= path
+    upcasts full-vocab logits to fp32 inside loss_function (~17GB at 32K) —
+    this covers the have-logits-already case (distill arm's CE logging/mixing);
+    the no-logits case routes through hip's memory_efficient_llm_ce instead
+    (output_logits=False)."""
+    import torch.nn.functional as F
+
+    lg, tg = logits[:, :-1], labels[:, 1:]
+    total = torch.zeros((), device=logits.device, dtype=torch.float32)
+    for i in range(0, lg.size(1), chunk):
+        total = total + F.cross_entropy(
+            lg[:, i:i + chunk].float().reshape(-1, lg.size(-1)),
+            tg[:, i:i + chunk].reshape(-1), reduction="sum")
+    return total / tg.numel()
+
+
+def kl_to_teacher(student_logits, teacher_logits, chunk=2048):
+    """Per-token mean KL(teacher || student), fp32 one sequence-chunk at a
+    time (b=1, like the probes)."""
+    total = torch.zeros((), device=student_logits.device, dtype=torch.float32)
+    for i in range(0, student_logits.size(1), chunk):
+        s = torch.log_softmax(student_logits[:, i:i + chunk].float(), dim=-1)
+        t = torch.log_softmax(teacher_logits[:, i:i + chunk].float(), dim=-1)
+        total = total + torch.sum(t.exp() * (t - s))
+    return total / student_logits.size(1)
 
 
 def probe_drift(model, batch, gamma, window):
@@ -232,7 +267,7 @@ def main():
     import wandb
 
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
-                     name=f"wp2_{args.arm}_s{args.seq_len}_n{args.steps}",
+                     name=f"wp2_{args.arm}{args.tag}_s{args.seq_len}_n{args.steps}",
                      config=vars(args))
 
     model, tokenizer = build_model(args)
@@ -251,8 +286,29 @@ def main():
     for step in range(1, args.steps + 1):
         batch = next(data).cuda()
         t0 = time.monotonic()
-        out = model(input_ids=batch, labels=batch)
-        loss = out.loss
+        if args.arm == "distill":
+            # teacher = the frozen base model (adapters off) under DENSE
+            # attention: the target is "what dense would have output here" —
+            # CE only pressures next-token logits; this pressures the whole
+            # distribution toward the dense one the pipeline approximates
+            with torch.no_grad(), model.disable_adapter():
+                model.config._attn_implementation = "sdpa"
+                t_logits = model(input_ids=batch).logits
+                model.config._attn_implementation = "flex_delta_train"
+            out = model(input_ids=batch)
+            loss = kl_to_teacher(out.logits, t_logits)
+            if args.distill_alpha > 0:
+                ce = chunked_ce(out.logits, batch)
+                loss = loss + args.distill_alpha * ce
+            else:
+                with torch.no_grad():  # logging only — keep it off the graph
+                    ce = chunked_ce(out.logits.detach(), batch)
+            del t_logits
+        else:
+            out = model(input_ids=batch, labels=batch,
+                        output_logits=args.seq_len <= 8192)
+            loss = out.loss
+            ce = loss
         if not torch.isfinite(loss):
             print(f"[train] FATAL: non-finite loss at step {step}", flush=True)
             sys.exit(1)
@@ -266,7 +322,10 @@ def main():
         t_hist.append(dt)
         tps = args.seq_len / dt
 
-        log = {"loss": loss.item(), "ppl": math.exp(min(loss.item(), 20.0)),
+        # ppl always from CE so it means the same thing across arms; for the
+        # distill arm "loss" is the KL objective and ce_loss tracks CE
+        log = {"loss": loss.item(), "ce_loss": ce.item(),
+               "ppl": math.exp(min(ce.item(), 20.0)),
                "lr": sched.get_last_lr()[0], "tokens_per_sec": tps, "step": step}
         if step % args.probe_every == 0 or step == args.steps:
             # NOTE: as of this commit anchor_grad_ratio is arm-faithful
@@ -279,7 +338,7 @@ def main():
             # no-op unrelated to its sdpa training graph): how much of the
             # ratio is the gamma-fold summed correction vs the anchor's
             # key-dense forward
-            if args.arm == "delta" and not model.config.detach_delta:
+            if args.arm in ("delta", "distill") and not model.config.detach_delta:
                 log["anchor_grad_ratio_detached"] = probe_anchor_grad_ratio(
                     model, heldout[0], args.gamma, args.window, detach_delta=True)
             drift = {}
@@ -307,9 +366,11 @@ def main():
     model.save_pretrained(args.save_dir)
     # boxes self-terminate on completion — the adapter must outlive the disk.
     # LoRA r16 on q/k/v/o is ~50MB; wandb artifact is the durable home.
-    artifact = wandb.Artifact(f"wp2_adapter_{args.arm}", type="lora-adapter",
+    artifact = wandb.Artifact(f"wp2_adapter_{args.arm}{args.tag}", type="lora-adapter",
                               metadata={"steps": args.steps, "seq_len": args.seq_len,
-                                        "gamma": args.gamma, "arm": args.arm})
+                                        "gamma": args.gamma, "arm": args.arm,
+                                        "tag": args.tag,
+                                        "distill_alpha": args.distill_alpha})
     artifact.add_dir(args.save_dir)
     run.log_artifact(artifact)
     run.summary["final_loss"] = loss.item()

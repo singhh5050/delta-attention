@@ -1,4 +1,5 @@
-"""LongBench v1 QA (generation+F1) and LongBench v2 MCQ (logprob) under the pipeline.
+"""LongBench v1 QA (generation+F1), LongBench v2 MCQ and InfiniteBench En.MC
+(letter-logprob) under the pipeline.
 
 Jeff's post-training eval ask: run the trained adapters on benchmarks beyond
 RULER. Four arms share identical prompts/samples; only the attention path and
@@ -16,6 +17,7 @@ noise (the MMLU-style scoring, but at lengths where delta != dense).
 
     python eval/longbench_eval.py --suite v1 --n-samples 50
     python eval/longbench_eval.py --suite v2 --n-samples 200
+    python eval/longbench_eval.py --suite enmc --n-samples 229
 """
 
 from __future__ import annotations
@@ -71,13 +73,29 @@ V2_TEMPLATE = (
     "Answer with a single letter (A, B, C, or D)."
 )
 
-ARMS = ("base_dense", "base_delta", "ce_delta", "dense_delta",
-        # decode arms (base model, delta prefill g64, non-dense decode):
-        # does the RULER decode cliff replicate on QA, or is it
-        # needle-retrieval-specific?
-        "sparse_dec", "delta_dec2", "delta_dec16")
+# InfiniteBench longbook_choice_eng prompt (prompt.py in the official repo)
+ENMC_TEMPLATE = (
+    "Read the book and answer the question.\n\n{context}\n\n"
+    "Question: {question}\n\nOnly one of the following options is correct, "
+    "tell me the answer using one single letter (A, B, C, or D). Don't say "
+    "anything else.\nA. {A}\nB. {B}\nC. {C}\nD. {D}\n\nAnswer:"
+)
+
+# DEFAULT_ARMS stays the original seven so existing chain stages (which rely
+# on the default --arms) keep working; new adapter arms are opt-in via --arms.
+DEFAULT_ARMS = ("base_dense", "base_delta", "ce_delta", "dense_delta",
+                # decode arms (base model, delta prefill g64, non-dense decode):
+                # does the RULER decode cliff replicate on QA, or is it
+                # needle-retrieval-specific?
+                "sparse_dec", "delta_dec2", "delta_dec16")
+ARMS = DEFAULT_ARMS + ("distill_delta",
+                       "ce32k_delta", "dense32k_delta", "detach32k_delta")
 ADAPTERS = {"ce_delta": "checkpoints/pilot_delta",
-            "dense_delta": "checkpoints/pilot_dense"}
+            "dense_delta": "checkpoints/pilot_dense",
+            "distill_delta": "checkpoints/pilot_distill",
+            "ce32k_delta": "checkpoints/pilot_delta_32k",
+            "dense32k_delta": "checkpoints/pilot_dense_32k",
+            "detach32k_delta": "checkpoints/pilot_detach_32k"}
 DECODE_ARMS = {"sparse_dec": ("sparse", None),
                "delta_dec2": ("delta", 2),
                "delta_dec16": ("delta", 16)}
@@ -85,8 +103,8 @@ DECODE_ARMS = {"sparse_dec": ("sparse", None),
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--suite", choices=["v1", "v2"], required=True)
-    p.add_argument("--arms", type=str, default=",".join(ARMS))
+    p.add_argument("--suite", choices=["v1", "v2", "enmc"], required=True)
+    p.add_argument("--arms", type=str, default=",".join(DEFAULT_ARMS))
     p.add_argument("--n-samples", type=int, default=50)
     p.add_argument("--gamma", type=int, default=64)
     p.add_argument("--window", type=int, default=2048)
@@ -140,6 +158,27 @@ def load_v2():
 
     jpath = hf_hub_download("THUDM/LongBench-v2", "data.json", repo_type="dataset")
     return json.loads(Path(jpath).read_text())
+
+
+def load_enmc():
+    from huggingface_hub import hf_hub_download
+
+    jpath = hf_hub_download("xinrongzhang2022/InfiniteBench",
+                            "longbook_choice_eng.jsonl", repo_type="dataset")
+    with open(jpath) as f:
+        return [json.loads(line) for line in f]
+
+
+def enmc_correct_letter(ex):
+    """InfiniteBench stores the answer as its option text; map it to A-D.
+    Returns None when it matches no option (skip the sample, don't guess)."""
+    if not ex.get("answer"):
+        return None
+    ans = ex["answer"][0].strip()
+    for letter, opt in zip("ABCD", ex["options"]):
+        if opt.strip() == ans:
+            return letter
+    return None
 
 
 def truncate_middle(prompt: str, tokenizer, max_tokens: int) -> str:
@@ -268,6 +307,44 @@ def select_v2(tokenizer, n: int):
     return picked
 
 
+def select_enmc(tokenizer, n: int):
+    """First n En.MC samples in dataset order (deterministic). Book contexts
+    are ~100K+ tokens, so every prompt gets middle-truncated to the 32K eval
+    budget — this compares the arms on identical truncated inputs, not
+    full-book QA. Truncation happens here, once, not per arm."""
+    picked, skipped = [], 0
+    for ex in load_enmc():
+        letter = enmc_correct_letter(ex)
+        if letter is None:
+            skipped += 1
+            continue
+        o = ex["options"]
+        prompt = ENMC_TEMPLATE.format(context=ex["context"], question=ex["input"],
+                                      A=o[0], B=o[1], C=o[2], D=o[3])
+        picked.append((truncate_middle(prompt, tokenizer, MAX_PROMPT_TOKENS), letter))
+        if len(picked) == n:
+            break
+    if skipped:
+        print(f"[enmc] skipped {skipped} samples whose answer matched no option",
+              flush=True)
+    return picked
+
+
+def run_enmc(model, tokenizer, arm: str, samples, log):
+    letters = ["A", "B", "C", "D"]
+    letter_ids = torch.tensor(
+        [tokenizer.encode(l, add_special_tokens=False)[0] for l in letters]).cuda()
+    hits = []
+    for prompt, answer in samples:
+        pick = choice_logprobs(model, tokenizer, chat_wrap(prompt, tokenizer),
+                               letter_ids)
+        hits.append(letters[pick] == answer)
+    acc = sum(hits) / len(hits)
+    log(arm, "enmc", "mcq", len(hits), acc)
+    print(f"[enmc] {arm}: acc {acc:.4f} (n={len(hits)})", flush=True)
+    return acc
+
+
 def run_v2(model, tokenizer, arm: str, samples, log):
     letters = ["A", "B", "C", "D"]
     letter_ids = torch.tensor(
@@ -315,10 +392,18 @@ def main():
         raise SystemExit(f"unknown arms {unknown}; valid: {ARMS}")
 
     v2_samples = None
+    enmc_samples = None
     for arm in arms:
         model, tokenizer = build_model(arm, args.gamma, args.window)
         if args.suite == "v1":
             run_v1(model, tokenizer, arm, args.n_samples, log)
+        elif args.suite == "enmc":
+            if enmc_samples is None:
+                enmc_samples = select_enmc(tokenizer, args.n_samples)
+                print(f"[enmc] selected {len(enmc_samples)} samples", flush=True)
+                if not enmc_samples:
+                    raise SystemExit("no InfiniteBench En.MC samples selected")
+            run_enmc(model, tokenizer, arm, enmc_samples, log)
         else:
             if v2_samples is None:
                 v2_samples = select_v2(tokenizer, args.n_samples)
