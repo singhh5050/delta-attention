@@ -23,6 +23,7 @@ import argparse
 import math
 import sys
 import time
+from contextlib import contextmanager
 
 import torch
 
@@ -53,6 +54,10 @@ def parse_args():
     p.add_argument("--tag", type=str, default="",
                    help="suffix for the wandb run/artifact names (e.g. _32k) so "
                         "re-trainings don't clobber wp2_adapter_<arm>:latest")
+    p.add_argument("--no-artifact", action="store_true",
+                   help="skip the wandb adapter upload (smoke runs — keeps "
+                        "throwaway adapters out of the wp2_adapter_* namespace "
+                        "that fetch_adapters treats as the source of truth)")
     p.add_argument("--min-tokens-per-sec", type=float, default=0.0,
                    help="0 = derive floor from first timing steps * 0.5")
     p.add_argument("--save-dir", type=str, default="checkpoints/smoke")
@@ -117,32 +122,67 @@ def packed_pg19(tokenizer, seq_len, seed=0, max_chunks_per_doc=4):
             yield torch.tensor([toks[c * seq_len:(c + 1) * seq_len]], dtype=torch.long)
 
 
-def chunked_ce(logits, labels, chunk=2048):
-    """Shifted CE, fp32 one sequence-chunk at a time. The default labels= path
-    upcasts full-vocab logits to fp32 inside loss_function (~17GB at 32K) —
-    this covers the have-logits-already case (distill arm's CE logging/mixing);
-    the no-logits case routes through hip's memory_efficient_llm_ce instead
-    (output_logits=False)."""
+def _ce_chunk(lg, tg):
     import torch.nn.functional as F
+
+    return F.cross_entropy(lg.float().reshape(-1, lg.size(-1)),
+                           tg.reshape(-1), reduction="sum")
+
+
+def _kl_chunk(s_lg, t_lg):
+    s = torch.log_softmax(s_lg.float(), dim=-1)
+    t = torch.log_softmax(t_lg.float(), dim=-1)
+    return torch.sum(t.exp() * (t - s))
+
+
+def chunked_ce(logits, labels, chunk=2048):
+    """Shifted CE from bf16 logits, fp32 one sequence-chunk at a time, each
+    chunk gradient-checkpointed so nothing fp32 is RETAINED for backward
+    (plain chunking only bounds temporaries — the saved log_softmax outputs
+    still scale with full sequence length, ~17GB at 32K).
+
+    This is the training loss for every arm: the default labels= path
+    upcasts full-vocab logits to fp32 inside loss_function, and the
+    output_logits=False alternative routes through hip's
+    memory_efficient_llm_ce, which is a FORWARD-ONLY Triton kernel (no
+    backward in hip-attn 1.2.9) — loss.backward() would raise."""
+    from torch.utils.checkpoint import checkpoint
 
     lg, tg = logits[:, :-1], labels[:, 1:]
     total = torch.zeros((), device=logits.device, dtype=torch.float32)
     for i in range(0, lg.size(1), chunk):
-        total = total + F.cross_entropy(
-            lg[:, i:i + chunk].float().reshape(-1, lg.size(-1)),
-            tg[:, i:i + chunk].reshape(-1), reduction="sum")
+        seg, tseg = lg[:, i:i + chunk], tg[:, i:i + chunk]
+        if seg.requires_grad:
+            total = total + checkpoint(_ce_chunk, seg, tseg, use_reentrant=False)
+        else:  # logging-only path (e.g. under no_grad)
+            total = total + _ce_chunk(seg, tseg)
     return total / tg.numel()
 
 
 def kl_to_teacher(student_logits, teacher_logits, chunk=2048):
     """Per-token mean KL(teacher || student), fp32 one sequence-chunk at a
-    time (b=1, like the probes)."""
+    time (b=1, like the probes), gradient-checkpointed per chunk — see
+    chunked_ce for why plain chunking is not enough."""
+    from torch.utils.checkpoint import checkpoint
+
     total = torch.zeros((), device=student_logits.device, dtype=torch.float32)
     for i in range(0, student_logits.size(1), chunk):
-        s = torch.log_softmax(student_logits[:, i:i + chunk].float(), dim=-1)
-        t = torch.log_softmax(teacher_logits[:, i:i + chunk].float(), dim=-1)
-        total = total + torch.sum(t.exp() * (t - s))
+        total = total + checkpoint(_kl_chunk, student_logits[:, i:i + chunk],
+                                   teacher_logits[:, i:i + chunk],
+                                   use_reentrant=False)
     return total / student_logits.size(1)
+
+
+@contextmanager
+def attn_impl(model, impl):
+    """Temporarily flip the attention dispatch; the restore is structural
+    (exception-safe), not a statement that only runs on the happy path."""
+    prev = model.config._attn_implementation
+    model.config._attn_implementation = impl
+    try:
+        yield
+    finally:
+        model.config._attn_implementation = prev
 
 
 def probe_drift(model, batch, gamma, window):
@@ -256,8 +296,36 @@ def startup_validation(model, args, run):
         train_out.flatten(2).float(), dense.flatten(2).float(), dim=-1)
     if cos.mean().item() <= 0.999:
         fail("gamma1-dense", f"mean cos {cos.mean().item():.6f}")
+
+    # chunked losses must match their unchunked forms AND backprop (the
+    # labels= path they replace upcasts full-vocab logits to fp32 — OOM at
+    # 32K — and hip's memory_efficient_llm_ce has no backward). chunk=100
+    # over 512 rows exercises multi-chunk + ragged tail.
+    lg = torch.randn(1, 512, 128, device="cuda", requires_grad=True)
+    tg = torch.randint(0, 128, (1, 512), device="cuda")
+    ref = torch.nn.functional.cross_entropy(
+        lg[:, :-1].reshape(-1, 128).float(), tg[:, 1:].reshape(-1))
+    ours = chunked_ce(lg, tg, chunk=100)
+    if abs(ref.item() - ours.item()) > 1e-4:
+        fail("chunked-ce", f"full {ref.item():.6f} vs chunked {ours.item():.6f}")
+    ours.backward()
+    if lg.grad is None or not torch.isfinite(lg.grad).all():
+        fail("chunked-ce-grad", "missing/non-finite grad through checkpoint")
+    s2 = lg.detach().clone().requires_grad_(True)
+    t2 = torch.randn(1, 512, 128, device="cuda")
+    sf = torch.log_softmax(s2.detach().float(), dim=-1)
+    tf = torch.log_softmax(t2.float(), dim=-1)
+    ref_kl = (torch.sum(tf.exp() * (tf - sf)) / s2.size(1)).item()
+    kl = kl_to_teacher(s2, t2, chunk=100)
+    if abs(ref_kl - kl.item()) > 1e-4:
+        fail("chunked-kl", f"full {ref_kl:.6f} vs chunked {kl.item():.6f}")
+    kl.backward()
+    if s2.grad is None or not torch.isfinite(s2.grad).all():
+        fail("chunked-kl-grad", "missing/non-finite grad through checkpoint")
+
     run.log({k: 0 for k in MANDATORY_KEYS})
-    print("[train startup_validation] PASS (gamma=1 dense check, wandb keys)", flush=True)
+    print("[train startup_validation] PASS (gamma=1 dense check, chunked "
+          "CE/KL vs full + backward, wandb keys)", flush=True)
 
 
 def main():
@@ -291,23 +359,20 @@ def main():
             # attention: the target is "what dense would have output here" —
             # CE only pressures next-token logits; this pressures the whole
             # distribution toward the dense one the pipeline approximates
-            with torch.no_grad(), model.disable_adapter():
-                model.config._attn_implementation = "sdpa"
+            with torch.no_grad(), model.disable_adapter(), attn_impl(model, "sdpa"):
                 t_logits = model(input_ids=batch).logits
-                model.config._attn_implementation = "flex_delta_train"
             out = model(input_ids=batch)
             loss = kl_to_teacher(out.logits, t_logits)
             if args.distill_alpha > 0:
                 ce = chunked_ce(out.logits, batch)
                 loss = loss + args.distill_alpha * ce
             else:
-                with torch.no_grad():  # logging only — keep it off the graph
-                    ce = chunked_ce(out.logits.detach(), batch)
+                with torch.no_grad():  # logging only
+                    ce = chunked_ce(out.logits, batch)
             del t_logits
         else:
-            out = model(input_ids=batch, labels=batch,
-                        output_logits=args.seq_len <= 8192)
-            loss = out.loss
+            out = model(input_ids=batch)
+            loss = chunked_ce(out.logits, batch)
             ce = loss
         if not torch.isfinite(loss):
             print(f"[train] FATAL: non-finite loss at step {step}", flush=True)
@@ -364,15 +429,19 @@ def main():
             print(f"[train] tokens/s {measured:.0f} (floor {floor:.0f})", flush=True)
 
     model.save_pretrained(args.save_dir)
-    # boxes self-terminate on completion — the adapter must outlive the disk.
-    # LoRA r16 on q/k/v/o is ~50MB; wandb artifact is the durable home.
-    artifact = wandb.Artifact(f"wp2_adapter_{args.arm}{args.tag}", type="lora-adapter",
-                              metadata={"steps": args.steps, "seq_len": args.seq_len,
-                                        "gamma": args.gamma, "arm": args.arm,
-                                        "tag": args.tag,
-                                        "distill_alpha": args.distill_alpha})
-    artifact.add_dir(args.save_dir)
-    run.log_artifact(artifact)
+    if not args.no_artifact:
+        # boxes self-terminate on completion — the adapter must outlive the
+        # disk. LoRA r16 on q/k/v/o is ~50MB; wandb artifact is the durable
+        # home.
+        artifact = wandb.Artifact(f"wp2_adapter_{args.arm}{args.tag}",
+                                  type="lora-adapter",
+                                  metadata={"steps": args.steps,
+                                            "seq_len": args.seq_len,
+                                            "gamma": args.gamma, "arm": args.arm,
+                                            "tag": args.tag,
+                                            "distill_alpha": args.distill_alpha})
+        artifact.add_dir(args.save_dir)
+        run.log_artifact(artifact)
     run.summary["final_loss"] = loss.item()
     run.finish()  # blocks until artifact upload completes
     print(f"[train] DONE: {args.steps} steps, final loss {loss.item():.4f}, "

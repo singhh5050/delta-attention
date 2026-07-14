@@ -175,11 +175,16 @@ if [ -n "$TRAIN32K" ]; then
   # 32K = the 8K pilot's token budget (2000x8192), so "longer sequences" is
   # the only lever that moved. --tag _32k keeps wp2_adapter_<arm>:latest (the
   # 8K adapters every existing eval fetches) untouched.
-  stage "train32k-smoke:running"
-  python -m delta_attention.train.train_delta --steps 20 --seq-len 32768 \
-    --probe-every 10 --arm delta --tag _smoke32k --save-dir checkpoints/smoke_32k \
-    || { stage "train32k-smoke:FAILED"; exit 1; }
-  stage "train32k-smoke:PASS"
+  # smoke ALL THREE arms first (a dense/detach-specific failure must not
+  # surface only after the delta arm's hours-long payload run)
+  for A in delta dense detach; do
+    stage "train32k-smoke-$A:running"
+    python -m delta_attention.train.train_delta --steps 20 --seq-len 32768 \
+      --probe-every 10 --arm "$A" --tag _smoke32k --no-artifact \
+      --save-dir "checkpoints/smoke_32k_$A" \
+      || { stage "train32k-smoke-$A:FAILED"; exit 1; }
+    stage "train32k-smoke-$A:PASS"
+  done
   for A in delta dense detach; do
     stage "train32k-$A:running"
     python -m delta_attention.train.train_delta --steps 500 --seq-len 32768 \
@@ -203,17 +208,19 @@ if [ -n "$DISTILL" ]; then
   # pilot (2000 steps @8K, identical data/seed) so it is a 4th comparable arm
   stage "distill-smoke:running"
   python -m delta_attention.train.train_delta --steps 20 --seq-len 8192 \
-    --probe-every 10 --arm distill --tag _smoke --save-dir checkpoints/smoke_distill \
+    --probe-every 10 --arm distill --tag _smoke --no-artifact \
+    --save-dir checkpoints/smoke_distill \
     || { stage "distill-smoke:FAILED"; exit 1; }
   stage "distill-smoke:PASS"
+  # fetch BEFORE the 3h train stage: a bad artifact must fail here, not after
+  stage "adapter-fetch:running"
+  fetch_adapters delta dense detach || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
   stage "distill-train:running"
   python -m delta_attention.train.train_delta --steps 2000 --seq-len 8192 \
     --probe-every 100 --arm distill --save-dir checkpoints/pilot_distill \
     || { stage "distill-train:FAILED"; exit 1; }
   stage "distill-train:PASS"
-  stage "adapter-fetch:running"
-  fetch_adapters delta dense detach || { stage "adapter-fetch:FAILED"; exit 1; }
-  stage "adapter-fetch:PASS"
   stage "ppl32k-distill:running"
   python eval/ppl_eval.py --arms base,delta,dense,detach,distill \
     --chunks 32 --seq-len 32768 || { stage "ppl32k-distill:FAILED"; exit 1; }
@@ -229,7 +236,10 @@ if [ -n "$ENMC" ]; then
   fetch_adapters delta dense || { stage "adapter-fetch:FAILED"; exit 1; }
   stage "adapter-fetch:PASS"
   stage "enmc-smoke:running"
-  python eval/longbench_eval.py --suite enmc --n-samples 3 --arms base_delta \
+  # all four arms at n=3: exercises adapter loading in minutes, not as arms
+  # 3-4 of the 229-sample payload hours in
+  python eval/longbench_eval.py --suite enmc --n-samples 3 \
+    --arms base_dense,base_delta,ce_delta,dense_delta \
     --out results/enmc_smoke.csv \
     || { stage "enmc-smoke:FAILED"; exit 1; }
   stage "enmc-smoke:PASS"

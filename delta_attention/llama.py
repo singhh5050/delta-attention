@@ -1294,6 +1294,10 @@ class LlamaModel(LlamaPreTrainedModel):
             # "recompute",
             # "delta",
             "dense",
+            # flex_delta_train builds its own block mask and never reads
+            # attention_mask; without this entry every 32K training/eval
+            # forward materializes a dead ~2.1GB 4D causal mask
+            "flex_delta_train",
         ]:
             if attention_mask is not None and (attention_mask == 0.0).any():
                 return attention_mask

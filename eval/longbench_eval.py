@@ -321,7 +321,8 @@ def select_enmc(tokenizer, n: int):
         o = ex["options"]
         prompt = ENMC_TEMPLATE.format(context=ex["context"], question=ex["input"],
                                       A=o[0], B=o[1], C=o[2], D=o[3])
-        picked.append((truncate_middle(prompt, tokenizer, MAX_PROMPT_TOKENS), letter))
+        picked.append((truncate_middle(prompt, tokenizer, MAX_PROMPT_TOKENS),
+                       letter, None))
         if len(picked) == n:
             break
     if skipped:
@@ -330,22 +331,10 @@ def select_enmc(tokenizer, n: int):
     return picked
 
 
-def run_enmc(model, tokenizer, arm: str, samples, log):
-    letters = ["A", "B", "C", "D"]
-    letter_ids = torch.tensor(
-        [tokenizer.encode(l, add_special_tokens=False)[0] for l in letters]).cuda()
-    hits = []
-    for prompt, answer in samples:
-        pick = choice_logprobs(model, tokenizer, chat_wrap(prompt, tokenizer),
-                               letter_ids)
-        hits.append(letters[pick] == answer)
-    acc = sum(hits) / len(hits)
-    log(arm, "enmc", "mcq", len(hits), acc)
-    print(f"[enmc] {arm}: acc {acc:.4f} (n={len(hits)})", flush=True)
-    return acc
-
-
-def run_v2(model, tokenizer, arm: str, samples, log):
+def run_mcq(model, tokenizer, arm: str, suite: str, samples, log):
+    """Shared letter-logprob runner for the MCQ suites (v2, enmc): one scoring
+    path so a fix (e.g. letter tokenization) can't silently diverge between
+    suites. samples: (prompt, answer_letter, difficulty_or_None)."""
     letters = ["A", "B", "C", "D"]
     letter_ids = torch.tensor(
         [tokenizer.encode(l, add_special_tokens=False)[0] for l in letters]).cuda()
@@ -355,13 +344,15 @@ def run_v2(model, tokenizer, arm: str, samples, log):
                                letter_ids)
         ok = letters[pick] == answer
         hits.append(ok)
-        by_diff.setdefault(diff, []).append(ok)
+        if diff is not None:
+            by_diff.setdefault(diff, []).append(ok)
     acc = sum(hits) / len(hits)
-    log(arm, "v2", "mcq", len(hits), acc)
+    log(arm, suite, "mcq", len(hits), acc)
     for diff, xs in sorted(by_diff.items()):
-        log(arm, "v2", f"mcq_{diff}", len(xs), sum(xs) / len(xs))
-    print(f"[lb-v2] {arm}: acc {acc:.4f} (n={len(hits)}) "
-          f"{ {d: round(sum(x)/len(x), 3) for d, x in by_diff.items()} }", flush=True)
+        log(arm, suite, f"mcq_{diff}", len(xs), sum(xs) / len(xs))
+    print(f"[{suite}] {arm}: acc {acc:.4f} (n={len(hits)})"
+          + (f" { {d: round(sum(x)/len(x), 3) for d, x in by_diff.items()} }"
+             if by_diff else ""), flush=True)
     return acc
 
 
@@ -403,14 +394,14 @@ def main():
                 print(f"[enmc] selected {len(enmc_samples)} samples", flush=True)
                 if not enmc_samples:
                     raise SystemExit("no InfiniteBench En.MC samples selected")
-            run_enmc(model, tokenizer, arm, enmc_samples, log)
+            run_mcq(model, tokenizer, arm, "enmc", enmc_samples, log)
         else:
             if v2_samples is None:
                 v2_samples = select_v2(tokenizer, args.n_samples)
                 print(f"[lb-v2] selected {len(v2_samples)} samples", flush=True)
                 if not v2_samples:
                     raise SystemExit("no LongBench-v2 samples fit the token budget")
-            run_v2(model, tokenizer, arm, v2_samples, log)
+            run_mcq(model, tokenizer, arm, "v2", v2_samples, log)
         # break the _sample MethodType reference cycle, then drop OUR binding —
         # del must run in this scope or the object survives into the next load
         model._sample = None
