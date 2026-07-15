@@ -106,6 +106,11 @@ def build_model(args):
     # LlamaModel.forward requires self.training — without train() it silently
     # no-ops and all activations stay resident (OOM'd a 40GB A100 at s=4096).
     model.train()
+    if args.arm != "distill":
+        # CE arms take their loss from hidden states (chunked_ce_hidden fuses
+        # the lm_head per chunk) — full-vocab logits are never materialized.
+        # The distill arm needs real logits for the KL, so it keeps lm_head.
+        setattr(model.get_base_model(), "no_lm_head", True)
     return model.cuda(), tokenizer
 
 
@@ -151,9 +156,31 @@ def packed_pg19(tokenizer, seq_len, seed=0, max_chunks_per_doc=4):
             yield torch.tensor([toks[c * seq_len:(c + 1) * seq_len]], dtype=torch.long)
 
 
+def _chunk_apply(fn, total, *args):
+    """One idiom for both loss helpers: gradient-checkpoint the chunk when
+    anything requires grad (so no fp32 chunk output is RETAINED for backward
+    — plain chunking only bounds temporaries), plain call otherwise (avoids
+    checkpoint's no-grad-inputs warning on logging-only paths)."""
+    from torch.utils.checkpoint import checkpoint
+
+    if any(isinstance(a, torch.Tensor) and a.requires_grad for a in args):
+        return total + checkpoint(fn, *args, use_reentrant=False)
+    return total + fn(*args)
+
+
 def _ce_chunk(lg, tg):
     import torch.nn.functional as F
 
+    # reduction="sum" skips ignore_index=-100 positions; callers must
+    # normalize by the NON-ignored count, not tg.numel()
+    return F.cross_entropy(lg.float().reshape(-1, lg.size(-1)),
+                           tg.reshape(-1), reduction="sum")
+
+
+def _ce_hidden_chunk(h, w, tg):
+    import torch.nn.functional as F
+
+    lg = F.linear(h, w)  # lm_head applied per chunk, inside the checkpoint
     return F.cross_entropy(lg.float().reshape(-1, lg.size(-1)),
                            tg.reshape(-1), reduction="sum")
 
@@ -165,40 +192,42 @@ def _kl_chunk(s_lg, t_lg):
 
 
 def chunked_ce(logits, labels, chunk=2048):
-    """Shifted CE from bf16 logits, fp32 one sequence-chunk at a time, each
-    chunk gradient-checkpointed so nothing fp32 is RETAINED for backward
-    (plain chunking only bounds temporaries — the saved log_softmax outputs
-    still scale with full sequence length, ~17GB at 32K).
-
-    This is the training loss for every arm: the default labels= path
-    upcasts full-vocab logits to fp32 inside loss_function, and the
+    """Shifted CE from logits, fp32 one gradient-checkpointed chunk at a
+    time. Used where full-vocab logits already exist (the distill arm needs
+    them for the KL). Normalizes by non-ignored (!= -100) label count,
+    matching the HF labels= path this replaced. That path was dropped
+    because it upcasts full-vocab logits to fp32 in loss_function, and the
     output_logits=False alternative routes through hip's
-    memory_efficient_llm_ce, which is a FORWARD-ONLY Triton kernel (no
-    backward in hip-attn 1.2.9) — loss.backward() would raise."""
-    from torch.utils.checkpoint import checkpoint
-
+    memory_efficient_llm_ce — a FORWARD-ONLY Triton kernel (no backward in
+    hip-attn 1.2.9), so loss.backward() would raise."""
     lg, tg = logits[:, :-1], labels[:, 1:]
     total = torch.zeros((), device=logits.device, dtype=torch.float32)
     for i in range(0, lg.size(1), chunk):
-        seg, tseg = lg[:, i:i + chunk], tg[:, i:i + chunk]
-        if seg.requires_grad:
-            total = total + checkpoint(_ce_chunk, seg, tseg, use_reentrant=False)
-        else:  # logging-only path (e.g. under no_grad)
-            total = total + _ce_chunk(seg, tseg)
-    return total / tg.numel()
+        total = _chunk_apply(_ce_chunk, total, lg[:, i:i + chunk], tg[:, i:i + chunk])
+    return total / (tg != -100).sum().clamp_min(1)
+
+
+def chunked_ce_hidden(hidden, lm_head_weight, labels, chunk=2048):
+    """Shifted CE straight from hidden states: the lm_head projection runs
+    per chunk INSIDE the checkpoint, so full-vocab logits are never
+    materialized (~8.4GB bf16 + an equal-size grad at 32K — fits an 80GB
+    card but nothing smaller). This is the training loss for the CE arms
+    (build_model sets no_lm_head for them)."""
+    h, tg = hidden[:, :-1], labels[:, 1:]
+    total = torch.zeros((), device=hidden.device, dtype=torch.float32)
+    for i in range(0, h.size(1), chunk):
+        total = _chunk_apply(_ce_hidden_chunk, total,
+                             h[:, i:i + chunk], lm_head_weight, tg[:, i:i + chunk])
+    return total / (tg != -100).sum().clamp_min(1)
 
 
 def kl_to_teacher(student_logits, teacher_logits, chunk=2048):
-    """Per-token mean KL(teacher || student), fp32 one sequence-chunk at a
-    time (b=1, like the probes), gradient-checkpointed per chunk — see
-    chunked_ce for why plain chunking is not enough."""
-    from torch.utils.checkpoint import checkpoint
-
+    """Per-token mean KL(teacher || student), fp32 one gradient-checkpointed
+    sequence-chunk at a time (b=1, like the probes)."""
     total = torch.zeros((), device=student_logits.device, dtype=torch.float32)
     for i in range(0, student_logits.size(1), chunk):
-        total = total + checkpoint(_kl_chunk, student_logits[:, i:i + chunk],
-                                   teacher_logits[:, i:i + chunk],
-                                   use_reentrant=False)
+        total = _chunk_apply(_kl_chunk, total, student_logits[:, i:i + chunk],
+                             teacher_logits[:, i:i + chunk])
     return total / student_logits.size(1)
 
 
@@ -329,17 +358,32 @@ def startup_validation(model, args, run):
     # chunked losses must match their unchunked forms AND backprop (the
     # labels= path they replace upcasts full-vocab logits to fp32 — OOM at
     # 32K — and hip's memory_efficient_llm_ce has no backward). chunk=100
-    # over 512 rows exercises multi-chunk + ragged tail.
+    # over 512 rows exercises multi-chunk + ragged tail; the -100 block
+    # exercises ignore-index normalization (divide by NON-ignored count).
     lg = torch.randn(1, 512, 128, device="cuda", requires_grad=True)
     tg = torch.randint(0, 128, (1, 512), device="cuda")
+    tg[0, 100:200] = -100
     ref = torch.nn.functional.cross_entropy(
-        lg[:, :-1].reshape(-1, 128).float(), tg[:, 1:].reshape(-1))
+        lg[:, :-1].reshape(-1, 128).float(), tg[:, 1:].reshape(-1),
+        ignore_index=-100)
     ours = chunked_ce(lg, tg, chunk=100)
     if abs(ref.item() - ours.item()) > 1e-4:
         fail("chunked-ce", f"full {ref.item():.6f} vs chunked {ours.item():.6f}")
     ours.backward()
     if lg.grad is None or not torch.isfinite(lg.grad).all():
         fail("chunked-ce-grad", "missing/non-finite grad through checkpoint")
+    # hidden-CE (lm_head fused per chunk) must match CE over full projection
+    hd = torch.randn(1, 512, 64, device="cuda", requires_grad=True)
+    w = torch.randn(128, 64, device="cuda")
+    ref_h = torch.nn.functional.cross_entropy(
+        torch.nn.functional.linear(hd, w)[:, :-1].reshape(-1, 128).float(),
+        tg[:, 1:].reshape(-1), ignore_index=-100)
+    ours_h = chunked_ce_hidden(hd, w, tg, chunk=100)
+    if abs(ref_h.item() - ours_h.item()) > 1e-4:
+        fail("chunked-ce-hidden", f"full {ref_h.item():.6f} vs {ours_h.item():.6f}")
+    ours_h.backward()
+    if hd.grad is None or not torch.isfinite(hd.grad).all():
+        fail("chunked-ce-hidden-grad", "missing/non-finite grad through checkpoint")
     s2 = lg.detach().clone().requires_grad_(True)
     t2 = torch.randn(1, 512, 128, device="cuda")
     sf = torch.log_softmax(s2.detach().float(), dim=-1)
@@ -372,8 +416,11 @@ def main():
 
     teacher = None
     if args.teacher_checkpoint:
-        assert args.arm == "distill", "--teacher-checkpoint is distill-only"
+        if args.arm != "distill":  # not assert: must survive python -O
+            raise SystemExit("--teacher-checkpoint is distill-only; "
+                             f"got --arm {args.arm}")
         teacher = build_teacher(args.teacher_checkpoint)
+    lm_head_w = model.get_base_model().lm_head.weight  # frozen (LoRA is q/k/v/o)
 
     data = packed_pg19(tokenizer, args.seq_len)
     heldout = [next(data) for _ in range(2)]  # drift probe sequences
@@ -411,8 +458,8 @@ def main():
                     ce = chunked_ce(out.logits, batch)
             del t_logits
         else:
-            out = model(input_ids=batch)
-            loss = chunked_ce(out.logits, batch)
+            out = model(input_ids=batch)  # no_lm_head -> logits ARE hidden states
+            loss = chunked_ce_hidden(out.logits, lm_head_w, batch)
             ce = loss
         if not torch.isfinite(loss):
             print(f"[train] FATAL: non-finite loss at step {step}", flush=True)
@@ -473,14 +520,21 @@ def main():
         # boxes self-terminate on completion — the adapter must outlive the
         # disk. LoRA r16 on q/k/v/o is ~50MB; wandb artifact is the durable
         # home.
+        meta = {"steps": args.steps, "seq_len": args.seq_len,
+                "gamma": args.gamma, "arm": args.arm, "tag": args.tag}
+        if args.arm == "distill":  # distill-only fields; a CE arm claiming a
+            meta["distill_alpha"] = args.distill_alpha  # teacher would mislabel it
+            meta["teacher_checkpoint"] = args.teacher_checkpoint
+            if args.teacher_checkpoint:
+                # provenance: fetch_adapters records the RESOLVED artifact
+                # version+digest here; ':latest' alone is a floating alias and
+                # would make the run irreproducible if the teacher is re-uploaded
+                from pathlib import Path
+                pin = Path(args.teacher_checkpoint) / "WANDB_ARTIFACT"
+                meta["teacher_artifact"] = (
+                    pin.read_text().strip() if pin.exists() else "UNPINNED")
         artifact = wandb.Artifact(f"wp2_adapter_{args.arm}{args.tag}",
-                                  type="lora-adapter",
-                                  metadata={"steps": args.steps,
-                                            "seq_len": args.seq_len,
-                                            "gamma": args.gamma, "arm": args.arm,
-                                            "tag": args.tag,
-                                            "distill_alpha": args.distill_alpha,
-                                            "teacher_checkpoint": args.teacher_checkpoint})
+                                  type="lora-adapter", metadata=meta)
         artifact.add_dir(args.save_dir)
         run.log_artifact(artifact)
     run.summary["final_loss"] = loss.item()

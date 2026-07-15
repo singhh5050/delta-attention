@@ -20,9 +20,30 @@ fetch_adapters() {  # usage: fetch_adapters <arm>... — one source of truth
 import sys, wandb
 api = wandb.Api()
 for arm in sys.argv[1:]:
-    api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest").download(root=f"checkpoints/pilot_{arm}")
-    print("fetched", arm)
+    art = api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest")
+    root = f"checkpoints/pilot_{arm}"
+    art.download(root=root)
+    # record the RESOLVED version+digest next to the weights: ':latest' is a
+    # floating alias, and anything trained/evaled against this adapter (e.g.
+    # a distill teacher) needs pinned provenance to be reproducible
+    with open(f"{root}/WANDB_ARTIFACT", "w") as f:
+        f.write(f"wp2_adapter_{arm}:{art.version} digest={art.digest}\n")
+    print(f"fetched {arm} -> {art.version} digest={art.digest}")
 PYEOF
+}
+
+run_ppl_2x2() {  # usage: run_ppl_2x2 <stage_prefix> <arms> — the shared
+  # 32-chunk @32K grid, both forwards; ONE copy of the dials so future
+  # changes can't silently diverge between modes
+  local P=$1 A=$2
+  stage "$P:running"
+  python eval/ppl_eval.py --arms "$A" --chunks 32 --seq-len 32768 \
+    || { stage "$P:FAILED"; exit 1; }
+  stage "$P:PASS"
+  stage "$P-dense:running"
+  python eval/ppl_eval.py --forward dense --arms "$A" --chunks 32 --seq-len 32768 \
+    || { stage "$P-dense:FAILED"; exit 1; }
+  stage "$P-dense:PASS"
 }
 
 case "$WP" in
@@ -194,14 +215,7 @@ if [ -n "$TRAIN32K" ]; then
     stage "train32k-$A:PASS"
   done
   # same deterministic 32 chunks as the 8K-adapter runs -> paired across runs
-  stage "ppl32k-32ktrained:running"
-  python eval/ppl_eval.py --arms base,delta_32k,dense_32k,detach_32k \
-    --chunks 32 --seq-len 32768 || { stage "ppl32k-32ktrained:FAILED"; exit 1; }
-  stage "ppl32k-32ktrained:PASS"
-  stage "ppl32k-32ktrained-dense:running"
-  python eval/ppl_eval.py --forward dense --arms base,delta_32k,dense_32k,detach_32k \
-    --chunks 32 --seq-len 32768 || { stage "ppl32k-32ktrained-dense:FAILED"; exit 1; }
-  stage "ppl32k-32ktrained-dense:PASS"
+  run_ppl_2x2 ppl32k-32ktrained base,delta_32k,dense_32k,detach_32k
 fi
 
 if [ -n "$DISTILL" ]; then
@@ -222,14 +236,7 @@ if [ -n "$DISTILL" ]; then
     --probe-every 100 --arm distill --save-dir checkpoints/pilot_distill \
     || { stage "distill-train:FAILED"; exit 1; }
   stage "distill-train:PASS"
-  stage "ppl32k-distill:running"
-  python eval/ppl_eval.py --arms base,delta,dense,detach,distill \
-    --chunks 32 --seq-len 32768 || { stage "ppl32k-distill:FAILED"; exit 1; }
-  stage "ppl32k-distill:PASS"
-  stage "ppl32k-distill-dense:running"
-  python eval/ppl_eval.py --forward dense --arms base,delta,dense,detach,distill \
-    --chunks 32 --seq-len 32768 || { stage "ppl32k-distill-dense:FAILED"; exit 1; }
-  stage "ppl32k-distill-dense:PASS"
+  run_ppl_2x2 ppl32k-distill base,delta,dense,detach,distill
 fi
 
 if [ -n "$DISTILL2" ]; then
@@ -247,6 +254,14 @@ if [ -n "$DISTILL2" ]; then
     --tag _smokedft --no-artifact --save-dir checkpoints/smoke_distill_dft \
     || { stage "distill2-smoke:FAILED"; exit 1; }
   stage "distill2-smoke:PASS"
+  # the mix config (alpha>0: differentiable chunked CE stacked on the KL
+  # graph) is its own code path — smoke it too, not just dft
+  stage "distill2-smoke-mix:running"
+  python -m delta_attention.train.train_delta --steps 20 --seq-len 8192 \
+    --probe-every 10 --arm distill --distill-alpha 1.0 \
+    --tag _smokemix --no-artifact --save-dir checkpoints/smoke_distill_mix \
+    || { stage "distill2-smoke-mix:FAILED"; exit 1; }
+  stage "distill2-smoke-mix:PASS"
   stage "distill2-mix:running"
   python -m delta_attention.train.train_delta --steps 2000 --seq-len 8192 \
     --probe-every 100 --arm distill --distill-alpha 1.0 --tag _mix \
@@ -259,15 +274,7 @@ if [ -n "$DISTILL2" ]; then
     --tag _dft --save-dir checkpoints/pilot_distill_dft \
     || { stage "distill2-dft:FAILED"; exit 1; }
   stage "distill2-dft:PASS"
-  stage "ppl32k-distill2:running"
-  python eval/ppl_eval.py --arms base,delta,dense,detach,distill,distill_mix,distill_dft \
-    --chunks 32 --seq-len 32768 || { stage "ppl32k-distill2:FAILED"; exit 1; }
-  stage "ppl32k-distill2:PASS"
-  stage "ppl32k-distill2-dense:running"
-  python eval/ppl_eval.py --forward dense \
-    --arms base,delta,dense,detach,distill,distill_mix,distill_dft \
-    --chunks 32 --seq-len 32768 || { stage "ppl32k-distill2-dense:FAILED"; exit 1; }
-  stage "ppl32k-distill2-dense:PASS"
+  run_ppl_2x2 ppl32k-distill2 base,delta,dense,detach,distill,distill_mix,distill_dft
 fi
 
 if [ -n "$ENMC" ]; then

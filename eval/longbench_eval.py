@@ -88,11 +88,13 @@ DEFAULT_ARMS = ("base_dense", "base_delta", "ce_delta", "dense_delta",
                 # does the RULER decode cliff replicate on QA, or is it
                 # needle-retrieval-specific?
                 "sparse_dec", "delta_dec2", "delta_dec16")
-ARMS = DEFAULT_ARMS + ("distill_delta",
+ARMS = DEFAULT_ARMS + ("distill_delta", "distill_mix_delta", "distill_dft_delta",
                        "ce32k_delta", "dense32k_delta", "detach32k_delta")
 ADAPTERS = {"ce_delta": "checkpoints/pilot_delta",
             "dense_delta": "checkpoints/pilot_dense",
             "distill_delta": "checkpoints/pilot_distill",
+            "distill_mix_delta": "checkpoints/pilot_distill_mix",
+            "distill_dft_delta": "checkpoints/pilot_distill_dft",
             "ce32k_delta": "checkpoints/pilot_delta_32k",
             "dense32k_delta": "checkpoints/pilot_dense_32k",
             "detach32k_delta": "checkpoints/pilot_detach_32k"}
@@ -331,19 +333,23 @@ def select_enmc(tokenizer, n: int):
     return picked
 
 
-def run_mcq(model, tokenizer, arm: str, suite: str, samples, log):
+def run_mcq(model, tokenizer, arm: str, suite: str, samples, log, slog=None):
     """Shared letter-logprob runner for the MCQ suites (v2, enmc): one scoring
     path so a fix (e.g. letter tokenization) can't silently diverge between
-    suites. samples: (prompt, answer_letter, difficulty_or_None)."""
+    suites. samples: (prompt, answer_letter, difficulty_or_None). slog logs
+    per-sample correctness — without it only aggregates survive and no paired
+    (McNemar-style) test between arms is possible post-hoc."""
     letters = ["A", "B", "C", "D"]
     letter_ids = torch.tensor(
         [tokenizer.encode(l, add_special_tokens=False)[0] for l in letters]).cuda()
     hits, by_diff = [], {}
-    for prompt, answer, diff in samples:
+    for i, (prompt, answer, diff) in enumerate(samples):
         pick = choice_logprobs(model, tokenizer, chat_wrap(prompt, tokenizer),
                                letter_ids)
         ok = letters[pick] == answer
         hits.append(ok)
+        if slog:
+            slog(suite, arm, i, letters[pick], answer, ok)
         if diff is not None:
             by_diff.setdefault(diff, []).append(ok)
     acc = sum(hits) / len(hits)
@@ -377,6 +383,19 @@ def main():
         run.log({f"longbench/{arm}/{suite}_{task}": score})
         run.summary[f"{suite}_{task}_{arm}"] = score
 
+    # per-sample MCQ correctness (same dir as --out -> box archive picks it
+    # up); enables paired between-arm tests, which aggregates cannot
+    samples_path = out_path.with_name(out_path.stem + "_samples.csv")
+    new_samples_file = not samples_path.exists()
+    sfh = samples_path.open("a", newline="")
+    swriter = csv.writer(sfh)
+    if new_samples_file:
+        swriter.writerow(["suite", "arm", "idx", "pred", "gold", "correct", "run_id"])
+
+    def slog(suite, arm, idx, pred, gold, ok):
+        swriter.writerow([suite, arm, idx, pred, gold, int(ok), run.id])
+        sfh.flush()
+
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     unknown = [a for a in arms if a not in ARMS]
     if unknown:  # fail before any model is built, not after arm 1's GPU-hours
@@ -394,14 +413,14 @@ def main():
                 print(f"[enmc] selected {len(enmc_samples)} samples", flush=True)
                 if not enmc_samples:
                     raise SystemExit("no InfiniteBench En.MC samples selected")
-            run_mcq(model, tokenizer, arm, "enmc", enmc_samples, log)
+            run_mcq(model, tokenizer, arm, "enmc", enmc_samples, log, slog)
         else:
             if v2_samples is None:
                 v2_samples = select_v2(tokenizer, args.n_samples)
                 print(f"[lb-v2] selected {len(v2_samples)} samples", flush=True)
                 if not v2_samples:
                     raise SystemExit("no LongBench-v2 samples fit the token budget")
-            run_mcq(model, tokenizer, arm, "v2", v2_samples, log)
+            run_mcq(model, tokenizer, arm, "v2", v2_samples, log, slog)
         # break the _sample MethodType reference cycle, then drop OUR binding —
         # del must run in this scope or the object survives into the next load
         model._sample = None
@@ -410,6 +429,7 @@ def main():
         torch.cuda.empty_cache()
 
     fh.close()
+    sfh.close()
     run.finish()
     print("[longbench] DONE", flush=True)
 

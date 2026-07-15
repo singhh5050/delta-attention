@@ -233,8 +233,15 @@ Paired per-chunk (pipeline eval):
 
 - Rotate Lambda/HF/wandb keys (still pending; current keys traveled to
   boxes 5–8, all now terminated).
-- Per-sample logging for MCQ suites, then optionally En.MC on the 32K
-  adapters (`ce32k_delta` etc. already wired in longbench_eval.py).
+- ~~Per-sample logging for MCQ suites~~ DONE 07-15 (mcq `_samples.csv`,
+  paired tests now possible); En.MC on the 32K / distill2 adapters is
+  unblocked (`ce32k_delta`, `distill_dft_delta` etc. wired) but not yet run.
+- 07-15 post-review hardening (see commit): CE arms now compute loss from
+  hidden states with per-chunk fused lm_head (no full-vocab logits — removes
+  the 80GB floor for CE training); -100 label normalization fixed (latent);
+  fetch_adapters records resolved artifact version+digest and distill
+  teachers store it as `teacher_artifact` metadata (the 07-14 dft teacher
+  was wp2_adapter_dense:latest, UNPINNED — pin before any rerun).
 - LongBench QA on the 32K adapters (cheap, same wiring).
 - InfiniteBench at full 128K budget (different experiment; decouples from
   the 32K grid).
