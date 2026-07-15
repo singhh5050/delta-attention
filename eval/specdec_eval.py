@@ -267,7 +267,12 @@ def main():
         prompts, max_new = load_prompts(args.suite, tokenizer, args.n_samples)
         prompts = [chat_wrap(pr, tokenizer) for pr in prompts]
         # dense references are draft/block-independent: compute ONCE per
-        # weights config (was recomputed per config — 6x waste on the grid)
+        # weights config (was recomputed per config — 6x waste on the grid).
+        # Warmup first: the first CUDA forwards after model load pay kernel
+        # autotune/pool costs, and charging that to t_dense would inflate the
+        # reported speedup.
+        if prompts:
+            dense_reference(model, tokenizer, prompts[0], 16)
         refs = {}
         for i in range(min(args.exact_check_n, len(prompts))):
             refs[i] = dense_reference(model, tokenizer, prompts[i], max_new)
@@ -297,9 +302,16 @@ def main():
                         n_cmp = min(len(toks), len(ref))
                         div = next((j for j in range(n_cmp)
                                     if toks[j] != ref[j]), None)
-                        if div is None and len(toks) < len(ref):
-                            div = len(toks)  # early truncation = divergence
-                        agg["exact"].append(n_cmp if div is None else div)
+                        if div is None and len(toks) != len(ref):
+                            # length mismatch after a clean prefix is a
+                            # harness bug in EITHER direction: early
+                            # truncation, or overrunning an eos the dense
+                            # reference stopped at
+                            div = n_cmp
+                        # a byte-identical output is a PASS regardless of
+                        # length (legitimate short eos stop must not trip
+                        # the min-parity gate)
+                        agg["exact"].append(10**9 if div is None else div)
                     print(f"[specdec] {wkey}/{draft}/b{block} #{i}: "
                           f"acc {st['accepted']}/{st['proposed']}", flush=True)
                 acc = agg["accepted"] / max(agg["proposed"], 1)
@@ -308,7 +320,9 @@ def main():
                 tps_spec = agg["tok_chk"] / max(agg["t_spec_chk"], 1e-9)
                 tps_dense = agg["tok_ref"] / max(agg["t_dense"], 1e-9)
                 parity = min(agg["exact"]) if agg["exact"] else None
-                if (args.min_parity_prefix and parity is not None
+                if parity == 10**9:
+                    parity = "full"  # every checked output byte-identical
+                if (args.min_parity_prefix and isinstance(parity, int)
                         and parity < args.min_parity_prefix):
                     raise SystemExit(
                         f"PARITY FAILURE: {wkey}/{draft}/b{block} diverged from "
