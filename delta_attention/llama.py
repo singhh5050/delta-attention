@@ -652,6 +652,7 @@ class LlamaAttention(nn.Module):
             window=int(self.config.sliding_window),
             scaling=scaling,
             detach_delta=bool(getattr(self.config, "detach_delta", False)),
+            delta_grad_scale=float(getattr(self.config, "delta_grad_scale", 1.0)),
         )
         return out, None
 

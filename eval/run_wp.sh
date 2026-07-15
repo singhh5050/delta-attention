@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -77,6 +77,10 @@ case "$WP" in
   # cost the evals
   bench32k) TESTS="tests/test_longbench_offline.py tests/test_flex_delta.py"
             BENCH32K=1; DISTILL3=1 ;;
+  mmlu) TESTS="tests/test_longbench_offline.py"; MMLU=1 ;;
+  gradscale) TESTS="tests/test_flex_delta.py"; GRADSCALE=1 ;;
+  seeds32k) TESTS="tests/test_flex_delta.py"; SEEDS32K=1 ;;
+  seedsdistill) TESTS="tests/test_flex_delta.py"; SEEDSDISTILL=1 ;;
   enmc) TESTS="tests/test_longbench_offline.py"; ENMC=1 ;;
   specdec) TESTS="tests/test_longbench_offline.py tests/test_delta_decode.py"; SPECDEC=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
@@ -380,6 +384,91 @@ if [ -n "$SPECDEC" ]; then
     --arms base_dense,base_delta,sparse_dec,delta_dec2,delta_dec4,delta_dec8,delta_dec16 \
     || { stage "govreport:FAILED"; exit 1; }
   stage "govreport:PASS"
+fi
+
+if [ -n "$MMLU" ]; then
+  # capability-retention check: MMLU prompts fit inside sink+window, so
+  # delta==dense — this measures finetuning damage, not delta adaptation
+  stage "adapter-fetch:running"
+  fetch_adapters delta dense detach delta_32k dense_32k detach_32k \
+    distill distill_mix distill_dft || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  stage "mmlu-smoke:running"
+  python eval/longbench_eval.py --suite mmlu --n-samples 20 --arms base_delta \
+    --out results/mmlu_smoke.csv || { stage "mmlu-smoke:FAILED"; exit 1; }
+  stage "mmlu-smoke:PASS"
+  stage "mmlu:running"
+  python eval/longbench_eval.py --suite mmlu --n-samples 1000 \
+    --arms base_dense,base_delta,ce_delta,dense_delta,detach32k_delta,ce32k_delta,dense32k_delta,distill_delta,distill_mix_delta,distill_dft_delta \
+    || { stage "mmlu:FAILED"; exit 1; }
+  stage "mmlu:PASS"
+fi
+
+if [ -n "$GRADSCALE" ]; then
+  # interventional test of Jeff's 1/gamma idea: scale ONLY the correction
+  # branch's backward. 0.125 = 1/sqrt(64), 0.015625 = 1/64. Same 32K dials
+  # as train32k so the arms pair with delta_32k/dense_32k.
+  for S in 0.125 0.015625; do
+    TAGS=$(echo "$S" | sed 's/0\.125/gsqrt/; s/0\.015625/gsinv/')
+    stage "gradscale-smoke-$TAGS:running"
+    python -m delta_attention.train.train_delta --steps 20 --seq-len 32768 \
+      --probe-every 10 --arm delta --delta-grad-scale "$S" \
+      --tag "_smoke$TAGS" --no-artifact --save-dir "checkpoints/smoke_$TAGS" \
+      || { stage "gradscale-smoke-$TAGS:FAILED"; exit 1; }
+    stage "gradscale-smoke-$TAGS:PASS"
+    stage "gradscale-$TAGS:running"
+    python -m delta_attention.train.train_delta --steps 500 --seq-len 32768 \
+      --probe-every 50 --arm delta --delta-grad-scale "$S" \
+      --tag "_32k_$TAGS" --save-dir "checkpoints/pilot_delta_32k_$TAGS" \
+      || { stage "gradscale-$TAGS:FAILED"; exit 1; }
+    stage "gradscale-$TAGS:PASS"
+  done
+  stage "adapter-fetch:running"
+  fetch_adapters delta_32k dense_32k || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  run_ppl_2x2 ppl32k-gradscale \
+    base,delta_32k,dense_32k,delta_32k_gsqrt,delta_32k_gsinv
+fi
+
+if [ -n "$SEEDS32K" ]; then
+  # training-run variance behind the -0.025 32K gap: seeds 1,2 for the two
+  # arms that define it (seed 0 = the existing result)
+  for SEED in 1 2; do
+    for A in delta dense; do
+      stage "seeds32k-${A}-s${SEED}:running"
+      python -m delta_attention.train.train_delta --steps 500 --seq-len 32768 \
+        --probe-every 100 --arm "$A" --data-seed "$SEED" \
+        --tag "_32k_s${SEED}" --save-dir "checkpoints/pilot_${A}_32k_s${SEED}" \
+        || { stage "seeds32k-${A}-s${SEED}:FAILED"; exit 1; }
+      stage "seeds32k-${A}-s${SEED}:PASS"
+    done
+  done
+  run_ppl_2x2 ppl32k-seeds \
+    base,delta_32k_s1,dense_32k_s1,delta_32k_s2,dense_32k_s2
+fi
+
+if [ -n "$SEEDSDISTILL" ]; then
+  # training-run variance behind the 10.37 delta-CE == distill_dft tie
+  stage "adapter-fetch:running"
+  fetch_adapters dense || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  for SEED in 1 2; do
+    stage "seedsdistill-delta-s${SEED}:running"
+    python -m delta_attention.train.train_delta --steps 2000 --seq-len 8192 \
+      --probe-every 200 --arm delta --data-seed "$SEED" \
+      --tag "_s${SEED}" --save-dir "checkpoints/pilot_delta_s${SEED}" \
+      || { stage "seedsdistill-delta-s${SEED}:FAILED"; exit 1; }
+    stage "seedsdistill-delta-s${SEED}:PASS"
+    stage "seedsdistill-dft-s${SEED}:running"
+    python -m delta_attention.train.train_delta --steps 2000 --seq-len 8192 \
+      --probe-every 200 --arm distill --teacher-checkpoint checkpoints/pilot_dense \
+      --data-seed "$SEED" --tag "_dft_s${SEED}" \
+      --save-dir "checkpoints/pilot_distill_dft_s${SEED}" \
+      || { stage "seedsdistill-dft-s${SEED}:FAILED"; exit 1; }
+    stage "seedsdistill-dft-s${SEED}:PASS"
+  done
+  run_ppl_2x2 ppl32k-seedsdistill \
+    base,delta_s1,distill_dft_s1,delta_s2,distill_dft_s2
 fi
 
 stage "ALL-DONE"

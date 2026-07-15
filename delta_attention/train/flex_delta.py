@@ -69,6 +69,22 @@ def anchor_layout(s: int, gamma: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
     return torch.arange(0, s_p, gamma), torch.arange(s_p, s), s_p
 
 
+class _ScaleGrad(torch.autograd.Function):
+    """Identity forward; backward multiplies the gradient by a constant.
+    Applied to the correction term ONLY — Jeff's 1/γ intervention: damp the
+    γ-times-summed gradient through the broadcast delta without touching the
+    forward math or the sparse path's gradient."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.scale, None
+
+
 def delta_forward_train(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -78,6 +94,7 @@ def delta_forward_train(
     sink: int = 1024,
     scaling: Optional[float] = None,
     detach_delta: bool = False,
+    delta_grad_scale: float = 1.0,
 ) -> torch.Tensor:
     """Differentiable delta-corrected attention.
 
@@ -114,6 +131,8 @@ def delta_forward_train(
     delta = dense_anchor - sparse[:, idx]
     if detach_delta:  # ablation arm ONLY
         delta = delta.detach()
+    elif delta_grad_scale != 1.0:  # gradient-scale arms (1/sqrt(gamma), 1/gamma)
+        delta = _ScaleGrad.apply(delta, delta_grad_scale)
 
     n = idx.numel()
     corrected = (

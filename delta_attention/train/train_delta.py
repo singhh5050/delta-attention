@@ -49,6 +49,12 @@ def parse_args():
                         "distill: delta pipeline forward, loss = KL to the frozen "
                         "dense teacher (adapters disabled) instead of CE")
     p.add_argument("--detach-delta", action="store_true", help="same as --arm detach")
+    p.add_argument("--delta-grad-scale", type=float, default=1.0,
+                   help="backward-only multiplier on the broadcast correction's "
+                        "gradient (delta arm; Jeff's 1/gamma idea: try 0.125 = "
+                        "1/sqrt(64) and 0.015625 = 1/64). 1.0 = unchanged")
+    p.add_argument("--data-seed", type=int, default=0,
+                   help="PG19 shuffle seed (seed replication runs)")
     p.add_argument("--distill-alpha", type=float, default=0.0,
                    help="CE weight mixed into the distill loss (0 = pure KL)")
     p.add_argument("--teacher-checkpoint", type=str, default="",
@@ -88,6 +94,7 @@ def build_model(args):
     model.config.sliding_window = args.window
     model.config.log_drift = False
     model.config.detach_delta = args.arm == "detach" or args.detach_delta
+    model.config.delta_grad_scale = args.delta_grad_scale
     # dense arm trains with standard attention: same data/optimizer/probes,
     # no delta pipeline — isolates "long-text training" from the mechanism
     model.config._attn_implementation = (
@@ -299,7 +306,8 @@ def probe_drift(model, batch, gamma, window):
     return means
 
 
-def probe_anchor_grad_ratio(model, batch, gamma, window, detach_delta=False):
+def probe_anchor_grad_ratio(model, batch, gamma, window, detach_delta=False,
+                            delta_grad_scale=1.0):
     """anchor_grad_ratio on MODEL-DERIVED q/k/v (layer 0 of the current
     weights, real data). The smoke-run version used fixed random tensors,
     which is weights-independent and therefore constant across training —
@@ -327,7 +335,8 @@ def probe_anchor_grad_ratio(model, batch, gamma, window, detach_delta=False):
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
     q = q.detach().requires_grad_(True)
     out = delta_forward_train(q, k.detach(), v.detach(), gamma=gamma, window=window,
-                              detach_delta=detach_delta)
+                              detach_delta=detach_delta,
+                              delta_grad_scale=delta_grad_scale)
     out.float().pow(2).mean().backward()
     return anchor_grad_ratio(q.grad, gamma)
 
@@ -422,7 +431,7 @@ def main():
         teacher = build_teacher(args.teacher_checkpoint)
     lm_head_w = model.get_base_model().lm_head.weight  # frozen (LoRA is q/k/v/o)
 
-    data = packed_pg19(tokenizer, args.seq_len)
+    data = packed_pg19(tokenizer, args.seq_len, seed=args.data_seed)
     heldout = [next(data) for _ in range(2)]  # drift probe sequences
 
     opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
@@ -485,7 +494,8 @@ def main():
             # logged the full-graph value for every arm — not comparable.
             log["anchor_grad_ratio"] = probe_anchor_grad_ratio(
                 model, heldout[0], args.gamma, args.window,
-                detach_delta=model.config.detach_delta)
+                detach_delta=model.config.detach_delta,
+                delta_grad_scale=args.delta_grad_scale)  # arm-faithful
             # decomposition (delta arm only — for dense it is an expensive
             # no-op unrelated to its sdpa training graph): how much of the
             # ratio is the gamma-fold summed correction vs the anchor's
@@ -521,7 +531,9 @@ def main():
         # disk. LoRA r16 on q/k/v/o is ~50MB; wandb artifact is the durable
         # home.
         meta = {"steps": args.steps, "seq_len": args.seq_len,
-                "gamma": args.gamma, "arm": args.arm, "tag": args.tag}
+                "gamma": args.gamma, "arm": args.arm, "tag": args.tag,
+                "delta_grad_scale": args.delta_grad_scale,
+                "data_seed": args.data_seed}
         if args.arm == "distill":  # distill-only fields; a CE arm claiming a
             meta["distill_alpha"] = args.distill_alpha  # teacher would mislabel it
             meta["teacher_checkpoint"] = args.teacher_checkpoint

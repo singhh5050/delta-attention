@@ -29,6 +29,10 @@ class Config:
 
     delta_lambda: int = 64          # delta lambda window
     sliding_window: int = 2048      # sliding window size
+    # WP-2 gradient-scale arms (Jeff's 1/gamma backward idea, tested
+    # interventionally): backward-only multiplier on the broadcast
+    # correction's gradient in the TRAIN forward. 1.0 = current behavior.
+    delta_grad_scale: float = 1.0
 
     # WP-2 post-training eval: path to a saved LoRA adapter directory. When
     # set, init_model wraps the base model with the adapter and merges it, so
@@ -81,7 +85,7 @@ class Config:
 # in: transformers' legacy path reads those off model.config and it would
 # change generate() behavior.
 PIPELINE_FIELDS = (
-    "mode", "delta_lambda", "sliding_window", "log_drift",
+    "mode", "delta_lambda", "sliding_window", "log_drift", "delta_grad_scale",
     "stride_policy", "gamma_min", "gamma_max", "adapt_chunk",
     "adapt_threshold", "stride_trigger", "adapt_k",
     "decode_mode", "gamma_dec", "refresh_policy", "drift_threshold",

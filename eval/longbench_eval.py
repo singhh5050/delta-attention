@@ -84,6 +84,15 @@ V2_TEMPLATE = (
     "Answer with a single letter (A, B, C, or D)."
 )
 
+# MMLU, 0-shot letter-logprob. Prompts sit far inside sink+window (3072), so
+# delta == dense mathematically — this does NOT measure delta adaptation; it
+# measures whether finetuning damaged general capabilities (Jeff's
+# "we ruined the posttraining" concern), on a protocol consistent across arms.
+MMLU_TEMPLATE = (
+    "The following is a multiple choice question. Answer with a single letter "
+    "(A, B, C, or D).\n\n{question}\nA. {A}\nB. {B}\nC. {C}\nD. {D}\n\nAnswer:"
+)
+
 # InfiniteBench longbook_choice_eng prompt (prompt.py in the official repo)
 ENMC_TEMPLATE = (
     "Read the book and answer the question.\n\n{context}\n\n"
@@ -119,7 +128,8 @@ DECODE_ARMS = {"sparse_dec": ("sparse", None),
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--suite", choices=["v1", "v2", "enmc", "govreport"], required=True)
+    p.add_argument("--suite", choices=["v1", "v2", "enmc", "govreport", "mmlu"],
+                   required=True)
     p.add_argument("--arms", type=str, default=",".join(DEFAULT_ARMS))
     p.add_argument("--n-samples", type=int, default=50)
     p.add_argument("--gamma", type=int, default=64)
@@ -368,6 +378,29 @@ def run_govreport(model, tokenizer, arm: str, n: int, log, slog=None):
     return score
 
 
+def select_mmlu(n: int):
+    """Deterministic even stride over the full MMLU test split (14,042 rows,
+    ordered by subject — a head-slice would be all abstract_algebra; striding
+    covers every subject proportionally)."""
+    from datasets import load_dataset
+
+    ds = load_dataset("cais/mmlu", "all", split="test")
+    step = max(len(ds) // n, 1)
+    picked = []
+    for i in range(0, len(ds), step):
+        ex = ds[i]
+        c = ex["choices"]
+        # .replace, not .format: math questions can contain literal braces
+        prompt = MMLU_TEMPLATE
+        for field, val in (("{question}", ex["question"]), ("{A}", c[0]),
+                           ("{B}", c[1]), ("{C}", c[2]), ("{D}", c[3])):
+            prompt = prompt.replace(field, str(val))
+        picked.append((prompt, "ABCD"[ex["answer"]], ex["subject"]))
+        if len(picked) == n:
+            break
+    return picked
+
+
 def select_enmc(tokenizer, n: int):
     """First n En.MC samples in dataset order (deterministic). Book contexts
     are ~100K+ tokens, so every prompt gets middle-truncated to the 32K eval
@@ -464,12 +497,19 @@ def main():
 
     v2_samples = None
     enmc_samples = None
+    mmlu_samples = None
     for arm in arms:
         model, tokenizer = build_model(arm, args.gamma, args.window)
         if args.suite == "v1":
             run_v1(model, tokenizer, arm, args.n_samples, log, slog)
         elif args.suite == "govreport":
             run_govreport(model, tokenizer, arm, args.n_samples, log, slog)
+        elif args.suite == "mmlu":
+            if mmlu_samples is None:
+                mmlu_samples = select_mmlu(args.n_samples)
+                print(f"[mmlu] selected {len(mmlu_samples)} samples", flush=True)
+            # difficulty slot carries the subject -> per-subject accuracies
+            run_mcq(model, tokenizer, arm, "mmlu", mmlu_samples, log, slog)
         elif args.suite == "enmc":
             if enmc_samples is None:
                 enmc_samples = select_enmc(tokenizer, args.n_samples)
