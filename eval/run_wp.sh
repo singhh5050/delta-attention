@@ -303,7 +303,8 @@ if [ -n "$SPECDEC" ]; then
   # (b) GovReport summarization — long natural-language generation, the
   #     regime where a local-context draft should hold up
   stage "rouge-dep:running"
-  pip install --quiet rouge || { stage "rouge-dep:FAILED"; exit 1; }
+  # also pinned in requirements.txt; this covers boxes whose venv predates it
+  pip install --quiet rouge==1.0.1 || { stage "rouge-dep:FAILED"; exit 1; }
   stage "rouge-dep:PASS"
   stage "specdec-smoke:running"
   python eval/longbench_eval.py --suite govreport --n-samples 2 \

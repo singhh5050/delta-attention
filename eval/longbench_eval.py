@@ -165,9 +165,9 @@ def rouge_l_score(prediction: str, ground_truths) -> float:
     for gt in ground_truths:
         try:
             s = Rouge().get_scores([prediction], [gt], avg=True)["rouge-l"]["f"]
-        except ValueError:  # empty/degenerate prediction
-            s = 0.0
-        best = max(best, s)
+        except Exception:  # LongBench metrics.py uses a bare except here too:
+            s = 0.0        # rouge can also raise RecursionError on degenerate
+        best = max(best, s)  # period-free generations, not just ValueError
     return best
 
 
@@ -301,7 +301,7 @@ def choice_logprobs(model, tokenizer, prompt: str, letter_ids) -> int:
 # suites
 # ---------------------------------------------------------------------------
 
-def run_v1(model, tokenizer, arm: str, n: int, log):
+def run_v1(model, tokenizer, arm: str, n: int, log, slog=None):
     scores = {}
     for task, (template, max_new) in V1_TASKS.items():
         rows = load_v1(task)[:n]
@@ -314,6 +314,9 @@ def run_v1(model, tokenizer, arm: str, n: int, log):
             pred = generate_answer(model, tokenizer,
                                    chat_wrap(prompt, tokenizer), max_new)
             vals.append(qa_f1_score(pred, ex["answers"]))
+            if slog:
+                slog("v1", task, arm, i, pred[:80],
+                     " | ".join(ex["answers"])[:80], round(vals[-1], 4))
             if i < 2:
                 print(f"[lb-v1] {arm}/{task} #{i}: pred={pred!r} "
                       f"gt={ex['answers']} f1={vals[-1]:.2f}", flush=True)
@@ -341,7 +344,7 @@ def select_v2(tokenizer, n: int):
     return picked
 
 
-def run_govreport(model, tokenizer, arm: str, n: int, log):
+def run_govreport(model, tokenizer, arm: str, n: int, log, slog=None):
     rows = load_v1("gov_report")[:n]
     if not rows:
         raise SystemExit(f"no gov_report samples (n={n})")
@@ -353,6 +356,9 @@ def run_govreport(model, tokenizer, arm: str, n: int, log):
         pred = generate_answer(model, tokenizer, chat_wrap(prompt, tokenizer),
                                GOVREPORT_MAX_NEW, first_line_only=False)
         vals.append(rouge_l_score(pred, ex["answers"]))
+        if slog:  # per-sample scores or the 7-arm "is there any difference"
+            slog("govreport", "gov_report", arm, i, "", "",  # question can't
+                 round(vals[-1], 4))                         # be paired-tested
         if i < 2:
             print(f"[govreport] {arm} #{i}: rouge-l {vals[-1]:.3f} "
                   f"pred[:120]={pred[:120]!r}", flush=True)
@@ -402,7 +408,7 @@ def run_mcq(model, tokenizer, arm: str, suite: str, samples, log, slog=None):
         ok = letters[pick] == answer
         hits.append(ok)
         if slog:
-            slog(suite, arm, i, letters[pick], answer, ok)
+            slog(suite, "mcq", arm, i, letters[pick], answer, int(ok))
         if diff is not None:
             by_diff.setdefault(diff, []).append(ok)
     acc = sum(hits) / len(hits)
@@ -436,17 +442,19 @@ def main():
         run.log({f"longbench/{arm}/{suite}_{task}": score})
         run.summary[f"{suite}_{task}_{arm}"] = score
 
-    # per-sample MCQ correctness (same dir as --out -> box archive picks it
-    # up); enables paired between-arm tests, which aggregates cannot
+    # per-sample scores for EVERY suite (same dir as --out -> box archive
+    # picks it up); enables paired between-arm tests, which aggregates cannot
+    # — samples are identical across arms, so pairing is by idx
     samples_path = out_path.with_name(out_path.stem + "_samples.csv")
     new_samples_file = not samples_path.exists()
     sfh = samples_path.open("a", newline="")
     swriter = csv.writer(sfh)
     if new_samples_file:
-        swriter.writerow(["suite", "arm", "idx", "pred", "gold", "correct", "run_id"])
+        swriter.writerow(["suite", "task", "arm", "idx", "pred", "gold",
+                          "score", "run_id"])
 
-    def slog(suite, arm, idx, pred, gold, ok):
-        swriter.writerow([suite, arm, idx, pred, gold, int(ok), run.id])
+    def slog(suite, task, arm, idx, pred, gold, score):
+        swriter.writerow([suite, task, arm, idx, pred, gold, score, run.id])
         sfh.flush()
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
@@ -459,9 +467,9 @@ def main():
     for arm in arms:
         model, tokenizer = build_model(arm, args.gamma, args.window)
         if args.suite == "v1":
-            run_v1(model, tokenizer, arm, args.n_samples, log)
+            run_v1(model, tokenizer, arm, args.n_samples, log, slog)
         elif args.suite == "govreport":
-            run_govreport(model, tokenizer, arm, args.n_samples, log)
+            run_govreport(model, tokenizer, arm, args.n_samples, log, slog)
         elif args.suite == "enmc":
             if enmc_samples is None:
                 enmc_samples = select_enmc(tokenizer, args.n_samples)
