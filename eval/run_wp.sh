@@ -432,6 +432,12 @@ if [ -n "$MMLU" ]; then
     --arms base_dense,base_delta,ce_delta,dense_delta,detach32k_delta,ce32k_delta,dense32k_delta,distill_delta,distill_mix_delta,distill_dft_delta \
     || { stage "mmlu:FAILED"; exit 1; }
   stage "mmlu:PASS"
+  # cheap rider (~20 min, adapters already fetched): Jeff's directional-bias
+  # question — do anchor-row gradients dominate the DIRECTION of the update?
+  stage "gradprobe:running"
+  python eval/grad_direction_probe.py --arms delta,delta_32k,detach,dense \
+    || { stage "gradprobe:FAILED"; exit 1; }
+  stage "gradprobe:PASS"
 fi
 
 if [ -n "$GRADSCALE" ]; then
