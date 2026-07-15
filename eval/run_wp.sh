@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -83,6 +83,7 @@ case "$WP" in
   seedsdistill) TESTS="tests/test_flex_delta.py"; SEEDSDISTILL=1 ;;
   enmc) TESTS="tests/test_longbench_offline.py"; ENMC=1 ;;
   specdec) TESTS="tests/test_longbench_offline.py tests/test_delta_decode.py"; SPECDEC=1 ;;
+  specdec2) TESTS="tests/test_specdec_offline.py tests/test_delta_decode.py"; SPECDEC2=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -384,6 +385,35 @@ if [ -n "$SPECDEC" ]; then
     --arms base_dense,base_delta,sparse_dec,delta_dec2,delta_dec4,delta_dec8,delta_dec16 \
     || { stage "govreport:FAILED"; exit 1; }
   stage "govreport:PASS"
+fi
+
+if [ -n "$SPECDEC2" ]; then
+  # TRUE speculative decoding: draft (sparse/delta) + dense verify, exact
+  # greedy parity enforced. Smoke MUST pass --require-exact before the grid.
+  stage "adapter-fetch:running"
+  fetch_adapters delta_32k distill_dft || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  stage "specdec2-smoke:running"
+  python eval/specdec_eval.py --suite govreport --n-samples 5 \
+    --drafts sparse,delta --blocks 4 --weights base \
+    --exact-check-n 5 --require-exact --out results/specdec_smoke.csv \
+    || { stage "specdec2-smoke:FAILED"; exit 1; }
+  stage "specdec2-smoke:PASS"
+  stage "specdec2-base-grid:running"
+  python eval/specdec_eval.py --suite govreport --n-samples 20 \
+    --drafts sparse,delta --blocks 2,4,8 --weights base \
+    || { stage "specdec2-base-grid:FAILED"; exit 1; }
+  stage "specdec2-base-grid:PASS"
+  stage "specdec2-trained:running"
+  python eval/specdec_eval.py --suite govreport --n-samples 20 \
+    --drafts sparse,delta --blocks 4 --weights ce32k,dft \
+    || { stage "specdec2-trained:FAILED"; exit 1; }
+  stage "specdec2-trained:PASS"
+  stage "specdec2-qa:running"
+  python eval/specdec_eval.py --suite qa --n-samples 40 \
+    --drafts sparse,delta --blocks 4 --weights base \
+    || { stage "specdec2-qa:FAILED"; exit 1; }
+  stage "specdec2-qa:PASS"
 fi
 
 if [ -n "$MMLU" ]; then
