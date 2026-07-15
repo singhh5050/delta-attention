@@ -68,11 +68,16 @@ log "installing pinned requirements (torch==2.8.0, triton==3.4.0, transformers==
 ${PY} -m pip install --upgrade pip >/dev/null
 # flash_attn's setup.py imports torch at build time, so torch must be installed
 # BEFORE requirements.txt, and the rest installed with --no-build-isolation.
-${PY} -m pip install ninja==1.13.0 packaging==25.0 setuptools wheel
+# psutil: flash_attn's setup.py imports it at metadata time — without it the
+# source-build fallback dies immediately (bit us on a python3.12 box image)
+${PY} -m pip install ninja==1.13.0 packaging==25.0 setuptools wheel psutil==7.0.0
 ${PY} -m pip install torch==2.8.0 triton==3.4.0 torchvision==0.23.0
-# Prefer the official prebuilt flash-attn wheel (matching cu12/torch2.8/cp311);
-# fall back to a source build (needs nvcc, ~30 min) if the wheel 404s.
-FA_WHL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+# Prefer the official prebuilt flash-attn wheel; the cp tag MUST match the
+# venv's interpreter (box images vary: us-south-2 ships 3.11, us-southeast-1
+# ships 3.12 — a hardcoded cp311 wheel gets rejected and forces a source
+# build). Fall back to source (needs nvcc, ~30 min) if the wheel 404s.
+CPTAG="cp$(${PY} -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')"
+FA_WHL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-${CPTAG}-${CPTAG}-linux_x86_64.whl"
 ${PY} -m pip install "${FA_WHL}" \
   || { log "prebuilt flash-attn wheel unavailable; building from source"; \
        ${PY} -m pip install flash_attn==2.8.3 --no-build-isolation; }
