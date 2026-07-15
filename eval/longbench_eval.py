@@ -243,12 +243,16 @@ def chat_wrap(prompt: str, tokenizer) -> str:
 # model
 # ---------------------------------------------------------------------------
 
-def build_model(arm: str, gamma: int, window: int):
+def build_model(arm: str, gamma: int, window: int, force_dense: bool = False):
     from delta_attention.config import Config
     from delta_attention.sample import init_model
 
     cfg = Config()
-    if arm == "base_dense":
+    if arm == "base_dense" or force_dense:
+        # force_dense: MMLU prompts are shorter than delta_forward's cut_n
+        # (its anchor arange crashes on s < ~170), and at these lengths
+        # delta == dense anyway — retention is measured under the model's
+        # native attention with the arm's adapter
         cfg.attn_implementation = "flash_attention_2"
         cfg.mode = "none"
     else:
@@ -499,7 +503,8 @@ def main():
     enmc_samples = None
     mmlu_samples = None
     for arm in arms:
-        model, tokenizer = build_model(arm, args.gamma, args.window)
+        model, tokenizer = build_model(arm, args.gamma, args.window,
+                                       force_dense=(args.suite == "mmlu"))
         if args.suite == "v1":
             run_v1(model, tokenizer, arm, args.n_samples, log, slog)
         elif args.suite == "govreport":

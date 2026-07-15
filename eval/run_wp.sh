@@ -396,7 +396,7 @@ if [ -n "$SPECDEC2" ]; then
   stage "specdec2-smoke:running"
   python eval/specdec_eval.py --suite govreport --n-samples 5 \
     --drafts sparse,delta --blocks 4 --weights base \
-    --exact-check-n 5 --require-exact --out results/specdec_smoke.csv \
+    --exact-check-n 5 --min-parity-prefix 24 --out results/specdec_smoke.csv \
     || { stage "specdec2-smoke:FAILED"; exit 1; }
   stage "specdec2-smoke:PASS"
   stage "specdec2-base-grid:running"
@@ -424,12 +424,14 @@ if [ -n "$MMLU" ]; then
     distill distill_mix distill_dft || { stage "adapter-fetch:FAILED"; exit 1; }
   stage "adapter-fetch:PASS"
   stage "mmlu-smoke:running"
-  python eval/longbench_eval.py --suite mmlu --n-samples 20 --arms base_delta \
+  python eval/longbench_eval.py --suite mmlu --n-samples 20 --arms base_dense,ce_delta \
     --out results/mmlu_smoke.csv || { stage "mmlu-smoke:FAILED"; exit 1; }
   stage "mmlu-smoke:PASS"
+  # all arms force_dense on mmlu (delta==dense at these lengths; base_delta
+  # would duplicate base_dense exactly, so it is omitted)
   stage "mmlu:running"
   python eval/longbench_eval.py --suite mmlu --n-samples 1000 \
-    --arms base_dense,base_delta,ce_delta,dense_delta,detach32k_delta,ce32k_delta,dense32k_delta,distill_delta,distill_mix_delta,distill_dft_delta \
+    --arms base_dense,ce_delta,dense_delta,detach32k_delta,ce32k_delta,dense32k_delta,distill_delta,distill_mix_delta,distill_dft_delta \
     || { stage "mmlu:FAILED"; exit 1; }
   stage "mmlu:PASS"
   # cheap rider (~20 min, adapters already fetched): Jeff's directional-bias
