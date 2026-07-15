@@ -3,14 +3,14 @@
 # Usage: bash eval/run_wp.sh <mode>
 # Modes: wp1 | wp3 | wp2 | wp2train | driftprobe | eval32k | falsify | decsweep
 #        | wp2pilot-{delta,dense,detach,all} | t2eval | longbench | ppl32k | gap
-#        | train32k | distill | enmc
+#        | train32k | distill | distill2 | enmc
 # Writes one line per stage to ~/wp_status; designed for nohup; self-terminates
 # + archives on clean completion when SELF_TERMINATE creds are in the env.
 set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -49,6 +49,7 @@ case "$WP" in
   gap) TESTS="tests/test_longbench_offline.py tests/test_delta_decode.py"; GAP=1 ;;
   train32k) TESTS="tests/test_flex_delta.py"; TRAIN32K=1 ;;
   distill) TESTS="tests/test_flex_delta.py"; DISTILL=1 ;;
+  distill2) TESTS="tests/test_flex_delta.py"; DISTILL2=1 ;;
   enmc) TESTS="tests/test_longbench_offline.py"; ENMC=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
@@ -229,6 +230,44 @@ if [ -n "$DISTILL" ]; then
   python eval/ppl_eval.py --forward dense --arms base,delta,dense,detach,distill \
     --chunks 32 --seq-len 32768 || { stage "ppl32k-distill-dense:FAILED"; exit 1; }
   stage "ppl32k-distill-dense:PASS"
+fi
+
+if [ -n "$DISTILL2" ]; then
+  # distill follow-up, two arms: (a) mix = KL to the base teacher + CE
+  # (alpha=1), testing whether one objective captures both PG19 adaptation
+  # and the tax cut; (b) dft = pure KL to the DENSE-FINETUNED teacher —
+  # distill the pipeline onto our best dense-adapted model. Same dials as
+  # the pilots otherwise. Fetch first: pilot_dense is the dft teacher.
+  stage "adapter-fetch:running"
+  fetch_adapters delta dense detach distill || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  stage "distill2-smoke:running"
+  python -m delta_attention.train.train_delta --steps 20 --seq-len 8192 \
+    --probe-every 10 --arm distill --teacher-checkpoint checkpoints/pilot_dense \
+    --tag _smokedft --no-artifact --save-dir checkpoints/smoke_distill_dft \
+    || { stage "distill2-smoke:FAILED"; exit 1; }
+  stage "distill2-smoke:PASS"
+  stage "distill2-mix:running"
+  python -m delta_attention.train.train_delta --steps 2000 --seq-len 8192 \
+    --probe-every 100 --arm distill --distill-alpha 1.0 --tag _mix \
+    --save-dir checkpoints/pilot_distill_mix \
+    || { stage "distill2-mix:FAILED"; exit 1; }
+  stage "distill2-mix:PASS"
+  stage "distill2-dft:running"
+  python -m delta_attention.train.train_delta --steps 2000 --seq-len 8192 \
+    --probe-every 100 --arm distill --teacher-checkpoint checkpoints/pilot_dense \
+    --tag _dft --save-dir checkpoints/pilot_distill_dft \
+    || { stage "distill2-dft:FAILED"; exit 1; }
+  stage "distill2-dft:PASS"
+  stage "ppl32k-distill2:running"
+  python eval/ppl_eval.py --arms base,delta,dense,detach,distill,distill_mix,distill_dft \
+    --chunks 32 --seq-len 32768 || { stage "ppl32k-distill2:FAILED"; exit 1; }
+  stage "ppl32k-distill2:PASS"
+  stage "ppl32k-distill2-dense:running"
+  python eval/ppl_eval.py --forward dense \
+    --arms base,delta,dense,detach,distill,distill_mix,distill_dft \
+    --chunks 32 --seq-len 32768 || { stage "ppl32k-distill2-dense:FAILED"; exit 1; }
+  stage "ppl32k-distill2-dense:PASS"
 fi
 
 if [ -n "$ENMC" ]; then

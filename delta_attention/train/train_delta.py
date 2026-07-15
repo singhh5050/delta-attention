@@ -51,6 +51,13 @@ def parse_args():
     p.add_argument("--detach-delta", action="store_true", help="same as --arm detach")
     p.add_argument("--distill-alpha", type=float, default=0.0,
                    help="CE weight mixed into the distill loss (0 = pure KL)")
+    p.add_argument("--teacher-checkpoint", type=str, default="",
+                   help="distill arm only: LoRA adapter merged into a SEPARATE "
+                        "frozen dense teacher model (e.g. checkpoints/pilot_dense "
+                        "-> distill onto the dense-finetuned model). Default '' "
+                        "keeps the same-model base teacher (adapters disabled). "
+                        "The student still starts from the plain base, so saved "
+                        "adapters eval exactly like every other arm's")
     p.add_argument("--tag", type=str, default="",
                    help="suffix for the wandb run/artifact names (e.g. _32k) so "
                         "re-trainings don't clobber wp2_adapter_<arm>:latest")
@@ -100,6 +107,28 @@ def build_model(args):
     # no-ops and all activations stay resident (OOM'd a 40GB A100 at s=4096).
     model.train()
     return model.cuda(), tokenizer
+
+
+def build_teacher(checkpoint):
+    """Separate frozen dense teacher with a LoRA checkpoint merged in (same
+    init_model merge path the eval scripts use). A second 16GB static model is
+    the safe way to get a finetuned teacher: PEFT set_adapter switching also
+    toggles requires_grad on the student's params — silent no-op training if
+    the toggle-back ever misses."""
+    from delta_attention.config import Config
+    from delta_attention.sample import init_model
+
+    cfg = Config()
+    cfg.attn_implementation = "flash_attention_2"
+    cfg.mode = "none"
+    cfg.attn_implementation_original = cfg.attn_implementation
+    cfg.checkpoint = checkpoint
+    teacher, _ = init_model(cfg)
+    teacher.config.log_drift = False
+    teacher.config.use_cache = False
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    return teacher.eval().cuda()
 
 
 def packed_pg19(tokenizer, seq_len, seed=0, max_chunks_per_doc=4):
@@ -341,6 +370,11 @@ def main():
     model, tokenizer = build_model(args)
     startup_validation(model, args, run)
 
+    teacher = None
+    if args.teacher_checkpoint:
+        assert args.arm == "distill", "--teacher-checkpoint is distill-only"
+        teacher = build_teacher(args.teacher_checkpoint)
+
     data = packed_pg19(tokenizer, args.seq_len)
     heldout = [next(data) for _ in range(2)]  # drift probe sequences
 
@@ -355,12 +389,18 @@ def main():
         batch = next(data).cuda()
         t0 = time.monotonic()
         if args.arm == "distill":
-            # teacher = the frozen base model (adapters off) under DENSE
-            # attention: the target is "what dense would have output here" —
-            # CE only pressures next-token logits; this pressures the whole
-            # distribution toward the dense one the pipeline approximates
-            with torch.no_grad(), model.disable_adapter(), attn_impl(model, "sdpa"):
-                t_logits = model(input_ids=batch).logits
+            # teacher under DENSE attention: the target is "what dense would
+            # have output here" — CE only pressures next-token logits; this
+            # pressures the whole distribution toward the dense one the
+            # pipeline approximates. Default teacher = the frozen base model
+            # (adapters off, same weights); --teacher-checkpoint swaps in a
+            # separate frozen finetuned model instead
+            if teacher is not None:
+                with torch.no_grad():
+                    t_logits = teacher(input_ids=batch).logits
+            else:
+                with torch.no_grad(), model.disable_adapter(), attn_impl(model, "sdpa"):
+                    t_logits = model(input_ids=batch).logits
             out = model(input_ids=batch)
             loss = kl_to_teacher(out.logits, t_logits)
             if args.distill_alpha > 0:
@@ -439,7 +479,8 @@ def main():
                                             "seq_len": args.seq_len,
                                             "gamma": args.gamma, "arm": args.arm,
                                             "tag": args.tag,
-                                            "distill_alpha": args.distill_alpha})
+                                            "distill_alpha": args.distill_alpha,
+                                            "teacher_checkpoint": args.teacher_checkpoint})
         artifact.add_dir(args.save_dir)
         run.log_artifact(artifact)
     run.summary["final_loss"] = loss.item()
