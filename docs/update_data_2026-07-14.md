@@ -177,9 +177,55 @@ Two arms, same 8K pilot dials, code `4c25f0b`:
   9.73), pipeline ppl ≈ 10.19 < delta-CE's 10.37 → would be the best
   pipeline number in the project.
 
-Chain ends with the 7-arm 2×2 @32K (arms base, delta, dense, detach,
-distill, distill_mix, distill_dft; both forwards; same 32 chunks).
-Results to be appended.
+### Results (pipeline `bt676j1m`, dense `bc3z02ye`, same 32 chunks)
+
+Training wall-clock: mix 59 min, dft 56 min. Full 7-arm 2×2:
+
+| arm | pipeline ppl | dense ppl | tax |
+|---|---|---|---|
+| base | 12.2219 | 11.2652 | 0.0815 |
+| dense-CE | 10.5851 | 9.7333 | 0.0839 |
+| detach-CE | 10.4691 | 9.7738 | 0.0687 |
+| delta-CE | 10.3732 | 9.7946 | 0.0574 |
+| distill (base teacher) | 11.7148 | 11.1852 | 0.0463 |
+| distill_mix (KL-base + CE) | 10.6547 | 10.1079 | 0.0527 |
+| **distill_dft (KL, dense-ft teacher)** | **10.3732** | 9.8418 | **0.0526** |
+
+Paired per-chunk (pipeline eval):
+
+- **distill_dft − delta = +0.00001 ± 0.00021 (sem), dft better on 13/32 —
+  a statistical DEAD HEAT.** Means agree to 4 decimals; per-chunk losses
+  differ on 32/32 chunks (0/32 bitwise-equal, diffs in the 3rd decimal), so
+  the two evaluated models are genuinely different — this is a real tie,
+  not an eval bug. Verified explicitly because the exact agreement looked
+  suspicious.
+- distill_dft − dense-CE = −0.0202 ± 0.0012, 32/32 (numerically the same
+  margin delta-CE has over dense-CE).
+- distill_dft − distill(base teacher) = −0.1216 ± 0.0032, 32/32.
+- distill_mix − delta = +0.0268 ± 0.0010, mix better on **0/32** — the mix
+  is strictly worse than plain CE-through-pipeline.
+- distill_mix − dense-CE = +0.0066 ± 0.0014, mix better on 4/32 — worse
+  than the dense CE control too.
+
+**Readings:**
+
+1. **The 10.19 prediction was wrong, informatively.** The tax did not
+   compose additively onto the dense-ft base. Instead, pure KL-to-dense-ft
+   and CE-through-the-pipeline — two very different objectives, one with no
+   PG19 labels through the student at all — converge on the SAME pipeline
+   number (10.3732) from opposite directions: delta-CE = better dense model
+   (9.79) + higher tax (0.0574); dft = slightly worse dense model (9.84) +
+   lower tax (0.0526). Suggests ~10.37 is a shared ceiling for
+   2000-step-LoRA@8K pipeline adaptation, i.e. a trade-off frontier, not an
+   objective-specific artifact.
+2. **The mix arm is actively harmful** (worse than delta-CE on 32/32,
+   worse than even the dense control on 28/32): with the UNadapted base as
+   the KL anchor, the KL term fights the CE adaptation rather than
+   regularizing it. Anchoring must be to an adapted teacher (as in dft) or
+   not at all.
+3. Levers that might break the 10.37 ceiling, in plausibility order: more
+   steps / bigger LoRA rank / full finetune (capacity), dft distillation at
+   32K (length), dft with CE mixed (adapted-teacher version of mix).
 
 ---
 
