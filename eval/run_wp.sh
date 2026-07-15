@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -72,6 +72,11 @@ case "$WP" in
   distill) TESTS="tests/test_flex_delta.py"; DISTILL=1 ;;
   distill2) TESTS="tests/test_flex_delta.py"; DISTILL2=1 ;;
   distill3) TESTS="tests/test_flex_delta.py"; DISTILL3=1 ;;
+  # benchmarks for the 32K-trained adapters + distill_dft (per-sample logged),
+  # THEN the dft+CE training cell — bench first so a train failure can't
+  # cost the evals
+  bench32k) TESTS="tests/test_longbench_offline.py tests/test_flex_delta.py"
+            BENCH32K=1; DISTILL3=1 ;;
   enmc) TESTS="tests/test_longbench_offline.py"; ENMC=1 ;;
   specdec) TESTS="tests/test_longbench_offline.py tests/test_delta_decode.py"; SPECDEC=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
@@ -277,6 +282,32 @@ if [ -n "$DISTILL2" ]; then
     || { stage "distill2-dft:FAILED"; exit 1; }
   stage "distill2-dft:PASS"
   run_ppl_2x2 ppl32k-distill2 base,delta,dense,detach,distill,distill_mix,distill_dft
+fi
+
+BENCH_ARMS=base_dense,base_delta,ce_delta,dense_delta,ce32k_delta,dense32k_delta,detach32k_delta,distill_dft_delta
+
+if [ -n "$BENCH32K" ]; then
+  # downstream benchmarks for the 32K-trained adapters (perplexity alone
+  # cannot carry the claim): 8 arms x LongBench QA + En.MC, per-sample
+  # logged so every between-arm comparison is paired. The 8K arms are
+  # re-run to get their per-sample logs (aggregates exist from 07-13/14).
+  stage "adapter-fetch-bench:running"
+  fetch_adapters delta dense delta_32k dense_32k detach_32k distill_dft \
+    || { stage "adapter-fetch-bench:FAILED"; exit 1; }
+  stage "adapter-fetch-bench:PASS"
+  stage "bench32k-smoke:running"
+  python eval/longbench_eval.py --suite v1 --n-samples 3 \
+    --arms ce32k_delta,distill_dft_delta --out results/bench32k_smoke.csv \
+    || { stage "bench32k-smoke:FAILED"; exit 1; }
+  stage "bench32k-smoke:PASS"
+  stage "bench32k-v1:running"
+  python eval/longbench_eval.py --suite v1 --n-samples 50 --arms "$BENCH_ARMS" \
+    || { stage "bench32k-v1:FAILED"; exit 1; }
+  stage "bench32k-v1:PASS"
+  stage "bench32k-enmc:running"
+  python eval/longbench_eval.py --suite enmc --n-samples 229 --arms "$BENCH_ARMS" \
+    || { stage "bench32k-enmc:FAILED"; exit 1; }
+  stage "bench32k-enmc:PASS"
 fi
 
 if [ -n "$DISTILL3" ]; then
