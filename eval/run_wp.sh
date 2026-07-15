@@ -17,12 +17,20 @@ stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 
 
 fetch_adapters() {  # usage: fetch_adapters <arm>... — one source of truth
   python - "$@" <<'PYEOF'
-import sys, wandb
+import sys, time, wandb
 api = wandb.Api()
 for arm in sys.argv[1:]:
     art = api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest")
     root = f"checkpoints/pilot_{arm}"
-    art.download(root=root)
+    for attempt in range(3):  # wandb GCS signed URLs 403 transiently
+        try:
+            art.download(root=root)
+            break
+        except Exception as e:
+            if attempt == 2:
+                raise
+            print(f"fetch {arm} attempt {attempt + 1} failed ({e}); retrying in 30s", flush=True)
+            time.sleep(30)
     # record the RESOLVED version+digest next to the weights: ':latest' is a
     # floating alias, and anything trained/evaled against this adapter (e.g.
     # a distill teacher) needs pinned provenance to be reproducible
