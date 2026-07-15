@@ -57,14 +57,20 @@ def lora_updates(adapter_dir):
 def masked_labels(ids, gamma, anchor: bool):
     """Anchor rows follow delta_forward_train's layout: every gamma-th row of
     the uniform region + the dense tail. anchor=True keeps only those;
-    False keeps only the window rows. -100 elsewhere."""
+    False keeps only the window rows. -100 elsewhere.
+
+    SHIFT-AWARE: chunked_ce_hidden computes the loss of hidden position p
+    from labels[p+1], so to capture the loss AT anchor rows idx we must keep
+    labels at idx+1 (masking at idx would credit the row BEFORE each anchor
+    — a window row — and swap the two gradient populations)."""
     from delta_attention.train.flex_delta import anchor_layout
 
     s = ids.size(1)
     idx, tail, _ = anchor_layout(s, gamma)
+    pos = torch.cat((idx, tail)) + 1  # label p+1 carries hidden row p's loss
+    pos = pos[pos < s]
     mask = torch.zeros(s, dtype=torch.bool)
-    mask[idx] = True
-    mask[tail] = True
+    mask[pos] = True
     labels = ids.clone()
     labels[0, ~mask if anchor else mask] = -100
     return labels

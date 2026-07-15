@@ -266,11 +266,20 @@ def main():
         model, tokenizer = build(wkey, args.gamma, args.window)
         prompts, max_new = load_prompts(args.suite, tokenizer, args.n_samples)
         prompts = [chat_wrap(pr, tokenizer) for pr in prompts]
+        # dense references are draft/block-independent: compute ONCE per
+        # weights config (was recomputed per config — 6x waste on the grid)
+        refs = {}
+        for i in range(min(args.exact_check_n, len(prompts))):
+            refs[i] = dense_reference(model, tokenizer, prompts[i], max_new)
         for draft in drafts:
             for block in blocks:
                 agg = {"proposed": 0, "accepted": 0, "verify_calls": 0,
                        "full_blocks": 0, "blocks": 0, "tokens": 0,
-                       "t_spec": 0.0, "t_dense": 0.0, "exact": []}
+                       # timing comparison uses ONLY the checked prompts and
+                       # includes prefill on BOTH sides (dense_reference's
+                       # generate() includes its prefill; spec adds t_prefill)
+                       "tok_chk": 0, "t_spec_chk": 0.0,
+                       "tok_ref": 0, "t_dense": 0.0, "exact": []}
                 for i, prompt in enumerate(prompts):
                     toks, st = spec_generate(model, tokenizer, prompt, draft,
                                              block, max_new)
@@ -278,22 +287,26 @@ def main():
                               "full_blocks", "blocks"):
                         agg[k] += st[k]
                     agg["tokens"] += len(toks)
-                    agg["t_spec"] += st["t_draft"] + st["t_verify"]
-                    if i < args.exact_check_n:
-                        ref, dt = dense_reference(model, tokenizer, prompt, max_new)
+                    if i in refs:
+                        ref, dt = refs[i]
+                        agg["tok_chk"] += len(toks)
+                        agg["t_spec_chk"] += (st["t_prefill"] + st["t_draft"]
+                                              + st["t_verify"])
+                        agg["tok_ref"] += len(ref)
                         agg["t_dense"] += dt
                         n_cmp = min(len(toks), len(ref))
                         div = next((j for j in range(n_cmp)
                                     if toks[j] != ref[j]), None)
+                        if div is None and len(toks) < len(ref):
+                            div = len(toks)  # early truncation = divergence
                         agg["exact"].append(n_cmp if div is None else div)
                     print(f"[specdec] {wkey}/{draft}/b{block} #{i}: "
                           f"acc {st['accepted']}/{st['proposed']}", flush=True)
                 acc = agg["accepted"] / max(agg["proposed"], 1)
                 apv = agg["accepted"] / max(agg["verify_calls"], 1)
                 fbr = agg["full_blocks"] / max(agg["blocks"], 1)
-                tps_spec = agg["tokens"] / max(agg["t_spec"], 1e-9)
-                tps_dense = (agg["tokens"] / agg["t_dense"] * len(agg["exact"]) / len(prompts)
-                             if agg["t_dense"] else 0.0)
+                tps_spec = agg["tok_chk"] / max(agg["t_spec_chk"], 1e-9)
+                tps_dense = agg["tok_ref"] / max(agg["t_dense"], 1e-9)
                 parity = min(agg["exact"]) if agg["exact"] else None
                 if (args.min_parity_prefix and parity is not None
                         and parity < args.min_parity_prefix):
