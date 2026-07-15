@@ -6,8 +6,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eval.longbench_eval import (  # noqa: E402
-    ENMC_TEMPLATE, enmc_correct_letter, f1_score, normalize_answer,
-    qa_f1_score, truncate_middle, V1_TASKS,
+    DECODE_ARMS, ENMC_TEMPLATE, enmc_correct_letter, f1_score,
+    GOVREPORT_TEMPLATE, normalize_answer, qa_f1_score, truncate_middle,
+    V1_TASKS,
 )
 
 
@@ -81,6 +82,18 @@ def test_enmc_correct_letter_unmatched_is_none():
         {"options": ["a", "b", "c", "d"], "answer": ["e"]}) is None
     assert enmc_correct_letter(
         {"options": ["a", "b", "c", "d"], "answer": []}) is None
+
+
+def test_govreport_template():
+    assert "{context}" in GOVREPORT_TEMPLATE
+    # rendered via .replace, so no other format fields may exist
+    assert GOVREPORT_TEMPLATE.count("{") == GOVREPORT_TEMPLATE.count("{context}")
+
+
+def test_decode_arm_gamma_sweep():
+    assert DECODE_ARMS["sparse_dec"] == ("sparse", None)
+    for g in (2, 4, 8, 16):
+        assert DECODE_ARMS[f"delta_dec{g}"] == ("delta", g)
 
 
 if __name__ == "__main__":

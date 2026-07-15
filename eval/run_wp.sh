@@ -3,14 +3,14 @@
 # Usage: bash eval/run_wp.sh <mode>
 # Modes: wp1 | wp3 | wp2 | wp2train | driftprobe | eval32k | falsify | decsweep
 #        | wp2pilot-{delta,dense,detach,all} | t2eval | longbench | ppl32k | gap
-#        | train32k | distill | distill2 | enmc
+#        | train32k | distill | distill2 | enmc | specdec
 # Writes one line per stage to ~/wp_status; designed for nohup; self-terminates
 # + archives on clean completion when SELF_TERMINATE creds are in the env.
 set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -72,6 +72,7 @@ case "$WP" in
   distill) TESTS="tests/test_flex_delta.py"; DISTILL=1 ;;
   distill2) TESTS="tests/test_flex_delta.py"; DISTILL2=1 ;;
   enmc) TESTS="tests/test_longbench_offline.py"; ENMC=1 ;;
+  specdec) TESTS="tests/test_longbench_offline.py tests/test_delta_decode.py"; SPECDEC=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -294,6 +295,31 @@ if [ -n "$ENMC" ]; then
     --arms base_dense,base_delta,ce_delta,dense_delta \
     || { stage "enmc:FAILED"; exit 1; }
   stage "enmc:PASS"
+fi
+
+if [ -n "$SPECDEC" ]; then
+  # Jeff's speculative-decoding probe (base model only, no adapters):
+  # (a) fill the gamma_dec gap on the QA tasks (2 and 16 already measured),
+  # (b) GovReport summarization — long natural-language generation, the
+  #     regime where a local-context draft should hold up
+  stage "rouge-dep:running"
+  pip install --quiet rouge || { stage "rouge-dep:FAILED"; exit 1; }
+  stage "rouge-dep:PASS"
+  stage "specdec-smoke:running"
+  python eval/longbench_eval.py --suite govreport --n-samples 2 \
+    --arms base_delta,delta_dec8 --out results/govreport_smoke.csv \
+    || { stage "specdec-smoke:FAILED"; exit 1; }
+  stage "specdec-smoke:PASS"
+  stage "qa-gamma-sweep:running"
+  python eval/longbench_eval.py --suite v1 --n-samples 50 \
+    --arms delta_dec4,delta_dec8 \
+    || { stage "qa-gamma-sweep:FAILED"; exit 1; }
+  stage "qa-gamma-sweep:PASS"
+  stage "govreport:running"
+  python eval/longbench_eval.py --suite govreport --n-samples 50 \
+    --arms base_dense,base_delta,sparse_dec,delta_dec2,delta_dec4,delta_dec8,delta_dec16 \
+    || { stage "govreport:FAILED"; exit 1; }
+  stage "govreport:PASS"
 fi
 
 stage "ALL-DONE"

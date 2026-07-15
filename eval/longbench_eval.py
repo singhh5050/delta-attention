@@ -65,6 +65,17 @@ V1_TASKS = {
     "multifieldqa_en": (MULTIFIELD_TEMPLATE, 64),
 }
 
+# LongBench gov_report (dataset2prompt/dataset2maxlen: summarization, 512 new
+# tokens). Jeff's speculative-decoding probe: long natural-language generation
+# where locally-predictable tokens dominate — the regime where a sparse/delta
+# draft should hold up, unlike RULER's impossible-by-construction retrieval.
+GOVREPORT_TEMPLATE = (
+    "You are given a report by a government agency. Write a one-page summary "
+    "of the report.\n\nReport:\n{context}\n\nNow, write a one-page summary of "
+    "the report.\n\nSummary:"
+)
+GOVREPORT_MAX_NEW = 512
+
 V2_TEMPLATE = (
     "Please read the following text and answer the question below.\n\n"
     "<text>\n{context}\n</text>\n\n"
@@ -88,7 +99,8 @@ DEFAULT_ARMS = ("base_dense", "base_delta", "ce_delta", "dense_delta",
                 # does the RULER decode cliff replicate on QA, or is it
                 # needle-retrieval-specific?
                 "sparse_dec", "delta_dec2", "delta_dec16")
-ARMS = DEFAULT_ARMS + ("distill_delta", "distill_mix_delta", "distill_dft_delta",
+ARMS = DEFAULT_ARMS + ("delta_dec4", "delta_dec8",
+                       "distill_delta", "distill_mix_delta", "distill_dft_delta",
                        "ce32k_delta", "dense32k_delta", "detach32k_delta")
 ADAPTERS = {"ce_delta": "checkpoints/pilot_delta",
             "dense_delta": "checkpoints/pilot_dense",
@@ -100,12 +112,14 @@ ADAPTERS = {"ce_delta": "checkpoints/pilot_delta",
             "detach32k_delta": "checkpoints/pilot_detach_32k"}
 DECODE_ARMS = {"sparse_dec": ("sparse", None),
                "delta_dec2": ("delta", 2),
+               "delta_dec4": ("delta", 4),
+               "delta_dec8": ("delta", 8),
                "delta_dec16": ("delta", 16)}
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--suite", choices=["v1", "v2", "enmc"], required=True)
+    p.add_argument("--suite", choices=["v1", "v2", "enmc", "govreport"], required=True)
     p.add_argument("--arms", type=str, default=",".join(DEFAULT_ARMS))
     p.add_argument("--n-samples", type=int, default=50)
     p.add_argument("--gamma", type=int, default=64)
@@ -139,6 +153,22 @@ def f1_score(prediction: str, ground_truth: str) -> float:
 
 def qa_f1_score(prediction: str, ground_truths) -> float:
     return max(f1_score(prediction, gt) for gt in ground_truths)
+
+
+def rouge_l_score(prediction: str, ground_truths) -> float:
+    """LongBench's rouge_score: rouge-l f via the `rouge` package (installed
+    by the specdec chain mode; import stays local so torch-less offline test
+    boxes never need it)."""
+    from rouge import Rouge
+
+    best = 0.0
+    for gt in ground_truths:
+        try:
+            s = Rouge().get_scores([prediction], [gt], avg=True)["rouge-l"]["f"]
+        except ValueError:  # empty/degenerate prediction
+            s = 0.0
+        best = max(best, s)
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -238,14 +268,16 @@ def build_model(arm: str, gamma: int, window: int):
 # build_model (OOM on 40GB boxes).
 
 
-def generate_answer(model, tokenizer, prompt: str, max_new: int) -> str:
+def generate_answer(model, tokenizer, prompt: str, max_new: int,
+                    first_line_only: bool = True) -> str:
     inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     inputs = {k: v.cuda() for k, v in inputs.items()}
     with torch.no_grad():
         ids = model.generate(**inputs, max_new_tokens=max_new, do_sample=False)
     text = tokenizer.decode(ids[0, inputs["input_ids"].size(1):],
-                            skip_special_tokens=True)
-    return text.strip().split("\n")[0]
+                            skip_special_tokens=True).strip()
+    # short-answer QA: first line only; summarization: keep the whole thing
+    return text.split("\n")[0] if first_line_only else text
 
 
 def choice_logprobs(model, tokenizer, prompt: str, letter_ids) -> int:
@@ -307,6 +339,27 @@ def select_v2(tokenizer, n: int):
         if len(picked) == n:
             break
     return picked
+
+
+def run_govreport(model, tokenizer, arm: str, n: int, log):
+    rows = load_v1("gov_report")[:n]
+    if not rows:
+        raise SystemExit(f"no gov_report samples (n={n})")
+    vals = []
+    for i, ex in enumerate(rows):
+        # .replace, not .format: government reports can contain literal braces
+        prompt = GOVREPORT_TEMPLATE.replace("{context}", ex["context"])
+        prompt = truncate_middle(prompt, tokenizer, MAX_PROMPT_TOKENS)
+        pred = generate_answer(model, tokenizer, chat_wrap(prompt, tokenizer),
+                               GOVREPORT_MAX_NEW, first_line_only=False)
+        vals.append(rouge_l_score(pred, ex["answers"]))
+        if i < 2:
+            print(f"[govreport] {arm} #{i}: rouge-l {vals[-1]:.3f} "
+                  f"pred[:120]={pred[:120]!r}", flush=True)
+    score = sum(vals) / len(vals)
+    log(arm, "govreport", "gov_report", len(vals), score)
+    print(f"[govreport] {arm}: ROUGE-L {score:.4f} (n={len(vals)})", flush=True)
+    return score
 
 
 def select_enmc(tokenizer, n: int):
@@ -407,6 +460,8 @@ def main():
         model, tokenizer = build_model(arm, args.gamma, args.window)
         if args.suite == "v1":
             run_v1(model, tokenizer, arm, args.n_samples, log)
+        elif args.suite == "govreport":
+            run_govreport(model, tokenizer, arm, args.n_samples, log)
         elif args.suite == "enmc":
             if enmc_samples is None:
                 enmc_samples = select_enmc(tokenizer, args.n_samples)
