@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -71,6 +71,7 @@ case "$WP" in
   train32k) TESTS="tests/test_flex_delta.py"; TRAIN32K=1 ;;
   distill) TESTS="tests/test_flex_delta.py"; DISTILL=1 ;;
   distill2) TESTS="tests/test_flex_delta.py"; DISTILL2=1 ;;
+  distill3) TESTS="tests/test_flex_delta.py"; DISTILL3=1 ;;
   enmc) TESTS="tests/test_longbench_offline.py"; ENMC=1 ;;
   specdec) TESTS="tests/test_longbench_offline.py tests/test_delta_decode.py"; SPECDEC=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
@@ -276,6 +277,33 @@ if [ -n "$DISTILL2" ]; then
     || { stage "distill2-dft:FAILED"; exit 1; }
   stage "distill2-dft:PASS"
   run_ppl_2x2 ppl32k-distill2 base,delta,dense,detach,distill,distill_mix,distill_dft
+fi
+
+if [ -n "$DISTILL3" ]; then
+  # the last untested cell of (teacher: base|dense-ft) x (loss: KL|KL+CE):
+  # KL to the dense-finetuned teacher PLUS CE. The adapted anchor avoids the
+  # mix arm's pathology; if this also lands at ~10.37 pipeline ppl, that is
+  # evidence for a 2000-step-LoRA capacity ceiling rather than an objective
+  # limitation. Same pilot dials as every other arm.
+  stage "adapter-fetch:running"
+  fetch_adapters delta dense detach distill distill_mix distill_dft \
+    || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  stage "distill3-smoke:running"
+  python -m delta_attention.train.train_delta --steps 20 --seq-len 8192 \
+    --probe-every 10 --arm distill --teacher-checkpoint checkpoints/pilot_dense \
+    --distill-alpha 1.0 --tag _smokedftmix --no-artifact \
+    --save-dir checkpoints/smoke_distill_dftmix \
+    || { stage "distill3-smoke:FAILED"; exit 1; }
+  stage "distill3-smoke:PASS"
+  stage "distill3-train:running"
+  python -m delta_attention.train.train_delta --steps 2000 --seq-len 8192 \
+    --probe-every 100 --arm distill --teacher-checkpoint checkpoints/pilot_dense \
+    --distill-alpha 1.0 --tag _dftmix --save-dir checkpoints/pilot_distill_dftmix \
+    || { stage "distill3-train:FAILED"; exit 1; }
+  stage "distill3-train:PASS"
+  run_ppl_2x2 ppl32k-distill3 \
+    base,delta,dense,detach,distill,distill_mix,distill_dft,distill_dftmix
 fi
 
 if [ -n "$ENMC" ]; then
