@@ -20,10 +20,10 @@ fetch_adapters() {  # usage: fetch_adapters <arm>... — one source of truth
 import sys, time, wandb
 api = wandb.Api()
 for arm in sys.argv[1:]:
-    art = api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest")
     root = f"checkpoints/pilot_{arm}"
-    for attempt in range(3):  # wandb GCS signed URLs 403 transiently
+    for attempt in range(3):  # wandb API + GCS signed URLs both flake
         try:
+            art = api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest")
             art.download(root=root)
             break
         except Exception as e:

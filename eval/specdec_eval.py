@@ -302,16 +302,26 @@ def main():
                         n_cmp = min(len(toks), len(ref))
                         div = next((j for j in range(n_cmp)
                                     if toks[j] != ref[j]), None)
-                        if div is None and len(toks) != len(ref):
-                            # length mismatch after a clean prefix is a
-                            # harness bug in EITHER direction: early
-                            # truncation, or overrunning an eos the dense
-                            # reference stopped at
-                            div = n_cmp
-                        # a byte-identical output is a PASS regardless of
-                        # length (legitimate short eos stop must not trip
-                        # the min-parity gate)
-                        agg["exact"].append(10**9 if div is None else div)
+                        eos_ids = model.generation_config.eos_token_id
+                        eos_ids = set(eos_ids if isinstance(eos_ids, (list, tuple))
+                                      else [eos_ids])
+                        if div is not None:
+                            parity_i = div
+                        elif len(toks) != len(ref):
+                            # clean prefix but different lengths is ALWAYS a
+                            # harness bug (a legit eos stop matches through
+                            # the eos, so lengths agree): hard-fail marker
+                            parity_i = -1
+                        elif toks and toks[-1] in eos_ids:
+                            parity_i = 10**9  # byte-identical, natural eos
+                        elif n_cmp >= max(args.min_parity_prefix, 1):
+                            parity_i = 10**9  # byte-identical, long enough
+                        else:
+                            # byte-identical but SHORT with no eos ending —
+                            # too few verified tokens to certify (e.g. a bug
+                            # truncating both paths identically)
+                            parity_i = n_cmp
+                        agg["exact"].append(parity_i)
                     print(f"[specdec] {wkey}/{draft}/b{block} #{i}: "
                           f"acc {st['accepted']}/{st['proposed']}", flush=True)
                 acc = agg["accepted"] / max(agg["proposed"], 1)
