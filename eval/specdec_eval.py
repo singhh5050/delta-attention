@@ -68,6 +68,53 @@ def accept_block(proposals, dense_choices, bonus):
     return n, bonus, True
 
 
+TIE_EPS = 0.5  # bf16 ulp at |logit|~16-32 is 0.125-0.25: a kernel-order
+# argmax flip needs the two candidates within ~1-2 ulps, while a harness bug
+# puts the spec token several logits below the max. Measured flips on
+# GovReport (margin probe, 07-16): 0.000, 0.125, 0.250.
+
+
+def classify_parity(entries, min_prefix):
+    """entries: per-checked-prompt parity results — int (divergence index;
+    10**9 = certified byte-identical; -1 = length mismatch after a clean
+    prefix, always a bug) or ('tie', div, margin) for an early divergence
+    PROVEN to be a bf16 argmax near-tie by a fresh dense forward.
+    Returns (csv_value, failure_msg_or_None)."""
+    if not entries:
+        return None, None
+    nums = [e for e in entries if isinstance(e, int)]
+    ties = [e for e in entries if not isinstance(e, int)]
+    parity = min(nums) if nums else None
+    val = "full" if parity == 10**9 else parity
+    if val is None:
+        val = "tie-only"  # every checked prompt hit a proven tie-flip
+    fail = None
+    if min_prefix and isinstance(val, int) and val < min_prefix:
+        fail = (f"diverged from dense greedy at token {val} (< {min_prefix}) "
+                "with a non-tie margin — harness bug, not kernel numerics")
+    if ties:
+        val = (f"{val}+{len(ties)}tie("
+               + ",".join(f"{d}@{m:.2f}" for _, d, m in ties) + ")")
+    return val, fail
+
+
+def spec_token_margin(model, tokenizer, prompt, ref, div, spec_tok):
+    """max_logit - logit[spec_tok] at the divergence slot, from a fresh
+    no-cache dense forward over prompt + ref[:div]. The tie detector for
+    early divergences: ~0 (within TIE_EPS) for kernel-order coin flips,
+    several logits for real bugs."""
+    ids = tokenizer(prompt, return_tensors="pt",
+                    add_special_tokens=False)["input_ids"][0].tolist()
+    model.config.decode_mode = "dense"
+    model.config._attn_implementation = model.config.attn_implementation_original
+    setattr(model, "no_lm_head", True)
+    with torch.no_grad():
+        out = model(torch.tensor([ids + ref[:div]], device="cuda"),
+                    use_cache=False)
+        logits = model.lm_head(out.logits[:, -1, :]).float()[0]
+    return float(logits.max() - logits[spec_tok])
+
+
 def positional_stats(nacc, block):
     """From per-block accepted-prefix lengths, compute (pos_acc, genuine).
     Prefix acceptance is monotone, so P(position i accepted) = fraction of
@@ -375,6 +422,18 @@ def main():
                                       else [eos_ids])
                         if div is not None:
                             parity_i = div
+                            if args.min_parity_prefix and div < args.min_parity_prefix:
+                                # early divergence: bug OR bf16 near-tie
+                                # (GovReport prose hits ties as early as
+                                # token 17) — one fresh dense forward
+                                # separates the two before we hard-fail
+                                margin = spec_token_margin(
+                                    model, tokenizer, prompt, ref, div,
+                                    toks[div])
+                                print(f"[specdec] early divergence @{div}: "
+                                      f"margin {margin:.3f}", flush=True)
+                                if margin <= TIE_EPS:
+                                    parity_i = ("tie", div, margin)
                         elif len(toks) != len(ref):
                             # clean prefix but different lengths is ALWAYS a
                             # harness bug (a legit eos stop matches through
@@ -398,16 +457,12 @@ def main():
                 pos_acc, genuine = positional_stats(agg["nacc"], block)
                 tps_spec = agg["tok_chk"] / max(agg["t_spec_chk"], 1e-9)
                 tps_dense = agg["tok_ref"] / max(agg["t_dense"], 1e-9)
-                parity = min(agg["exact"]) if agg["exact"] else None
-                if parity == 10**9:
-                    parity = "full"  # every checked output byte-identical
-                if (args.min_parity_prefix and isinstance(parity, int)
-                        and parity < args.min_parity_prefix):
+                parity, pfail = classify_parity(agg["exact"],
+                                                args.min_parity_prefix)
+                if pfail:
                     raise SystemExit(
-                        f"PARITY FAILURE: {wkey}/{draft}/b{block} diverged from "
-                        f"dense greedy at token {parity} (< "
-                        f"{args.min_parity_prefix}) — early divergence means a "
-                        "harness bug, not kernel numerics; aborting")
+                        f"PARITY FAILURE: {wkey}/{draft}/b{block} {pfail}; "
+                        "aborting")
                 w.writerow([args.suite, wkey, draft, block, len(prompts),
                             f"{acc:.4f}", f"{genuine:.4f}",
                             ";".join(f"{x:.4f}" for x in pos_acc),

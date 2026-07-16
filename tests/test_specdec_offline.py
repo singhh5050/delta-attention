@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eval.specdec_eval import (  # noqa: E402
-    DRAFT_WEIGHTS, accept_block, positional_stats,
+    DRAFT_WEIGHTS, accept_block, classify_parity, positional_stats,
 )
 
 
@@ -71,6 +71,33 @@ def test_positional_stats_edge_cases():
     # empty (no counted blocks) must not divide by zero
     pos_acc, genuine = positional_stats([], 4)
     assert pos_acc == [0.0] * 4 and genuine == 0.0
+
+
+def test_classify_parity_gate():
+    FULL = 10**9
+    # all byte-identical -> "full", no failure
+    assert classify_parity([FULL, FULL], 24) == ("full", None)
+    # late divergence (>= gate) passes with the numeric min
+    val, fail = classify_parity([75, FULL], 24)
+    assert val == 75 and fail is None
+    # early NON-TIE divergence hard-fails
+    val, fail = classify_parity([17, FULL], 24)
+    assert val == 17 and fail is not None
+    # early divergence proven to be a bf16 tie is benign and annotated
+    val, fail = classify_parity([("tie", 17, 0.125), FULL], 24)
+    assert fail is None and val.startswith("full+1tie(17@0.12")
+    # a tie does NOT excuse a separate early non-tie divergence
+    val, fail = classify_parity([("tie", 17, 0.0), 5], 24)
+    assert fail is not None
+    # length mismatch after a clean prefix (-1) is always a bug
+    _, fail = classify_parity([-1, FULL], 24)
+    assert fail is not None
+    # every prompt tie-flipped: no certified prefix, but not a failure
+    val, fail = classify_parity([("tie", 30, 0.25)], 24)
+    assert fail is None and val.startswith("tie-only")
+    # no checks -> (None, None), and gate disabled (0) never fails
+    assert classify_parity([], 24) == (None, None)
+    assert classify_parity([3], 0) == (3, None)
 
 
 def test_draft_weights_registry():
