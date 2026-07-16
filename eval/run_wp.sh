@@ -427,16 +427,19 @@ if [ -n "$SPECDEC2" ]; then
   stage "specdec2-base-grid:running"
   python eval/specdec_eval.py --suite govreport --n-samples 20 \
     --drafts sparse,delta --blocks 2,4,8 --weights base \
+    --min-parity-prefix 24 \
     || { stage "specdec2-base-grid:FAILED"; exit 1; }
   stage "specdec2-base-grid:PASS"
   stage "specdec2-trained:running"
   python eval/specdec_eval.py --suite govreport --n-samples 20 \
     --drafts sparse,delta --blocks 4 --weights ce32k,dft \
+    --min-parity-prefix 24 \
     || { stage "specdec2-trained:FAILED"; exit 1; }
   stage "specdec2-trained:PASS"
   stage "specdec2-qa:running"
   python eval/specdec_eval.py --suite qa --n-samples 40 \
     --drafts sparse,delta --blocks 4 --weights base \
+    --min-parity-prefix 24 \
     || { stage "specdec2-qa:FAILED"; exit 1; }
   stage "specdec2-qa:PASS"
 fi

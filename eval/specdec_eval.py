@@ -47,9 +47,11 @@ from eval.longbench_eval import (  # noqa: E402
 )
 
 DRAFT_MODES = ("sparse", "delta")
-# draft weights: base model or a trained adapter (merged at init)
-DRAFT_WEIGHTS = {"base": "", "ce32k": "checkpoints/pilot_delta_32k",
-                 "dft": "checkpoints/pilot_distill_dft"}
+# draft weights: base model or a trained adapter (merged at init).
+# Paths resolve against REPO_ROOT so the harness is cwd-independent.
+DRAFT_WEIGHTS = {"base": "",
+                 "ce32k": str(REPO_ROOT / "checkpoints/pilot_delta_32k"),
+                 "dft": str(REPO_ROOT / "checkpoints/pilot_distill_dft")}
 
 
 def accept_block(proposals, dense_choices, bonus):
@@ -121,8 +123,12 @@ def spec_generate(model, tokenizer, prompt, draft_mode, block, max_new):
         out = model(torch.tensor([ids], device="cuda"), use_cache=True)
         first_logits = model.lm_head(out.logits[:, -1, :]).float()[0]
     model.config._attn_implementation = "sdpa_rectangle"
+    # the draft's per-phase state reset means it must anchor ONLY at block
+    # starts — a small config.gamma_dec would fire mid-block for large K
+    model.config.gamma_dec = 10**9
     cache = out.past_key_values
-    t_prefill = time.monotonic() - t0
+    torch.cuda.synchronize()  # prefill kernels are async; time them here,
+    t_prefill = time.monotonic() - t0  # not inside the first draft window
 
     L_dense = len(ids)                      # dense-grade cache length
     pending = [int(first_logits.argmax())]  # accepted, KV not yet in cache
@@ -164,22 +170,29 @@ def spec_generate(model, tokenizer, prompt, draft_mode, block, max_new):
         bonus = int(logits[-1].argmax())
 
         n_acc, nxt, full = accept_block(proposals, dense_choices, bonus)
-        stats["proposed"] += len(proposals)
-        stats["accepted"] += n_acc
-        stats["blocks"] += 1
-        stats["full_blocks"] += int(full)
-        if not full:
-            stats["first_reject_pos"].append(n_acc)
         # dense-grade KV: pending + accepted proposals stay; rest cropped
         keep = L_dense + m + n_acc
         cache.crop(keep)
         L_dense = keep
 
         emitted = proposals[:n_acc] + [nxt]
+        consumed = 0
         for t in emitted:
             generated.append(t)
+            consumed += 1
             if len(generated) >= max_new or t in eos:
                 break
+        # acceptance accounting counts ONLY blocks fully inside the emitted
+        # sequence: a final block cut by eos/max_new includes proposals a
+        # sequential dense decode would never have needed, which inflates
+        # acceptance on short-answer suites
+        if consumed == len(emitted):
+            stats["proposed"] += len(proposals)
+            stats["accepted"] += n_acc
+            stats["blocks"] += 1
+            stats["full_blocks"] += int(full)
+            if not full:
+                stats["first_reject_pos"].append(n_acc)
         pending = [generated[-1]] if generated[-1] not in eos else []
         if not pending:
             break
@@ -204,15 +217,16 @@ def load_prompts(suite, tokenizer, n):
         rows = load_v1("gov_report")[:n]
         prompts = [truncate_middle(GOVREPORT_TEMPLATE.replace("{context}", r["context"]),
                                    tokenizer, MAX_PROMPT_TOKENS) for r in rows]
-        return prompts, GOVREPORT_MAX_NEW
+        return prompts, [GOVREPORT_MAX_NEW] * len(prompts)
     if suite == "qa":
-        prompts = []
+        prompts, budgets = [], []
         per = max(n // len(V1_TASKS), 1)
-        for task, (template, _mx) in V1_TASKS.items():
+        for task, (template, mx) in V1_TASKS.items():
             for ex in load_v1(task)[:per]:
                 p = template.format(context=ex["context"], input=ex["input"])
                 prompts.append(truncate_middle(p, tokenizer, MAX_PROMPT_TOKENS))
-        return prompts, 64
+                budgets.append(mx)  # official per-task budget (32/32/32/64)
+        return prompts, budgets
     raise SystemExit(f"unknown suite {suite}")
 
 
@@ -265,7 +279,7 @@ def main():
 
     for wkey in weights:
         model, tokenizer = build(wkey, args.gamma, args.window)
-        prompts, max_new = load_prompts(args.suite, tokenizer, args.n_samples)
+        prompts, budgets = load_prompts(args.suite, tokenizer, args.n_samples)
         prompts = [chat_wrap(pr, tokenizer) for pr in prompts]
         # dense references are draft/block-independent: compute ONCE per
         # weights config (was recomputed per config — 6x waste on the grid).
@@ -276,7 +290,7 @@ def main():
             dense_reference(model, tokenizer, prompts[0], 16)
         refs = {}
         for i in range(min(args.exact_check_n, len(prompts))):
-            refs[i] = dense_reference(model, tokenizer, prompts[i], max_new)
+            refs[i] = dense_reference(model, tokenizer, prompts[i], budgets[i])
         for draft in drafts:
             for block in blocks:
                 agg = {"proposed": 0, "accepted": 0, "verify_calls": 0,
@@ -288,7 +302,7 @@ def main():
                        "tok_ref": 0, "t_dense": 0.0, "exact": []}
                 for i, prompt in enumerate(prompts):
                     toks, st = spec_generate(model, tokenizer, prompt, draft,
-                                             block, max_new)
+                                             block, budgets[i])
                     for k in ("proposed", "accepted", "verify_calls",
                               "full_blocks", "blocks"):
                         agg[k] += st[k]
