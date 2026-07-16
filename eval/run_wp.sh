@@ -3,14 +3,14 @@
 # Usage: bash eval/run_wp.sh <mode>
 # Modes: wp1 | wp3 | wp2 | wp2train | driftprobe | eval32k | falsify | decsweep
 #        | wp2pilot-{delta,dense,detach,all} | t2eval | longbench | ppl32k | gap
-#        | train32k | distill | distill2 | enmc | specdec
+#        | train32k | distill | distill2 | enmc | specdec | specdec3 (2xGPU)
 # Writes one line per stage to ~/wp_status; designed for nohup; self-terminates
 # + archives on clean completion when SELF_TERMINATE creds are in the env.
 set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -109,6 +109,7 @@ case "$WP" in
   enmc) TESTS="tests/test_longbench_offline.py"; ENMC=1 ;;
   specdec) TESTS="tests/test_longbench_offline.py tests/test_delta_decode.py"; SPECDEC=1 ;;
   specdec2) TESTS="tests/test_specdec_offline.py tests/test_delta_decode.py"; SPECDEC2=1 ;;
+  specdec3) TESTS="tests/test_specdec_offline.py tests/test_delta_decode.py"; SPECDEC3=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -442,6 +443,83 @@ if [ -n "$SPECDEC2" ]; then
     --min-parity-prefix 24 \
     || { stage "specdec2-qa:FAILED"; exit 1; }
   stage "specdec2-qa:PASS"
+fi
+
+if [ -n "$SPECDEC3" ]; then
+  # Definitive spec-decode grid on a 2x H100 box, one shard per GPU running
+  # concurrently: GPU0 = QA full grid; GPU1 = GovReport grid + RULER negative
+  # control. Every stage (smokes included) is parity-gated; the run fails if
+  # EITHER shard fails, so a failed box stays up for debugging.
+  N_GPU=$(nvidia-smi -L | wc -l)
+  [ "$N_GPU" -ge 2 ] || { stage "specdec3-gpucheck:FAILED"; exit 1; }
+  stage "adapter-fetch:running"
+  fetch_adapters delta_32k distill_dft distill_dftmix \
+    || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  W_ALL="base,ce32k,dft,dftmix"
+  (
+    export CUDA_VISIBLE_DEVICES=0
+    stage "sd3-qa-smoke:running"
+    python eval/specdec_eval.py --suite qa --n-samples 4 \
+      --drafts sparse,delta --blocks 4 --weights base \
+      --exact-check-n 4 --min-parity-prefix 24 \
+      --out results/sd3_qa_smoke.csv \
+      --samples-out results/sd3_qa_smoke_samples.csv \
+      || { stage "sd3-qa-smoke:FAILED"; exit 1; }
+    stage "sd3-qa-smoke:PASS"
+    stage "sd3-qa-grid:running"
+    python eval/specdec_eval.py --suite qa --n-samples 40 \
+      --drafts sparse,delta --blocks 2,4,8 --weights "$W_ALL" \
+      --min-parity-prefix 24 \
+      --out results/sd3_qa.csv --samples-out results/sd3_qa_samples.csv \
+      || { stage "sd3-qa-grid:FAILED"; exit 1; }
+    stage "sd3-qa-grid:PASS"
+  ) &
+  QA_PID=$!
+  (
+    export CUDA_VISIBLE_DEVICES=1
+    stage "sd3-gov-smoke:running"
+    python eval/specdec_eval.py --suite govreport --n-samples 3 \
+      --drafts sparse,delta --blocks 4 --weights base \
+      --exact-check-n 3 --min-parity-prefix 24 \
+      --out results/sd3_gov_smoke.csv \
+      --samples-out results/sd3_gov_smoke_samples.csv \
+      || { stage "sd3-gov-smoke:FAILED"; exit 1; }
+    stage "sd3-gov-smoke:PASS"
+    stage "sd3-gov-grid:running"
+    python eval/specdec_eval.py --suite govreport --n-samples 20 \
+      --drafts sparse,delta --blocks 2,4,8 --weights base,ce32k \
+      --min-parity-prefix 24 \
+      --out results/sd3_gov.csv --samples-out results/sd3_gov_samples.csv \
+      || { stage "sd3-gov-grid:FAILED"; exit 1; }
+    stage "sd3-gov-grid:PASS"
+    # trained drafts at the headline block size only (the training effect is
+    # established at K=4; full-K for dft/dftmix would add ~1.5h for low value)
+    stage "sd3-gov-trained:running"
+    python eval/specdec_eval.py --suite govreport --n-samples 20 \
+      --drafts sparse,delta --blocks 4 --weights dft,dftmix \
+      --min-parity-prefix 24 \
+      --out results/sd3_gov.csv --samples-out results/sd3_gov_samples.csv \
+      || { stage "sd3-gov-trained:FAILED"; exit 1; }
+    stage "sd3-gov-trained:PASS"
+    # negative control: needle retrieval — the draft's local context cannot
+    # contain the needle, so drafted-position acceptance should collapse on
+    # the answer span (Jeff: RULER is impossible-by-construction for this)
+    stage "sd3-ruler:running"
+    python eval/specdec_eval.py --suite ruler --n-samples 10 \
+      --drafts sparse,delta --blocks 4,8 --weights base \
+      --min-parity-prefix 24 \
+      --out results/sd3_ruler.csv --samples-out results/sd3_ruler_samples.csv \
+      || { stage "sd3-ruler:FAILED"; exit 1; }
+    stage "sd3-ruler:PASS"
+  ) &
+  GOV_PID=$!
+  wait "$QA_PID"; QA_RC=$?
+  wait "$GOV_PID"; GOV_RC=$?
+  if [ "$QA_RC" -ne 0 ] || [ "$GOV_RC" -ne 0 ]; then
+    stage "specdec3:FAILED"; exit 1
+  fi
+  stage "specdec3:PASS"
 fi
 
 if [ -n "$MMLU" ]; then

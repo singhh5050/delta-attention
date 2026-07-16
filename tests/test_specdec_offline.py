@@ -9,7 +9,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from eval.specdec_eval import DRAFT_WEIGHTS, accept_block  # noqa: E402
+from eval.specdec_eval import (  # noqa: E402
+    DRAFT_WEIGHTS, accept_block, positional_stats,
+)
 
 
 def test_full_block_accepted_returns_bonus():
@@ -47,9 +49,33 @@ def test_emitted_tokens_always_dense_choices():
         assert nxt == (bonus if full else dense[n])
 
 
+def test_positional_stats_curve_and_genuine():
+    # blocks of K=4 with accepted-prefix lengths 4, 2, 0:
+    # pos_acc[i] = frac(nacc > i) -> [2/3, 2/3, 1/3, 1/3]
+    pos_acc, genuine = positional_stats([4, 2, 0], 4)
+    assert pos_acc == [2 / 3, 2 / 3, 1 / 3, 1 / 3]
+    # genuine = accepted positions 2..K only: (3 + 1 + 0) / (3 blocks * 3)
+    assert abs(genuine - 4 / 9) < 1e-12
+    # headline == genuine reconstruction: acc = (pos1 + genuine*(K-1)) / K
+    acc = sum([4, 2, 0]) / (3 * 4)
+    assert abs(acc - (pos_acc[0] + genuine * 3) / 4) < 1e-12
+
+
+def test_positional_stats_edge_cases():
+    # all-full blocks: every position 1.0, genuine 1.0
+    pos_acc, genuine = positional_stats([2, 2], 2)
+    assert pos_acc == [1.0, 1.0] and genuine == 1.0
+    # K=1 has no drafted positions beyond the anchor; genuine == pos1
+    pos_acc, genuine = positional_stats([1, 0], 1)
+    assert pos_acc == [0.5] and genuine == 0.5
+    # empty (no counted blocks) must not divide by zero
+    pos_acc, genuine = positional_stats([], 4)
+    assert pos_acc == [0.0] * 4 and genuine == 0.0
+
+
 def test_draft_weights_registry():
     assert DRAFT_WEIGHTS["base"] == ""
-    assert set(DRAFT_WEIGHTS) == {"base", "ce32k", "dft"}
+    assert set(DRAFT_WEIGHTS) == {"base", "ce32k", "dft", "dftmix"}
 
 
 if __name__ == "__main__":

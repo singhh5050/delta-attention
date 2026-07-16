@@ -51,7 +51,8 @@ DRAFT_MODES = ("sparse", "delta")
 # Paths resolve against REPO_ROOT so the harness is cwd-independent.
 DRAFT_WEIGHTS = {"base": "",
                  "ce32k": str(REPO_ROOT / "checkpoints/pilot_delta_32k"),
-                 "dft": str(REPO_ROOT / "checkpoints/pilot_distill_dft")}
+                 "dft": str(REPO_ROOT / "checkpoints/pilot_distill_dft"),
+                 "dftmix": str(REPO_ROOT / "checkpoints/pilot_distill_dftmix")}
 
 
 def accept_block(proposals, dense_choices, bonus):
@@ -65,6 +66,22 @@ def accept_block(proposals, dense_choices, bonus):
             return n, d, False  # dense takes over at first mismatch
         n += 1
     return n, bonus, True
+
+
+def positional_stats(nacc, block):
+    """From per-block accepted-prefix lengths, compute (pos_acc, genuine).
+    Prefix acceptance is monotone, so P(position i accepted) = fraction of
+    blocks with n_acc > i. `genuine` is acceptance over positions 2..K only —
+    the delta draft's position 1 comes from a dense anchor row and is
+    accepted ~always by construction, so it is excluded for comparability
+    with small-draft speculative-decoding literature."""
+    nb = max(len(nacc), 1)
+    pos_acc = [sum(1 for a in nacc if a > i) / nb for i in range(block)]
+    if block == 1:
+        return pos_acc, pos_acc[0]
+    genuine = (sum(max(0, min(a, block) - 1) for a in nacc)
+               / (nb * (block - 1)))
+    return pos_acc, genuine
 
 
 def build(draft_weights_key, gamma_prefill, window):
@@ -134,7 +151,7 @@ def spec_generate(model, tokenizer, prompt, draft_mode, block, max_new):
     pending = [int(first_logits.argmax())]  # accepted, KV not yet in cache
     generated = [pending[0]]
     stats = {"proposed": 0, "accepted": 0, "verify_calls": 0, "draft_calls": 0,
-             "full_blocks": 0, "blocks": 0, "first_reject_pos": [],
+             "full_blocks": 0, "blocks": 0, "first_reject_pos": [], "nacc": [],
              "t_prefill": t_prefill, "t_draft": 0.0, "t_verify": 0.0}
 
     while len(generated) < max_new and generated[-1] not in eos:
@@ -191,6 +208,10 @@ def spec_generate(model, tokenizer, prompt, draft_mode, block, max_new):
             stats["accepted"] += n_acc
             stats["blocks"] += 1
             stats["full_blocks"] += int(full)
+            stats["nacc"].append(n_acc)  # per-position acceptance: pos i
+            # accepted iff n_acc > i (prefix acceptance is monotone), so the
+            # nacc list reconstructs the full positional curve — including
+            # the delta draft's structural pos-1 (dense-anchor) accept
             if not full:
                 stats["first_reject_pos"].append(n_acc)
         pending = [generated[-1]] if generated[-1] not in eos else []
@@ -213,26 +234,38 @@ def dense_reference(model, tokenizer, prompt, max_new):
 
 
 def load_prompts(suite, tokenizer, n):
+    """Returns (prompts, budgets) with chat templating ALREADY applied."""
     if suite == "govreport":
         rows = load_v1("gov_report")[:n]
         prompts = [truncate_middle(GOVREPORT_TEMPLATE.replace("{context}", r["context"]),
                                    tokenizer, MAX_PROMPT_TOKENS) for r in rows]
-        return prompts, [GOVREPORT_MAX_NEW] * len(prompts)
+        return ([chat_wrap(p, tokenizer) for p in prompts],
+                [GOVREPORT_MAX_NEW] * len(prompts))
     if suite == "qa":
         prompts, budgets = [], []
         per = max(n // len(V1_TASKS), 1)
         for task, (template, mx) in V1_TASKS.items():
             for ex in load_v1(task)[:per]:
                 p = template.format(context=ex["context"], input=ex["input"])
-                prompts.append(truncate_middle(p, tokenizer, MAX_PROMPT_TOKENS))
+                prompts.append(chat_wrap(
+                    truncate_middle(p, tokenizer, MAX_PROMPT_TOKENS), tokenizer))
                 budgets.append(mx)  # official per-task budget (32/32/32/64)
         return prompts, budgets
+    if suite == "ruler":
+        # negative control: needle retrieval, where the needle is outside the
+        # draft's sink+window — the sparse draft cannot know the answer and
+        # acceptance should collapse once positions leave local context.
+        # prepare_task_data returns RULER's own llama-3-templated text, so no
+        # chat_wrap here (double-templating would corrupt the prompt).
+        from eval.ruler_client import prepare_task_data
+        rows = prepare_task_data("niah_single_1", 32768, n, seed=0)
+        return [r["input"] for r in rows], [64] * len(rows)
     raise SystemExit(f"unknown suite {suite}")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--suite", choices=["govreport", "qa"], required=True)
+    p.add_argument("--suite", choices=["govreport", "qa", "ruler"], required=True)
     p.add_argument("--n-samples", type=int, default=20)
     p.add_argument("--drafts", type=str, default="sparse,delta")
     p.add_argument("--blocks", type=str, default="2,4,8")
@@ -254,6 +287,8 @@ def main():
                         "Systematic harness bugs diverge at tokens 0-10, so an "
                         "early divergence = bug. 0 disables the gate")
     p.add_argument("--out", type=str, default="results/specdec.csv")
+    p.add_argument("--samples-out", type=str, default="results/specdec_samples.csv",
+                   help="per-sample raw log (one row per config x prompt)")
     args = p.parse_args()
 
     import wandb
@@ -266,8 +301,18 @@ def main():
     w = csv.writer(fh)
     if new:
         w.writerow(["suite", "weights", "draft", "block", "n", "acceptance",
-                    "acc_per_verify", "full_block_rate", "tok_per_s_spec",
-                    "tok_per_s_dense", "parity_prefix_min", "run_id"])
+                    "acc_genuine", "pos_acc", "acc_per_verify",
+                    "full_block_rate", "tok_per_s_spec", "tok_per_s_dense",
+                    "parity_prefix_min", "run_id"])
+    s_path = Path(args.samples_out)
+    s_path.parent.mkdir(parents=True, exist_ok=True)
+    s_new = not s_path.exists()
+    sfh = s_path.open("a", newline="")
+    sw = csv.writer(sfh)
+    if s_new:
+        sw.writerow(["suite", "weights", "draft", "block", "idx", "proposed",
+                     "accepted", "blocks", "full_blocks", "nacc_hist",
+                     "n_tokens", "t_prefill", "t_draft", "t_verify", "run_id"])
 
     drafts = [d.strip() for d in args.drafts.split(",")]
     blocks = [int(b) for b in args.blocks.split(",")]
@@ -280,7 +325,6 @@ def main():
     for wkey in weights:
         model, tokenizer = build(wkey, args.gamma, args.window)
         prompts, budgets = load_prompts(args.suite, tokenizer, args.n_samples)
-        prompts = [chat_wrap(pr, tokenizer) for pr in prompts]
         # dense references are draft/block-independent: compute ONCE per
         # weights config (was recomputed per config — 6x waste on the grid).
         # Warmup first: the first CUDA forwards after model load pay kernel
@@ -294,7 +338,7 @@ def main():
         for draft in drafts:
             for block in blocks:
                 agg = {"proposed": 0, "accepted": 0, "verify_calls": 0,
-                       "full_blocks": 0, "blocks": 0, "tokens": 0,
+                       "full_blocks": 0, "blocks": 0, "tokens": 0, "nacc": [],
                        # timing comparison uses ONLY the checked prompts and
                        # includes prefill on BOTH sides (dense_reference's
                        # generate() includes its prefill; spec adds t_prefill)
@@ -306,7 +350,16 @@ def main():
                     for k in ("proposed", "accepted", "verify_calls",
                               "full_blocks", "blocks"):
                         agg[k] += st[k]
+                    agg["nacc"].extend(st["nacc"])
                     agg["tokens"] += len(toks)
+                    hist = [st["nacc"].count(j) for j in range(block + 1)]
+                    sw.writerow([args.suite, wkey, draft, block, i,
+                                 st["proposed"], st["accepted"], st["blocks"],
+                                 st["full_blocks"], "|".join(map(str, hist)),
+                                 len(toks), f"{st['t_prefill']:.3f}",
+                                 f"{st['t_draft']:.3f}",
+                                 f"{st['t_verify']:.3f}", run.id])
+                    sfh.flush()
                     if i in refs:
                         ref, dt = refs[i]
                         agg["tok_chk"] += len(toks)
@@ -342,6 +395,7 @@ def main():
                 acc = agg["accepted"] / max(agg["proposed"], 1)
                 apv = agg["accepted"] / max(agg["verify_calls"], 1)
                 fbr = agg["full_blocks"] / max(agg["blocks"], 1)
+                pos_acc, genuine = positional_stats(agg["nacc"], block)
                 tps_spec = agg["tok_chk"] / max(agg["t_spec_chk"], 1e-9)
                 tps_dense = agg["tok_ref"] / max(agg["t_dense"], 1e-9)
                 parity = min(agg["exact"]) if agg["exact"] else None
@@ -355,15 +409,21 @@ def main():
                         f"{args.min_parity_prefix}) — early divergence means a "
                         "harness bug, not kernel numerics; aborting")
                 w.writerow([args.suite, wkey, draft, block, len(prompts),
-                            f"{acc:.4f}", f"{apv:.3f}", f"{fbr:.4f}",
+                            f"{acc:.4f}", f"{genuine:.4f}",
+                            ";".join(f"{x:.4f}" for x in pos_acc),
+                            f"{apv:.3f}", f"{fbr:.4f}",
                             f"{tps_spec:.2f}", f"{tps_dense:.2f}",
                             parity, run.id])
                 fh.flush()
                 run.log({f"specdec/{wkey}/{draft}/b{block}/acceptance": acc,
+                         f"specdec/{wkey}/{draft}/b{block}/acc_genuine": genuine,
                          f"specdec/{wkey}/{draft}/b{block}/acc_per_verify": apv,
                          f"specdec/{wkey}/{draft}/b{block}/full_block_rate": fbr})
                 run.summary[f"acc_{wkey}_{draft}_b{block}"] = acc
+                run.summary[f"accg_{wkey}_{draft}_b{block}"] = genuine
                 print(f"[specdec] {wkey}/{draft}/b{block}: acceptance {acc:.3f} "
+                      f"genuine {genuine:.3f} "
+                      f"pos_acc {';'.join(f'{x:.2f}' for x in pos_acc)} "
                       f"acc/verify {apv:.2f} full-block {fbr:.3f} "
                       f"parity_prefix_min={parity}", flush=True)
         model._sample = None
@@ -372,6 +432,7 @@ def main():
         torch.cuda.empty_cache()
 
     fh.close()
+    sfh.close()
     run.finish()
     print("[specdec] DONE", flush=True)
 
