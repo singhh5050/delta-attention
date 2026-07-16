@@ -83,19 +83,29 @@ def test_classify_parity_gate():
     # early NON-TIE divergence hard-fails
     val, fail = classify_parity([17, FULL], 24)
     assert val == 17 and fail is not None
-    # early divergence proven to be a bf16 tie is benign and annotated
+    # early tie is benign ONLY with corroboration (some prompt certified
+    # past the gate) — here FULL corroborates
     val, fail = classify_parity([("tie", 17, 0.125), FULL], 24)
     assert fail is None and val.startswith("full+1tie(17@0.12")
+    # ...and a late numeric divergence corroborates too
+    val, fail = classify_parity([("tie", 17, 0.125), 174], 24)
+    assert fail is None
     # a tie does NOT excuse a separate early non-tie divergence
     val, fail = classify_parity([("tie", 17, 0.0), 5], 24)
     assert fail is not None
-    # length mismatch after a clean prefix (-1) is always a bug
+    # length mismatch (-1) is always a bug — even with the gate DISABLED
     _, fail = classify_parity([-1, FULL], 24)
     assert fail is not None
-    # every prompt tie-flipped: no certified prefix, but not a failure
+    _, fail = classify_parity([-1], 0)
+    assert fail is not None
+    # ALL prompts tie-flipped before the gate: nothing certified -> fail
+    # (07-16 review: the old behavior passed with ~nothing verified)
+    val, fail = classify_parity([("tie", 5, 0.1), ("tie", 8, 0.0)], 24)
+    assert fail is not None
+    # all ties but one is past the gate: certified prefix exists -> pass
     val, fail = classify_parity([("tie", 30, 0.25)], 24)
     assert fail is None and val.startswith("tie-only")
-    # no checks -> (None, None), and gate disabled (0) never fails
+    # no checks -> (None, None), and gate disabled (0) never fails on ints
     assert classify_parity([], 24) == (None, None)
     assert classify_parity([3], 0) == (3, None)
 

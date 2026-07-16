@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -110,6 +110,7 @@ case "$WP" in
   specdec) TESTS="tests/test_longbench_offline.py tests/test_delta_decode.py"; SPECDEC=1 ;;
   specdec2) TESTS="tests/test_specdec_offline.py tests/test_delta_decode.py"; SPECDEC2=1 ;;
   specdec3) TESTS="tests/test_specdec_offline.py tests/test_delta_decode.py"; SPECDEC3=1 ;;
+  sdtiming) TESTS="tests/test_specdec_offline.py tests/test_delta_decode.py"; SDTIMING=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -520,6 +521,38 @@ if [ -n "$SPECDEC3" ]; then
     stage "specdec3:FAILED"; exit 1
   fi
   stage "specdec3:PASS"
+fi
+
+if [ -n "$SDTIMING" ]; then
+  # Definitive TIMING-ONLY rerun after the 07-16 review: --warm-baseline
+  # (lean sequential dense loop over every prompt, warm-vs-warm, symmetric
+  # harness machinery) replaces the cold generate() refs as the speedup
+  # denominator. Acceptance numbers from specdec3 stand; this fixes ONLY
+  # the tok_per_s comparison. Single GPU.
+  stage "adapter-fetch:running"
+  fetch_adapters delta_32k distill_dftmix || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  stage "sdt-smoke:running"
+  python eval/specdec_eval.py --suite govreport --n-samples 3 \
+    --drafts delta --blocks 4 --weights base --warm-baseline \
+    --exact-check-n 3 --min-parity-prefix 24 \
+    --out results/sdt_smoke.csv --samples-out results/sdt_smoke_samples.csv \
+    || { stage "sdt-smoke:FAILED"; exit 1; }
+  stage "sdt-smoke:PASS"
+  stage "sdt-delta-grid:running"
+  python eval/specdec_eval.py --suite govreport --n-samples 20 \
+    --drafts delta --blocks 2,4,8 --weights base,ce32k,dftmix \
+    --warm-baseline --min-parity-prefix 24 \
+    --out results/sdt_gov.csv --samples-out results/sdt_gov_samples.csv \
+    || { stage "sdt-delta-grid:FAILED"; exit 1; }
+  stage "sdt-delta-grid:PASS"
+  stage "sdt-sparse-contrast:running"
+  python eval/specdec_eval.py --suite govreport --n-samples 20 \
+    --drafts sparse --blocks 4 --weights base,ce32k,dftmix \
+    --warm-baseline --min-parity-prefix 24 \
+    --out results/sdt_gov.csv --samples-out results/sdt_gov_samples.csv \
+    || { stage "sdt-sparse-contrast:FAILED"; exit 1; }
+  stage "sdt-sparse-contrast:PASS"
 fi
 
 if [ -n "$MMLU" ]; then

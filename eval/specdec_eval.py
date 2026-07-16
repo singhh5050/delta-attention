@@ -78,20 +78,39 @@ def classify_parity(entries, min_prefix):
     """entries: per-checked-prompt parity results — int (divergence index;
     10**9 = certified byte-identical; -1 = length mismatch after a clean
     prefix, always a bug) or ('tie', div, margin) for an early divergence
-    PROVEN to be a bf16 argmax near-tie by a fresh dense forward.
-    Returns (csv_value, failure_msg_or_None)."""
+    measured as a bf16 argmax near-tie under the verify-path probe.
+    Returns (csv_value, failure_msg_or_None).
+
+    Guarantees (restored/tightened after the 07-16 review): -1 fails even
+    with the gate disabled; ties are benign only with corroboration — at
+    least one checked prompt must certify >= min_prefix tokens, otherwise
+    an all-early-ties config would pass with ~nothing verified."""
     if not entries:
         return None, None
     nums = [e for e in entries if isinstance(e, int)]
     ties = [e for e in entries if not isinstance(e, int)]
+    if -1 in nums:
+        return -1, ("length mismatch after a byte-identical prefix on a "
+                    "checked prompt — always a harness bug (a legit eos stop "
+                    "matches through the eos, so lengths agree)")
     parity = min(nums) if nums else None
     val = "full" if parity == 10**9 else parity
-    if val is None:
-        val = "tie-only"  # every checked prompt hit a proven tie-flip
     fail = None
-    if min_prefix and isinstance(val, int) and val < min_prefix:
-        fail = (f"diverged from dense greedy at token {val} (< {min_prefix}) "
-                "with a non-tie margin — harness bug, not kernel numerics")
+    if min_prefix:
+        if isinstance(val, int) and val < min_prefix:
+            fail = (f"diverged from dense greedy at token {val} "
+                    f"(< {min_prefix}) with a non-tie margin — harness bug, "
+                    "not kernel numerics")
+        elif ties:
+            certified = [e for e in nums if e >= min_prefix] \
+                + [t for t in ties if t[1] >= min_prefix]
+            if not certified:
+                fail = ("every checked prompt tie-flipped before the "
+                        f"{min_prefix}-token gate — ties are only benign "
+                        "with at least one prompt certified past the gate; "
+                        "nothing verified here")
+    if val is None:
+        val = "tie-only"  # every checked prompt hit a measured tie-flip
     if ties:
         val = (f"{val}+{len(ties)}tie("
                + ",".join(f"{d}@{m:.2f}" for _, d, m in ties) + ")")
@@ -99,19 +118,27 @@ def classify_parity(entries, min_prefix):
 
 
 def spec_token_margin(model, tokenizer, prompt, ref, div, spec_tok):
-    """max_logit - logit[spec_tok] at the divergence slot, from a fresh
-    no-cache dense forward over prompt + ref[:div]. The tie detector for
-    early divergences: ~0 (within TIE_EPS) for kernel-order coin flips,
-    several logits for real bugs."""
+    """max_logit - logit[spec_tok] at the divergence slot, computed under
+    the TARGET semantics: pipeline prefill of the prompt, then ref[:div] as
+    ONE dense rectangle (the verify path). The tie detector for early
+    divergences: ~0 (within TIE_EPS) for kernel-order coin flips, several
+    logits for real bugs. NOTE: a single no-cache forward under
+    attn_implementation_original would dispatch to delta_forward — the
+    APPROXIMATE window+delta path — which is the wrong adjudicator (07-16
+    review); this reproduces what the dense arm actually computes."""
     ids = tokenizer(prompt, return_tensors="pt",
                     add_special_tokens=False)["input_ids"][0].tolist()
-    model.config.decode_mode = "dense"
-    model.config._attn_implementation = model.config.attn_implementation_original
     setattr(model, "no_lm_head", True)
+    _reset_dec_state(model)
+    model.config._attn_implementation = model.config.attn_implementation_original
     with torch.no_grad():
-        out = model(torch.tensor([ids + ref[:div]], device="cuda"),
-                    use_cache=False)
+        out = model(torch.tensor([ids], device="cuda"), use_cache=True)
         logits = model.lm_head(out.logits[:, -1, :]).float()[0]
+    model.config._attn_implementation = "sdpa_rectangle"
+    model.config.decode_mode = "dense"
+    if div > 0:
+        logits, _ = _forward_tokens(model, ref[:div], out.past_key_values)
+        logits = logits[-1]
     return float(logits.max() - logits[spec_tok])
 
 
@@ -276,8 +303,38 @@ def dense_reference(model, tokenizer, prompt, max_new):
         t0 = time.monotonic()
         out = model.generate(**{k: v.cuda() for k, v in inputs.items()},
                              max_new_tokens=max_new, do_sample=False)
+        torch.cuda.synchronize()  # generate() can return with queued work
         dt = time.monotonic() - t0
     return out[0, inputs["input_ids"].size(1):].tolist(), dt
+
+
+def dense_lean(model, tokenizer, prompt, max_new):
+    """Sequential dense decode with the SAME lean machinery as spec_generate
+    (pipeline prefill + q_len=1 rectangle steps + argmax). This is the fair
+    wall-clock baseline: generate()'s per-step machinery (input_ids concat
+    at 32K length, stopping criteria, logits processors) is harness tax a
+    real serving loop doesn't pay, and charging it only to the dense side
+    inflates speedups (07-16 review). Returns (tokens, seconds incl prefill)."""
+    setattr(model, "no_lm_head", True)
+    eos = model.generation_config.eos_token_id
+    eos = set(eos if isinstance(eos, (list, tuple)) else [eos])
+    ids = tokenizer(prompt, return_tensors="pt",
+                    add_special_tokens=False)["input_ids"][0].tolist()
+    _reset_dec_state(model)
+    model.config._attn_implementation = model.config.attn_implementation_original
+    t0 = time.monotonic()
+    with torch.no_grad():
+        out = model(torch.tensor([ids], device="cuda"), use_cache=True)
+        logits = model.lm_head(out.logits[:, -1, :]).float()[0]
+    model.config._attn_implementation = "sdpa_rectangle"
+    model.config.decode_mode = "dense"
+    cache = out.past_key_values
+    generated = [int(logits.argmax())]
+    while len(generated) < max_new and generated[-1] not in eos:
+        lg, cache = _forward_tokens(model, [generated[-1]], cache)
+        generated.append(int(lg[-1].argmax()))
+    torch.cuda.synchronize()
+    return generated, time.monotonic() - t0
 
 
 def load_prompts(suite, tokenizer, n):
@@ -333,6 +390,12 @@ def main():
                         "eventually flips; observed at token ~75, never early). "
                         "Systematic harness bugs diverge at tokens 0-10, so an "
                         "early divergence = bug. 0 disables the gate")
+    p.add_argument("--warm-baseline", action="store_true",
+                   help="fair timing mode: after an untimed warmup, time a "
+                        "LEAN sequential dense loop over every prompt as the "
+                        "baseline, and time spec on every prompt too (07-16 "
+                        "review: cold first-config generate() refs biased "
+                        "tok_per_s_dense ~5% low)")
     p.add_argument("--out", type=str, default="results/specdec.csv")
     p.add_argument("--samples-out", type=str, default="results/specdec_samples.csv",
                    help="per-sample raw log (one row per config x prompt)")
@@ -341,25 +404,37 @@ def main():
     import wandb
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
                      name=f"specdec_{args.suite}", config=vars(args))
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    new = not out_path.exists()
-    fh = out_path.open("a", newline="")
-    w = csv.writer(fh)
-    if new:
-        w.writerow(["suite", "weights", "draft", "block", "n", "acceptance",
-                    "acc_genuine", "pos_acc", "acc_per_verify",
-                    "full_block_rate", "tok_per_s_spec", "tok_per_s_dense",
-                    "parity_prefix_min", "run_id"])
-    s_path = Path(args.samples_out)
-    s_path.parent.mkdir(parents=True, exist_ok=True)
-    s_new = not s_path.exists()
-    sfh = s_path.open("a", newline="")
-    sw = csv.writer(sfh)
-    if s_new:
-        sw.writerow(["suite", "weights", "draft", "block", "idx", "proposed",
-                     "accepted", "blocks", "full_blocks", "nacc_hist",
-                     "n_tokens", "t_prefill", "t_draft", "t_verify", "run_id"])
+
+    def open_csv(path, cols):
+        """Append-mode CSV with a schema guard: appending new-schema rows
+        under an old header silently misaligns column-name-based analysis
+        (07-16 review) — refuse instead."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            with path.open() as f:
+                first = f.readline().strip()
+            if first and first.split(",") != cols:
+                raise SystemExit(
+                    f"{path} has a different column schema (header: "
+                    f"{first[:100]}); appending would silently misalign "
+                    "columns — pass a fresh --out/--samples-out")
+            fh = path.open("a", newline="")
+            return fh, csv.writer(fh)
+        fh = path.open("a", newline="")
+        wtr = csv.writer(fh)
+        wtr.writerow(cols)
+        return fh, wtr
+
+    fh, w = open_csv(Path(args.out),
+                     ["suite", "weights", "draft", "block", "n", "acceptance",
+                      "acc_genuine", "pos_acc", "acc_per_verify",
+                      "full_block_rate", "tok_per_s_spec", "tok_per_s_dense",
+                      "parity_prefix_min", "run_id"])
+    sfh, sw = open_csv(Path(args.samples_out),
+                       ["suite", "weights", "draft", "block", "idx", "proposed",
+                        "accepted", "blocks", "full_blocks", "nacc_hist",
+                        "n_tokens", "t_prefill", "t_draft", "t_verify",
+                        "run_id"])
 
     drafts = [d.strip() for d in args.drafts.split(",")]
     blocks = [int(b) for b in args.blocks.split(",")]
@@ -382,6 +457,23 @@ def main():
         refs = {}
         for i in range(min(args.exact_check_n, len(prompts))):
             refs[i] = dense_reference(model, tokenizer, prompts[i], budgets[i])
+        lean_tok, lean_t = 0, 0.0
+        if args.warm_baseline and prompts:
+            # warm-vs-warm fair timing: one untimed spec + lean-dense pass
+            # first (kernel autotune/pool costs), then the lean dense loop
+            # over EVERY prompt as the baseline. The generate()-based refs
+            # above remain the PARITY reference only — their timing is
+            # neither lean nor warm (07-16 review) and is not used here.
+            spec_generate(model, tokenizer, prompts[0], drafts[0], blocks[0],
+                          budgets[0])
+            dense_lean(model, tokenizer, prompts[0], budgets[0])
+            for i, pr in enumerate(prompts):
+                toks_l, dt_l = dense_lean(model, tokenizer, pr, budgets[i])
+                lean_tok += len(toks_l)
+                lean_t += dt_l
+            print(f"[specdec] {wkey} lean warm dense baseline: "
+                  f"{lean_tok / max(lean_t, 1e-9):.2f} tok/s "
+                  f"({len(prompts)} prompts)", flush=True)
         for draft in drafts:
             for block in blocks:
                 agg = {"proposed": 0, "accepted": 0, "verify_calls": 0,
@@ -407,11 +499,14 @@ def main():
                                  f"{st['t_draft']:.3f}",
                                  f"{st['t_verify']:.3f}", run.id])
                     sfh.flush()
-                    if i in refs:
-                        ref, dt = refs[i]
+                    if args.warm_baseline or i in refs:
+                        # spec timing: every prompt under --warm-baseline,
+                        # else just the checked ones
                         agg["tok_chk"] += len(toks)
                         agg["t_spec_chk"] += (st["t_prefill"] + st["t_draft"]
                                               + st["t_verify"])
+                    if i in refs:
+                        ref, dt = refs[i]
                         agg["tok_ref"] += len(ref)
                         agg["t_dense"] += dt
                         n_cmp = min(len(toks), len(ref))
@@ -452,11 +547,18 @@ def main():
                     print(f"[specdec] {wkey}/{draft}/b{block} #{i}: "
                           f"acc {st['accepted']}/{st['proposed']}", flush=True)
                 acc = agg["accepted"] / max(agg["proposed"], 1)
-                apv = agg["accepted"] / max(agg["verify_calls"], 1)
+                # accepted per COUNTED verify: each counted block has exactly
+                # one verify; final blocks cut by eos/max_new are excluded
+                # from both sides (07-16 review: accepted/verify_calls mixed
+                # populations — ~2x understated on short-budget suites)
+                apv = agg["accepted"] / max(agg["blocks"], 1)
                 fbr = agg["full_blocks"] / max(agg["blocks"], 1)
                 pos_acc, genuine = positional_stats(agg["nacc"], block)
                 tps_spec = agg["tok_chk"] / max(agg["t_spec_chk"], 1e-9)
-                tps_dense = agg["tok_ref"] / max(agg["t_dense"], 1e-9)
+                if args.warm_baseline:
+                    tps_dense = lean_tok / max(lean_t, 1e-9)
+                else:
+                    tps_dense = agg["tok_ref"] / max(agg["t_dense"], 1e-9)
                 parity, pfail = classify_parity(agg["exact"],
                                                 args.min_parity_prefix)
                 if pfail:
