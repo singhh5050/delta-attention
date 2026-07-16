@@ -19,12 +19,29 @@ fetch_adapters() {  # usage: fetch_adapters <arm>... — one source of truth
   python - "$@" <<'PYEOF'
 import sys, time, wandb
 api = wandb.Api()
+def hf_fallback(arm, root):
+    """Adapters are mirrored to a private HF repo (2026-07-15, after the
+    key-rotation incident made wandb artifacts briefly unreachable)."""
+    import os
+    from huggingface_hub import snapshot_download
+    snapshot_download("singhh5050/delta-attention-adapters", repo_type="model",
+                      allow_patterns=[f"{arm}/*"], local_dir="checkpoints/_hf",
+                      token=os.environ.get("HF_TOKEN"))
+    os.makedirs(root, exist_ok=True)
+    src = f"checkpoints/_hf/{arm}"
+    for f in os.listdir(src):
+        os.replace(os.path.join(src, f), os.path.join(root, f))
+
 for arm in sys.argv[1:]:
     root = f"checkpoints/pilot_{arm}"
-    for attempt in range(3):  # wandb API + GCS signed URLs both flake
+    for attempt in range(3):  # wandb, then wandb, then the HF mirror
         try:
-            art = api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest")
-            art.download(root=root)
+            if attempt < 2:
+                art = api.artifact(f"singhh5050-stanford-university/delta-attention/wp2_adapter_{arm}:latest")
+                art.download(root=root)
+            else:
+                print(f"fetch {arm}: falling back to HF mirror", flush=True)
+                hf_fallback(arm, root)
             break
         except Exception as e:
             if attempt == 2:
