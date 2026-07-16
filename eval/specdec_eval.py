@@ -146,6 +146,7 @@ def spec_generate(model, tokenizer, prompt, draft_mode, block, max_new):
             proposals.append(nxt)
             cur = [nxt]
         # cache now holds draft-grade KV for pending + proposals[:-1]
+        torch.cuda.synchronize()  # timers must include the queued GPU work
         stats["t_draft"] += time.monotonic() - t0
 
         # ---- verify: crop to dense-grade, one rectangle block ----
@@ -155,6 +156,7 @@ def spec_generate(model, tokenizer, prompt, draft_mode, block, max_new):
         blk = pending + proposals
         logits, cache = _forward_tokens(model, blk, cache)
         stats["verify_calls"] += 1
+        torch.cuda.synchronize()  # timers must include the queued GPU work
         stats["t_verify"] += time.monotonic() - t0
         # dense choice at proposals[i]'s slot = argmax after its predecessor
         m = len(pending)
@@ -182,7 +184,6 @@ def spec_generate(model, tokenizer, prompt, draft_mode, block, max_new):
         if not pending:
             break
 
-    setattr(model, "no_lm_head", True)
     return generated, stats
 
 
