@@ -34,11 +34,38 @@ def parse_args():
     p.add_argument("--gamma", type=int, default=64)
     p.add_argument("--window", type=int, default=2048)
     p.add_argument("--adapters-root", type=str, default="checkpoints")
+    p.add_argument("--data-source", choices=["pg19", "arxiv"], default="pg19",
+                   help="held-out corpus for the chunks (arxiv = T3 replication)")
     return p.parse_args()
 
 
-def test_chunks(tokenizer, seq_len, n):
+def test_chunks(tokenizer, seq_len, n, source="pg19"):
     from datasets import load_dataset
+
+    if source == "arxiv":
+        # T3 second-corpus eval. common-pile/arxiv_papers has ONE split;
+        # training streams SHUFFLED from the head (~1.5K docs consumed at
+        # 500x32K), so held-out chunks come from 20K docs deep — disjoint
+        # by construction. No shuffle here: deterministic chunks are what
+        # make the per-chunk stats pairable across arms. Cross-doc packed
+        # (papers < 32K tokens), eos-separated, mirroring the training
+        # packing.
+        ds = load_dataset("common-pile/arxiv_papers", split="train",
+                          streaming=True).skip(20000)
+        eos = tokenizer.eos_token_id
+        buf, out = [], []
+        for doc in ds:
+            text = doc.get("text") or ""
+            if len(text) < 2000:
+                continue
+            buf.extend(tokenizer.encode(text, add_special_tokens=False))
+            buf.append(eos)
+            while len(buf) >= seq_len:
+                out.append(torch.tensor([buf[:seq_len]]))
+                buf = buf[seq_len:]
+                if len(out) == n:
+                    return out
+        raise SystemExit(f"only {len(out)} arxiv test chunks available")
 
     ds = load_dataset("emozilla/pg19", split="test", streaming=True)
     out = []
@@ -98,11 +125,12 @@ def main():
         model.eval().cuda()
 
         if chunks is None:
-            chunks = test_chunks(tokenizer, args.seq_len, args.chunks)
+            chunks = test_chunks(tokenizer, args.seq_len, args.chunks,
+                                 source=args.data_source)
         loss, ppl, per_chunk = pipeline_ppl(model, chunks)
         results[arm] = (loss, ppl, per_chunk)
         print(f"[ppl] {arm}: loss {loss:.4f}  ppl {ppl:.3f}  "
-              f"({args.chunks} held-out PG19-test chunks @ {args.seq_len})", flush=True)
+              f"({args.chunks} held-out {args.data_source} chunks @ {args.seq_len})", flush=True)
         print(f"[ppl] {arm} per-chunk: {[round(x, 4) for x in per_chunk]}", flush=True)
         run.log({f"ppl/{arm}": ppl, f"loss/{arm}": loss})
         run.summary[f"per_chunk_loss_{arm}"] = per_chunk

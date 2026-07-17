@@ -55,6 +55,20 @@ def parse_args():
                         "1/sqrt(64) and 0.015625 = 1/64). 1.0 = unchanged")
     p.add_argument("--data-seed", type=int, default=0,
                    help="PG19 shuffle seed (seed replication runs)")
+    p.add_argument("--data-source", choices=["pg19", "arxiv"], default="pg19",
+                   help="pg19: long books, per-doc 32K chunks (original). "
+                        "arxiv: LaTeX papers packed ACROSS documents (papers "
+                        "average ~10K tokens, shorter than one 32K sequence)")
+    p.add_argument("--bench", action="store_true",
+                   help="training-efficiency benchmark: CUDA-synced fwd/bwd/"
+                        "step timing + peak memory over the timed steps "
+                        "(after --bench-warmup), written to "
+                        "results/trainbench.csv. Same loop as real training "
+                        "— symmetric across arms by construction")
+    p.add_argument("--bench-warmup", type=int, default=5,
+                   help="untimed steps before timing starts (kernel autotune "
+                        "/ allocator maturation — the same cold-start bias "
+                        "that inflated the 07-16 decode speedups)")
     p.add_argument("--distill-alpha", type=float, default=0.0,
                    help="CE weight mixed into the distill loss (0 = pure KL)")
     p.add_argument("--teacher-checkpoint", type=str, default="",
@@ -161,6 +175,42 @@ def packed_pg19(tokenizer, seq_len, seed=0, max_chunks_per_doc=4):
         toks = tokenizer.encode(doc["text"], add_special_tokens=False)
         for c in range(min(len(toks) // seq_len, max_chunks_per_doc)):
             yield torch.tensor([toks[c * seq_len:(c + 1) * seq_len]], dtype=torch.long)
+
+
+def packed_arxiv(tokenizer, seq_len, seed=0):
+    """Stream arXiv LaTeX papers (shuffled) packed ACROSS documents into
+    [1, seq_len] tensors, eos-separated.
+
+    Second-corpus replication (T3): papers average ~10K tokens — shorter
+    than one 32K sequence — so unlike PG19's per-doc chunking, sequences
+    here concatenate 2-6 papers. Long-range structure differs from books
+    by design; that is the point of the replication."""
+    from datasets import load_dataset
+
+    # RedPajama/proof-pile-2/scientific_papers are script datasets
+    # (unsupported by modern `datasets`); this is a parquet arXiv corpus
+    # verified to stream. If it moves, pick any parquet arXiv mirror and
+    # keep the packing logic.
+    ds = load_dataset("common-pile/arxiv_papers", split="train",
+                      streaming=True)
+    ds = ds.shuffle(seed=seed, buffer_size=256)
+    eos = tokenizer.eos_token_id
+    buf = []
+    for doc in ds:
+        text = doc.get("text") or ""
+        if len(text) < 2000:  # skip stubs/withdrawn notices
+            continue
+        buf.extend(tokenizer.encode(text, add_special_tokens=False))
+        buf.append(eos)
+        while len(buf) >= seq_len:
+            yield torch.tensor([buf[:seq_len]], dtype=torch.long)
+            buf = buf[seq_len:]
+
+
+def packed_stream(tokenizer, seq_len, source="pg19", seed=0):
+    if source == "arxiv":
+        return packed_arxiv(tokenizer, seq_len, seed=seed)
+    return packed_pg19(tokenizer, seq_len, seed=seed)
 
 
 def _chunk_apply(fn, total, *args):
@@ -431,7 +481,8 @@ def main():
         teacher = build_teacher(args.teacher_checkpoint)
     lm_head_w = model.get_base_model().lm_head.weight  # frozen (LoRA is q/k/v/o)
 
-    data = packed_pg19(tokenizer, args.seq_len, seed=args.data_seed)
+    data = packed_stream(tokenizer, args.seq_len, source=args.data_source,
+                         seed=args.data_seed)
     heldout = [next(data) for _ in range(2)]  # drift probe sequences
 
     opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
@@ -441,8 +492,13 @@ def main():
 
     floor = args.min_tokens_per_sec
     t_hist = []
+    bench = {"fwd": [], "bwd": [], "opt": [], "step": []}
     for step in range(1, args.steps + 1):
         batch = next(data).cuda()
+        if args.bench:
+            if step == args.bench_warmup + 1:
+                torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
         t0 = time.monotonic()
         if args.arm == "distill":
             # teacher under DENSE attention: the target is "what dense would
@@ -473,12 +529,26 @@ def main():
         if not torch.isfinite(loss):
             print(f"[train] FATAL: non-finite loss at step {step}", flush=True)
             sys.exit(1)
+        if args.bench:
+            torch.cuda.synchronize()
+        t_fwd = time.monotonic()
         loss.backward()
+        if args.bench:
+            torch.cuda.synchronize()
+        t_bwd = time.monotonic()
         torch.nn.utils.clip_grad_norm_(
             (p for p in model.parameters() if p.requires_grad), 1.0)
         opt.step()
         sched.step()
         opt.zero_grad(set_to_none=True)
+        if args.bench:
+            torch.cuda.synchronize()
+            if step > args.bench_warmup:
+                t_end = time.monotonic()
+                bench["fwd"].append(t_fwd - t0)
+                bench["bwd"].append(t_bwd - t_fwd)
+                bench["opt"].append(t_end - t_bwd)
+                bench["step"].append(t_end - t0)
         dt = time.monotonic() - t0
         t_hist.append(dt)
         tps = args.seq_len / dt
@@ -524,6 +594,40 @@ def main():
                       "— wiring mistake (fp32? no flash path?)", flush=True)
                 sys.exit(1)
             print(f"[train] tokens/s {measured:.0f} (floor {floor:.0f})", flush=True)
+
+    if args.bench and bench["step"]:
+        import csv
+        from pathlib import Path
+        n = len(bench["step"])
+        peak_gb = torch.cuda.max_memory_allocated() / 2**30
+        mean = {k: sum(v) / n for k, v in bench.items()}
+        sem = {k: (sum((x - mean[k]) ** 2 for x in v) / max(n - 1, 1)) ** 0.5
+               / n ** 0.5 for k, v in bench.items()}
+        tok_s = args.seq_len / mean["step"]
+        out = Path("results/trainbench.csv")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        new = not out.exists()
+        with out.open("a", newline="") as f:
+            wtr = csv.writer(f)
+            if new:
+                wtr.writerow(["arm", "data_source", "seq_len", "n_timed",
+                              "fwd_ms", "fwd_sem", "bwd_ms", "bwd_sem",
+                              "opt_ms", "step_ms", "step_sem", "tok_per_s",
+                              "peak_mem_gb", "run_id"])
+            wtr.writerow([args.arm, args.data_source, args.seq_len, n]
+                         + [f"{1000*mean['fwd']:.1f}", f"{1000*sem['fwd']:.1f}",
+                            f"{1000*mean['bwd']:.1f}", f"{1000*sem['bwd']:.1f}",
+                            f"{1000*mean['opt']:.1f}",
+                            f"{1000*mean['step']:.1f}", f"{1000*sem['step']:.1f}",
+                            f"{tok_s:.0f}", f"{peak_gb:.2f}", run.id])
+        for k in ("fwd", "bwd", "opt", "step"):
+            run.summary[f"bench_{k}_ms"] = 1000 * mean[k]
+        run.summary["bench_tok_per_s"] = tok_s
+        run.summary["bench_peak_mem_gb"] = peak_gb
+        print(f"[bench] {args.arm} @{args.seq_len}: "
+              f"fwd {1000*mean['fwd']:.0f}ms bwd {1000*mean['bwd']:.0f}ms "
+              f"step {1000*mean['step']:.0f}ms ({tok_s:.0f} tok/s, "
+              f"peak {peak_gb:.1f}GB, n={n})", flush=True)
 
     model.save_pretrained(args.save_dir)
     if not args.no_artifact:

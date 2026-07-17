@@ -110,7 +110,8 @@ DEFAULT_ARMS = ("base_dense", "base_delta", "ce_delta", "dense_delta",
                 "sparse_dec", "delta_dec2", "delta_dec16")
 ARMS = DEFAULT_ARMS + ("delta_dec4", "delta_dec8",
                        "distill_delta", "distill_mix_delta", "distill_dft_delta",
-                       "ce32k_delta", "dense32k_delta", "detach32k_delta")
+                       "ce32k_delta", "dense32k_delta", "detach32k_delta",
+                       "distill_dftmix_delta")
 ADAPTERS = {"ce_delta": "checkpoints/pilot_delta",
             "dense_delta": "checkpoints/pilot_dense",
             "distill_delta": "checkpoints/pilot_distill",
@@ -118,7 +119,8 @@ ADAPTERS = {"ce_delta": "checkpoints/pilot_delta",
             "distill_dft_delta": "checkpoints/pilot_distill_dft",
             "ce32k_delta": "checkpoints/pilot_delta_32k",
             "dense32k_delta": "checkpoints/pilot_dense_32k",
-            "detach32k_delta": "checkpoints/pilot_detach_32k"}
+            "detach32k_delta": "checkpoints/pilot_detach_32k",
+            "distill_dftmix_delta": "checkpoints/pilot_distill_dftmix"}
 DECODE_ARMS = {"sparse_dec": ("sparse", None),
                "delta_dec2": ("delta", 2),
                "delta_dec4": ("delta", 4),
@@ -135,6 +137,13 @@ def parse_args():
     p.add_argument("--gamma", type=int, default=64)
     p.add_argument("--window", type=int, default=2048)
     p.add_argument("--out", type=str, default="results/longbench.csv")
+    p.add_argument("--force-dense", action="store_true",
+                   help="evaluate every arm under plain dense attention "
+                        "(T2 capability-retention protocol: does the TRAINED "
+                        "model match dense-trained on tasks, independent of "
+                        "the sparse pipeline?). Arm labels get an '@dense' "
+                        "suffix in the CSVs so rows never collide with "
+                        "pipeline-eval rows of the same adapter")
     return p.parse_args()
 
 
@@ -504,7 +513,10 @@ def main():
     mmlu_samples = None
     for arm in arms:
         model, tokenizer = build_model(arm, args.gamma, args.window,
-                                       force_dense=(args.suite == "mmlu"))
+                                       force_dense=(args.suite == "mmlu"
+                                                    or args.force_dense))
+        if args.force_dense and args.suite != "mmlu":
+            arm = arm + "@dense"  # label only — adapter already resolved
         if args.suite == "v1":
             run_v1(model, tokenizer, arm, args.n_samples, log, slog)
         elif args.suite == "govreport":

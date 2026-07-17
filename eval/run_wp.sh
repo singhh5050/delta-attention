@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -111,6 +111,7 @@ case "$WP" in
   specdec2) TESTS="tests/test_specdec_offline.py tests/test_delta_decode.py"; SPECDEC2=1 ;;
   specdec3) TESTS="tests/test_specdec_offline.py tests/test_delta_decode.py"; SPECDEC3=1 ;;
   sdtiming) TESTS="tests/test_specdec_offline.py tests/test_delta_decode.py"; SDTIMING=1 ;;
+  triad) TESTS="tests/test_flex_delta.py tests/test_longbench_offline.py"; TRIAD=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -521,6 +522,96 @@ if [ -n "$SPECDEC3" ]; then
     stage "specdec3:FAILED"; exit 1
   fi
   stage "specdec3:PASS"
+fi
+
+if [ -n "$TRIAD" ]; then
+  # Paper-core triad on a 2xGPU box (07-17 plan):
+  #   GPU0 = T1 training-efficiency benchmark (fwd/bwd/step ms, tok/s, peak
+  #          mem; delta/dense/detach x 8K/32K, warm+synced, symmetric loop)
+  #          then T2 downstream retention (LongBench v1 paired force-dense +
+  #          En.MC for the not-yet-run arms).
+  #   GPU1 = T3 second-corpus replication (arXiv: smoke -> delta 32K ->
+  #          dense 32K -> paired ppl 2x2 on held-out arxiv chunks).
+  # Failure of EITHER shard keeps the box up.
+  N_GPU=$(nvidia-smi -L | wc -l)
+  [ "$N_GPU" -ge 2 ] || { stage "triad-gpucheck:FAILED"; exit 1; }
+  stage "adapter-fetch:running"
+  fetch_adapters delta_32k dense_32k distill_dftmix \
+    || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  (
+    export CUDA_VISIBLE_DEVICES=0
+    # T1: bench smoke (3 timed steps must produce a CSV row) then the grid
+    stage "t1-smoke:running"
+    python -m delta_attention.train.train_delta --bench --steps 8 \
+      --bench-warmup 5 --seq-len 8192 --arm delta --probe-every 1000000 \
+      --no-artifact --tag _benchsmoke --save-dir checkpoints/bench_smoke \
+      || { stage "t1-smoke:FAILED"; exit 1; }
+    [ -s results/trainbench.csv ] || { stage "t1-smoke:FAILED"; exit 1; }
+    stage "t1-smoke:PASS"
+    for A in delta dense detach; do
+      for SL in 8192 32768; do
+        stage "t1-bench-$A-$SL:running"
+        python -m delta_attention.train.train_delta --bench --steps 35 \
+          --bench-warmup 5 --seq-len "$SL" --arm "$A" --probe-every 1000000 \
+          --no-artifact --tag "_bench$SL" \
+          --save-dir "checkpoints/bench_${A}_${SL}" \
+          || { stage "t1-bench-$A-$SL:FAILED"; exit 1; }
+        stage "t1-bench-$A-$SL:PASS"
+      done
+    done
+    # T2a: LongBench v1 QA, force-dense (capability retention, paired CSVs)
+    stage "t2-lb-dense:running"
+    python eval/longbench_eval.py --suite v1 --n-samples 50 \
+      --arms base_dense,ce32k_delta,dense32k_delta --force-dense \
+      --out results/triad_lb_dense.csv \
+      || { stage "t2-lb-dense:FAILED"; exit 1; }
+    stage "t2-lb-dense:PASS"
+    # T2b: En.MC for the arms never run (32K-trained + dftmix), pipeline eval
+    stage "t2-enmc-gap:running"
+    python eval/longbench_eval.py --suite enmc --n-samples 229 \
+      --arms ce32k_delta,dense32k_delta,distill_dftmix_delta \
+      --out results/triad_enmc.csv \
+      || { stage "t2-enmc-gap:FAILED"; exit 1; }
+    stage "t2-enmc-gap:PASS"
+  ) &
+  T12_PID=$!
+  (
+    export CUDA_VISIBLE_DEVICES=1
+    # T3: arXiv loader smoke (also validates loss wiring on the new corpus)
+    stage "t3-smoke:running"
+    python -m delta_attention.train.train_delta --steps 30 --seq-len 8192 \
+      --data-source arxiv --probe-every 15 --arm delta --no-artifact \
+      --tag _arxivsmoke --save-dir checkpoints/smoke_arxiv \
+      || { stage "t3-smoke:FAILED"; exit 1; }
+    stage "t3-smoke:PASS"
+    for A in delta dense; do
+      stage "t3-train-$A:running"
+      python -m delta_attention.train.train_delta --steps 500 \
+        --seq-len 32768 --probe-every 100 --arm "$A" --data-source arxiv \
+        --tag "_32k_arxiv" --save-dir "checkpoints/pilot_${A}_32k_arxiv" \
+        || { stage "t3-train-$A:FAILED"; exit 1; }
+      stage "t3-train-$A:PASS"
+    done
+    stage "t3-ppl:running"
+    python eval/ppl_eval.py --arms base,delta_32k_arxiv,dense_32k_arxiv \
+      --chunks 32 --seq-len 32768 --data-source arxiv \
+      || { stage "t3-ppl:FAILED"; exit 1; }
+    stage "t3-ppl:PASS"
+    stage "t3-ppl-dense:running"
+    python eval/ppl_eval.py --forward dense \
+      --arms base,delta_32k_arxiv,dense_32k_arxiv \
+      --chunks 32 --seq-len 32768 --data-source arxiv \
+      || { stage "t3-ppl-dense:FAILED"; exit 1; }
+    stage "t3-ppl-dense:PASS"
+  ) &
+  T3_PID=$!
+  wait "$T12_PID"; T12_RC=$?
+  wait "$T3_PID"; T3_RC=$?
+  if [ "$T12_RC" -ne 0 ] || [ "$T3_RC" -ne 0 ]; then
+    stage "triad:FAILED"; exit 1
+  fi
+  stage "triad:PASS"
 fi
 
 if [ -n "$SDTIMING" ]; then
