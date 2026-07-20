@@ -616,9 +616,21 @@ def main():
 
     if args.bench and bench["step"]:
         import csv
+        import subprocess
         from pathlib import Path
         n = len(bench["step"])
         peak_gb = torch.cuda.max_memory_allocated() / 2**30
+        # record clocks/temp AT THE END OF TIMED WORK: a thermally throttled
+        # GPU (box 31, 07-20: 495/1980 MHz @ 87C) silently produces 2-3x
+        # slower, ratio-distorted numbers — this column makes it visible
+        try:
+            q = subprocess.run(
+                ["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,temperature.gpu",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10).stdout.strip()
+            sm, sm_max, temp = [x.strip() for x in q.split(",")[:3]]
+        except Exception:
+            sm, sm_max, temp = "?", "?", "?"
         mean = {k: sum(v) / n for k, v in bench.items()}
         sem = {k: (sum((x - mean[k]) ** 2 for x in v) / max(n - 1, 1)) ** 0.5
                / n ** 0.5 for k, v in bench.items()}
@@ -632,14 +644,16 @@ def main():
                 wtr.writerow(["arm", "impl", "data_source", "seq_len",
                               "n_timed", "fwd_ms", "fwd_sem", "bwd_ms",
                               "bwd_sem", "opt_ms", "step_ms", "step_sem",
-                              "tok_per_s", "peak_mem_gb", "run_id"])
+                              "tok_per_s", "peak_mem_gb", "sm_mhz",
+                              "sm_max_mhz", "gpu_temp_c", "run_id"])
             impl = args.dense_impl if args.arm == "dense" else "flex_delta"
             wtr.writerow([args.arm, impl, args.data_source, args.seq_len, n]
                          + [f"{1000*mean['fwd']:.1f}", f"{1000*sem['fwd']:.1f}",
                             f"{1000*mean['bwd']:.1f}", f"{1000*sem['bwd']:.1f}",
                             f"{1000*mean['opt']:.1f}",
                             f"{1000*mean['step']:.1f}", f"{1000*sem['step']:.1f}",
-                            f"{tok_s:.0f}", f"{peak_gb:.2f}", run.id])
+                            f"{tok_s:.0f}", f"{peak_gb:.2f}",
+                            sm, sm_max, temp, run.id])
         for k in ("fwd", "bwd", "opt", "step"):
             run.summary[f"bench_{k}_ms"] = 1000 * mean[k]
         run.summary["bench_tok_per_s"] = tok_s

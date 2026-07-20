@@ -530,6 +530,26 @@ if [ -n "$TRAINBENCH" ]; then
   # 07-17 numbers were timed concurrently with a training job on the other
   # GPU of the same host. Adds the fa2-dense baseline (the 07-17 dense arm
   # ran sdpa, a kernel confound) and probe-free peak memory.
+  # GPU-health preflight (box 31 lesson: an H100 throttled to 495/1980MHz
+  # @87C produced 2.4x-slow, ratio-distorted numbers with no error): burn
+  # 30s of matmuls, then require >=70% of max SM clock and temp <= 82C.
+  stage "tb-gpupreflight:running"
+  python - <<'PYEOF' || { stage "tb-gpupreflight:FAILED"; exit 1; }
+import subprocess, time, torch
+a = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+t0 = time.monotonic()
+while time.monotonic() - t0 < 30:
+    a = (a @ a).clamp(-1, 1)
+torch.cuda.synchronize()
+q = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,temperature.gpu",
+                    "--format=csv,noheader,nounits"],
+                   capture_output=True, text=True).stdout.strip()
+sm, sm_max, temp = [int(x) for x in q.split(",")[:3]]
+print(f"[preflight] under load: {sm}/{sm_max} MHz, {temp}C", flush=True)
+assert sm >= 0.7 * sm_max, f"GPU THROTTLED: {sm}/{sm_max} MHz — bad box, relaunch elsewhere"
+assert temp <= 82, f"GPU HOT: {temp}C under 30s load — cooling problem, relaunch"
+PYEOF
+  stage "tb-gpupreflight:PASS"
   stage "tb-smoke:running"
   python -m delta_attention.train.train_delta --bench --steps 8 \
     --bench-warmup 5 --seq-len 8192 --arm delta --probe-every 1000000 \
