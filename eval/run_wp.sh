@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -112,6 +112,7 @@ case "$WP" in
   specdec3) TESTS="tests/test_specdec_offline.py tests/test_delta_decode.py"; SPECDEC3=1 ;;
   sdtiming) TESTS="tests/test_specdec_offline.py tests/test_delta_decode.py"; SDTIMING=1 ;;
   triad) TESTS="tests/test_flex_delta.py tests/test_longbench_offline.py"; TRIAD=1 ;;
+  trainbench) TESTS="tests/test_flex_delta.py"; TRAINBENCH=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -522,6 +523,39 @@ if [ -n "$SPECDEC3" ]; then
     stage "specdec3:FAILED"; exit 1
   fi
   stage "specdec3:PASS"
+fi
+
+if [ -n "$TRAINBENCH" ]; then
+  # CLEAN T1 rerun (07-20 review): IDLE box, strictly sequential — the
+  # 07-17 numbers were timed concurrently with a training job on the other
+  # GPU of the same host. Adds the fa2-dense baseline (the 07-17 dense arm
+  # ran sdpa, a kernel confound) and probe-free peak memory.
+  stage "tb-smoke:running"
+  python -m delta_attention.train.train_delta --bench --steps 8 \
+    --bench-warmup 5 --seq-len 8192 --arm delta --probe-every 1000000 \
+    --no-artifact --tag _tbsmoke --save-dir checkpoints/bench_smoke \
+    || { stage "tb-smoke:FAILED"; exit 1; }
+  [ -s results/trainbench.csv ] || { stage "tb-smoke:FAILED"; exit 1; }
+  stage "tb-smoke:PASS"
+  for SL in 8192 32768; do
+    for A in delta detach; do
+      stage "tb-$A-$SL:running"
+      python -m delta_attention.train.train_delta --bench --steps 35 \
+        --bench-warmup 5 --seq-len "$SL" --arm "$A" --probe-every 1000000 \
+        --no-artifact --tag "_tb$SL" --save-dir "checkpoints/tb_${A}_${SL}" \
+        || { stage "tb-$A-$SL:FAILED"; exit 1; }
+      stage "tb-$A-$SL:PASS"
+    done
+    for IMPL in sdpa flash_attention_2; do
+      stage "tb-dense-$IMPL-$SL:running"
+      python -m delta_attention.train.train_delta --bench --steps 35 \
+        --bench-warmup 5 --seq-len "$SL" --arm dense --dense-impl "$IMPL" \
+        --probe-every 1000000 --no-artifact --tag "_tb${SL}_$IMPL" \
+        --save-dir "checkpoints/tb_dense_${IMPL}_${SL}" \
+        || { stage "tb-dense-$IMPL-$SL:FAILED"; exit 1; }
+      stage "tb-dense-$IMPL-$SL:PASS"
+    done
+  done
 fi
 
 if [ -n "$TRIAD" ]; then

@@ -65,6 +65,12 @@ def parse_args():
                         "(after --bench-warmup), written to "
                         "results/trainbench.csv. Same loop as real training "
                         "— symmetric across arms by construction")
+    p.add_argument("--dense-impl", choices=["sdpa", "flash_attention_2"],
+                   default="sdpa",
+                   help="attention kernel for the dense arm (sdpa = "
+                        "historical default; fa2 = what every eval-side "
+                        "dense path uses — bench BOTH to separate kernel "
+                        "choice from mechanism)")
     p.add_argument("--bench-warmup", type=int, default=5,
                    help="untimed steps before timing starts (kernel autotune "
                         "/ allocator maturation — the same cold-start bias "
@@ -110,9 +116,11 @@ def build_model(args):
     model.config.detach_delta = args.arm == "detach" or args.detach_delta
     model.config.delta_grad_scale = args.delta_grad_scale
     # dense arm trains with standard attention: same data/optimizer/probes,
-    # no delta pipeline — isolates "long-text training" from the mechanism
+    # no delta pipeline — isolates "long-text training" from the mechanism.
+    # --dense-impl controls WHICH dense kernel (07-20 review: sdpa vs
+    # flash_attention_2 was an unvalidated confound in the T1 speedup)
     model.config._attn_implementation = (
-        "sdpa" if args.arm == "dense" else "flex_delta_train")
+        args.dense_impl if args.arm == "dense" else "flex_delta_train")
     model.config.use_cache = False
 
     lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.0, bias="none",
@@ -191,9 +199,16 @@ def packed_arxiv(tokenizer, seq_len, seed=0):
     # (unsupported by modern `datasets`); this is a parquet arXiv corpus
     # verified to stream. If it moves, pick any parquet arXiv mirror and
     # keep the packing logic.
+    # take() BEFORE shuffle pins training to the first 15,000 CANONICAL
+    # docs: streaming shuffle() otherwise permutes the corpus shards, so
+    # "training reads the head" was never guaranteed (07-20 review — the
+    # 07-17 T3 run used the shuffled-shard stream; its train/eval
+    # disjointness was verified post-hoc for that run, not structural).
+    # Eval (ppl_eval) reads canonical docs 20,000+ — disjoint BY
+    # CONSTRUCTION from here on.
     ds = load_dataset("common-pile/arxiv_papers", split="train",
                       streaming=True)
-    ds = ds.shuffle(seed=seed, buffer_size=256)
+    ds = ds.take(15000).shuffle(seed=seed, buffer_size=256)
     eos = tokenizer.eos_token_id
     buf = []
     for doc in ds:
@@ -558,7 +573,11 @@ def main():
         log = {"loss": loss.item(), "ce_loss": ce.item(),
                "ppl": math.exp(min(ce.item(), 20.0)),
                "lr": sched.get_last_lr()[0], "tokens_per_sec": tps, "step": step}
-        if step % args.probe_every == 0 or step == args.steps:
+        # probes run delta-pipeline math for EVERY arm and allocate inside
+        # the peak-memory window (07-20 review: they set an identical
+        # 20.36GB peak for all arms at 8K) — under --bench they are noise
+        if (step % args.probe_every == 0 or step == args.steps) \
+                and not args.bench:
             # NOTE: as of this commit anchor_grad_ratio is arm-faithful
             # (mirrors the arm's detach setting); pilot runs atyhqiir/2hepajmg
             # logged the full-graph value for every arm — not comparable.
@@ -610,11 +629,12 @@ def main():
         with out.open("a", newline="") as f:
             wtr = csv.writer(f)
             if new:
-                wtr.writerow(["arm", "data_source", "seq_len", "n_timed",
-                              "fwd_ms", "fwd_sem", "bwd_ms", "bwd_sem",
-                              "opt_ms", "step_ms", "step_sem", "tok_per_s",
-                              "peak_mem_gb", "run_id"])
-            wtr.writerow([args.arm, args.data_source, args.seq_len, n]
+                wtr.writerow(["arm", "impl", "data_source", "seq_len",
+                              "n_timed", "fwd_ms", "fwd_sem", "bwd_ms",
+                              "bwd_sem", "opt_ms", "step_ms", "step_sem",
+                              "tok_per_s", "peak_mem_gb", "run_id"])
+            impl = args.dense_impl if args.arm == "dense" else "flex_delta"
+            wtr.writerow([args.arm, impl, args.data_source, args.seq_len, n]
                          + [f"{1000*mean['fwd']:.1f}", f"{1000*sem['fwd']:.1f}",
                             f"{1000*mean['bwd']:.1f}", f"{1000*sem['bwd']:.1f}",
                             f"{1000*mean['opt']:.1f}",

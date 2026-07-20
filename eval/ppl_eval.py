@@ -53,19 +53,29 @@ def test_chunks(tokenizer, seq_len, n, source="pg19"):
         ds = load_dataset("common-pile/arxiv_papers", split="train",
                           streaming=True).skip(20000)
         eos = tokenizer.eos_token_id
-        buf, out = [], []
-        for doc in ds:
-            text = doc.get("text") or ""
-            if len(text) < 2000:
-                continue
-            buf.extend(tokenizer.encode(text, add_special_tokens=False))
-            buf.append(eos)
-            while len(buf) >= seq_len:
-                out.append(torch.tensor([buf[:seq_len]]))
-                buf = buf[seq_len:]
-                if len(out) == n:
-                    return out
-        raise SystemExit(f"only {len(out)} arxiv test chunks available")
+        # decorrelated chunks (07-20 review: the 07-17 protocol packed 32
+        # chunks back-to-back from ~100 consecutive docs — neighboring
+        # chunks shared documents, so per-chunk sems treated autocorrelated
+        # samples as independent): one chunk per buffer, no doc shared
+        # between chunks, 20 docs skipped between chunks. Deterministic.
+        it = iter(ds)
+        out = []
+        while len(out) < n:
+            buf = []
+            for doc in it:
+                text = doc.get("text") or ""
+                if len(text) < 2000:
+                    continue
+                buf.extend(tokenizer.encode(text, add_special_tokens=False))
+                buf.append(eos)
+                if len(buf) >= seq_len:
+                    out.append(torch.tensor([buf[:seq_len]]))
+                    break
+            else:
+                raise SystemExit(f"only {len(out)} arxiv test chunks available")
+            for _ in range(20):  # spacing between chunks
+                next(it, None)
+        return out
 
     ds = load_dataset("emozilla/pg19", split="test", streaming=True)
     out = []
