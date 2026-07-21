@@ -27,7 +27,11 @@ from contextlib import contextmanager
 
 import torch
 
-PROBE_LAYERS = (0, 8, 16, 24)
+def probe_layers(n_layers):
+    """0/25/50/75% depth — was hardcoded (0, 8, 16, 24), which on a
+    40-layer Qwen3-14B silently skipped the deepest 16 layers where prior
+    Llama data says drift concentrates (07-21 review)."""
+    return (0, n_layers // 4, n_layers // 2, (3 * n_layers) // 4)
 MANDATORY_KEYS = ("loss", "ppl", "lr", "tokens_per_sec", "anchor_grad_ratio",
                   "delta_interanchor_cos_mean")
 
@@ -338,7 +342,8 @@ def probe_drift(model, batch, gamma, window):
             captured[idx] = inp[0].detach()
         return fn
 
-    handles = [layers[i].input_layernorm.register_forward_hook(hook(i)) for i in PROBE_LAYERS]
+    idxs = probe_layers(len(layers))
+    handles = [layers[i].input_layernorm.register_forward_hook(hook(i)) for i in idxs]
     with torch.no_grad():
         base(batch.cuda(), use_cache=False)
     for h in handles:
@@ -346,13 +351,13 @@ def probe_drift(model, batch, gamma, window):
 
     means = {}
     with torch.no_grad():
-        for i in PROBE_LAYERS:
+        for i in idxs:
             attn: LlamaAttention = layers[i].self_attn
             hidden = layers[i].input_layernorm(captured[i])
             hs = hidden.shape[:-1]
-            q = attn.q_proj(hidden).view(*hs, -1, attn.head_dim).transpose(1, 2)
-            k = attn.k_proj(hidden).view(*hs, -1, attn.head_dim).transpose(1, 2)
-            v = attn.v_proj(hidden).view(*hs, -1, attn.head_dim).transpose(1, 2)
+            # _qkv is the model-family hook: for Qwen3 it applies the per-head
+            # q/k RMSNorm the manual projection here used to skip (07-21 review)
+            q, k, v = attn._qkv(hidden, (*hs, -1, attn.head_dim))
             s = q.size(2)
             pos = torch.arange(s, device=q.device).unsqueeze(0)
             cos, sin = base.model.rotary_emb(v.transpose(1, 2), pos)
@@ -397,9 +402,8 @@ def probe_anchor_grad_ratio(model, batch, gamma, window, detach_delta=False,
         hidden = layer.input_layernorm(hidden)
         attn = layer.self_attn
         hs = hidden.shape[:-1]
-        q = attn.q_proj(hidden).view(*hs, -1, attn.head_dim).transpose(1, 2)
-        k = attn.k_proj(hidden).view(*hs, -1, attn.head_dim).transpose(1, 2)
-        v = attn.v_proj(hidden).view(*hs, -1, attn.head_dim).transpose(1, 2)
+        # family hook — see probe_drift note (07-21 review)
+        q, k, v = attn._qkv(hidden, (*hs, -1, attn.head_dim))
         pos = torch.arange(q.size(2), device=q.device).unsqueeze(0)
         cos, sin = base.model.rotary_emb(v.transpose(1, 2), pos)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
@@ -420,15 +424,21 @@ def startup_validation(model, args, run):
 
     # gamma=1 => dense (T13 quick form, self-contained)
     torch.manual_seed(0)
-    q = torch.randn(1, 32, 4096, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(1, 8, 4096, 128, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(1, 8, 4096, 128, device="cuda", dtype=torch.bfloat16)
+    # geometry from the model under test — was hardcoded Llama-8B
+    # (32/8/128), which validated the wrong shapes for any --model override
+    n_h = model.config.num_attention_heads
+    n_kv = model.config.num_key_value_heads
+    hd = getattr(model.config, "head_dim",
+                 model.config.hidden_size // n_h)
+    q = torch.randn(1, n_h, 4096, hd, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, n_kv, 4096, hd, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, n_kv, 4096, hd, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
         train_out = delta_forward_train(q, k, v, gamma=1, window=args.window)
-        kk = k.repeat_interleave(4, dim=1)
-        vv = v.repeat_interleave(4, dim=1)
+        kk = k.repeat_interleave(n_h // n_kv, dim=1)
+        vv = v.repeat_interleave(n_h // n_kv, dim=1)
         dense = torch.nn.functional.scaled_dot_product_attention(
-            q, kk, vv, is_causal=True, scale=128 ** -0.5).transpose(1, 2)
+            q, kk, vv, is_causal=True, scale=hd ** -0.5).transpose(1, 2)
     cos = torch.nn.functional.cosine_similarity(
         train_out.flatten(2).float(), dense.flatten(2).float(), dim=-1)
     if cos.mean().item() <= 0.999:

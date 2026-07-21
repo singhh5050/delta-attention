@@ -71,6 +71,29 @@ run_ppl_2x2() {  # usage: run_ppl_2x2 <stage_prefix> <arms> — the shared
   stage "$P-dense:PASS"
 }
 
+gpu_preflight() {  # usage: gpu_preflight <stage-name> — burn-in then clock/temp
+  # assertion (box-31 lesson: a throttled H100 gives 2.4x-slow, ratio-
+  # distorted numbers with zero errors)
+  local ST=$1
+  stage "$ST:running"
+  python - <<'PYEOF' || { stage "$ST:FAILED"; exit 1; }
+import subprocess, time, torch
+a = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+t0 = time.monotonic()
+while time.monotonic() - t0 < 30:
+    a = (a @ a).clamp(-1, 1)
+torch.cuda.synchronize()
+q = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,temperature.gpu",
+                    "--format=csv,noheader,nounits"],
+                   capture_output=True, text=True).stdout.strip().split("\n")[0]
+sm, sm_max, temp = [int(x) for x in q.split(",")[:3]]
+print(f"[preflight] under load: {sm}/{sm_max} MHz, {temp}C", flush=True)
+assert sm >= 0.7 * sm_max, f"GPU THROTTLED: {sm}/{sm_max} MHz — bad box, relaunch elsewhere"
+assert temp <= 82, f"GPU HOT: {temp}C under 30s load — cooling problem, relaunch"
+PYEOF
+  stage "$ST:PASS"
+}
+
 case "$WP" in
   wp1) TESTS="tests/test_stride_offline.py tests/test_variable_stride.py"
        SMOKE="t1_adaptive_thr95,t1_fixed_g32,base_delta_g64" ;;
@@ -527,129 +550,105 @@ if [ -n "$SPECDEC3" ]; then
 fi
 
 if [ -n "$MODEL2" ]; then
-  # Model-2 replication (07-21, revised): Qwen3-14B — different family
-  # (dense GQA + per-head QK-norm, ported via delta_attention/qwen3.py),
-  # different scale (14B), Apr-2025 release. Quality = template-free ppl
-  # 2x2 (Qwen3 thinking-mode chat template would corrupt short-budget
-  # LongBench, so no QA here). 2 GPUs. If 32K training OOMs on 80GB at
-  # 14B, fall back to Qwen/Qwen3-8B and rerun this mode.
-  M2="Qwen/Qwen3-14B"
-  N_GPU=$(nvidia-smi -L | wc -l)
-  [ "$N_GPU" -ge 2 ] || { stage "model2-gpucheck:FAILED"; exit 1; }
-  (
-    export CUDA_VISIBLE_DEVICES=0
-    stage "m2-gpupreflight:running"
-    python - <<'PYEOF' || { stage "m2-gpupreflight:FAILED"; exit 1; }
-import subprocess, time, torch
-a = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
-t0 = time.monotonic()
-while time.monotonic() - t0 < 30:
-    a = (a @ a).clamp(-1, 1)
-torch.cuda.synchronize()
-q = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,temperature.gpu",
-                    "--format=csv,noheader,nounits"],
-                   capture_output=True, text=True).stdout.strip()
-sm, sm_max, temp = [int(x) for x in q.split(",")[:3]]
-print(f"[preflight] under load: {sm}/{sm_max} MHz, {temp}C", flush=True)
-assert sm >= 0.7 * sm_max, f"GPU THROTTLED: {sm}/{sm_max} MHz"
-assert temp <= 82, f"GPU HOT: {temp}C"
-PYEOF
-    stage "m2-gpupreflight:PASS"
-    for SL in 8192 32768; do
-      stage "m2-bench-delta-$SL:running"
-      python -m delta_attention.train.train_delta --bench --steps 35 \
-        --bench-warmup 5 --seq-len "$SL" --arm delta --model "$M2" \
-        --probe-every 1000000 --no-artifact --tag "_m2b$SL" \
-        --save-dir "checkpoints/m2b_delta_$SL" \
-        || { stage "m2-bench-delta-$SL:FAILED"; exit 1; }
-      stage "m2-bench-delta-$SL:PASS"
-      stage "m2-bench-densefa2-$SL:running"
-      python -m delta_attention.train.train_delta --bench --steps 35 \
-        --bench-warmup 5 --seq-len "$SL" --arm dense \
-        --dense-impl flash_attention_2 --model "$M2" \
-        --probe-every 1000000 --no-artifact --tag "_m2b${SL}fa2" \
-        --save-dir "checkpoints/m2b_dense_$SL" \
-        || { stage "m2-bench-densefa2-$SL:FAILED"; exit 1; }
-      stage "m2-bench-densefa2-$SL:PASS"
-    done
-  ) &
-  M2A_PID=$!
-  (
-    export CUDA_VISIBLE_DEVICES=1
-    # port gate: the Qwen3 delta pipeline must approximate ITS OWN dense
-    # loss sanely on real text before any paid training (a misplaced
-    # q/k-norm or rope bug shows up here as a loss explosion, not 3h in)
-    stage "m2-portgate:running"
-    python - <<'PYEOF' || { stage "m2-portgate:FAILED"; exit 1; }
-import torch
-from delta_attention.config import Config
-from delta_attention.sample import init_model
-
-cfg = Config()
-cfg.model_str = "Qwen/Qwen3-14B"
-cfg.attn_implementation = "window"
-cfg.mode = "delta"
-cfg.delta_lambda = 64
-cfg.sliding_window = 2048
-cfg.attn_implementation_original = cfg.attn_implementation
-model, tok = init_model(cfg)
-model.config.log_drift = False
-model.config.detach_delta = False
-model.config.use_cache = False
-model.eval().cuda()
+  # Model-2 replication (07-21, rewritten after review wf_d0eb0869):
+  # Qwen3-14B, STRICTLY SEQUENTIAL on ONE GPU — the first draft ran bench
+  # cells concurrently with training on the same host, violating the O4
+  # idle-box rule. Quality = template-free ppl 2x2. OOM fallback: set
+  # M2=Qwen/Qwen3-8B and relaunch (every stage reads $M2).
+  M2="${M2_MODEL:-Qwen/Qwen3-14B}"
+  export CUDA_VISIBLE_DEVICES=0
+  gpu_preflight "m2-gpupreflight"
+  # port gate v2: (a) OUR dense forward must match VANILLA transformers to
+  # bf16 noise — catches shared-path port bugs (wrong norm placement, rope,
+  # weight loading) that a delta-vs-dense comparison cannot see because
+  # both arms share _qkv; (b) pipeline tax must be sane.
+  stage "m2-portgate:running"
+  M2="$M2" python - <<'PYEOF' || { stage "m2-portgate:FAILED"; exit 1; }
+import gc, os, torch
+M2 = os.environ["M2"]
 from datasets import load_dataset
+import transformers
+
+tok = transformers.AutoTokenizer.from_pretrained(M2)
 ds = load_dataset("emozilla/pg19", split="test", streaming=True)
 toks = tok.encode(next(iter(ds))["text"], add_special_tokens=False)[:8192]
 ids = torch.tensor([toks], device="cuda")
-model.config._attn_implementation = "flex_delta_train"
+
+# reference: vanilla transformers, sdpa
+ref = transformers.AutoModelForCausalLM.from_pretrained(
+    M2, torch_dtype=torch.bfloat16, attn_implementation="sdpa").cuda().eval()
 with torch.no_grad():
-    l_delta = model(input_ids=ids, labels=ids, use_cache=False).loss.item()
+    l_ref = ref(input_ids=ids, labels=ids, use_cache=False).loss.item()
+del ref; gc.collect(); torch.cuda.empty_cache()
+
+from delta_attention.config import Config
+from delta_attention.sample import init_model
+cfg = Config(); cfg.model_str = M2
+cfg.attn_implementation = "window"; cfg.mode = "delta"
+cfg.delta_lambda = 64; cfg.sliding_window = 2048
+cfg.attn_implementation_original = cfg.attn_implementation
+model, _ = init_model(cfg)
+model.config.log_drift = False; model.config.detach_delta = False
+model.config.use_cache = False
+model.eval().cuda()
 model.config._attn_implementation = "sdpa"
 with torch.no_grad():
     l_dense = model(input_ids=ids, labels=ids, use_cache=False).loss.item()
+model.config._attn_implementation = "flex_delta_train"
+with torch.no_grad():
+    l_delta = model(input_ids=ids, labels=ids, use_cache=False).loss.item()
 tax = l_delta - l_dense
-print(f"[portgate] qwen3-14b @8K: pipeline loss {l_delta:.4f}, dense "
-      f"{l_dense:.4f}, tax {tax:.4f}", flush=True)
-assert torch.isfinite(torch.tensor([l_delta, l_dense])).all(), "non-finite loss"
-assert 0.0 < tax < 0.3, (
-    f"PORT SUSPECT: pipeline-dense tax {tax:.4f} outside (0, 0.3) — "
-    "llama reference is ~0.05-0.1 at this length; investigate before "
-    "training")
+print(f"[portgate] vanilla {l_ref:.4f} | ours-dense {l_dense:.4f} "
+      f"(diff {abs(l_dense-l_ref):.5f}) | pipeline {l_delta:.4f} "
+      f"(tax {tax:.4f})", flush=True)
+assert abs(l_dense - l_ref) < 0.01, (
+    f"PORT BROKEN: our dense forward diverges from vanilla transformers "
+    f"by {abs(l_dense-l_ref):.5f} — norm/rope/loading bug")
+assert 0.0 < tax < 0.3, f"PORT SUSPECT: pipeline tax {tax:.4f} outside (0, 0.3)"
 PYEOF
-    stage "m2-portgate:PASS"
-    stage "m2-train-smoke:running"
-    python -m delta_attention.train.train_delta --steps 20 --seq-len 32768 \
-      --probe-every 10 --arm delta --model "$M2" --no-artifact \
-      --tag _m2smoke --save-dir checkpoints/m2_smoke \
-      || { stage "m2-train-smoke:FAILED"; exit 1; }
-    stage "m2-train-smoke:PASS"
-    for A in delta dense; do
-      stage "m2-train-$A:running"
-      python -m delta_attention.train.train_delta --steps 500 \
-        --seq-len 32768 --probe-every 100 --arm "$A" --model "$M2" \
-        --tag "_32k_q3" --save-dir "checkpoints/pilot_${A}_32k_q3" \
-        || { stage "m2-train-$A:FAILED"; exit 1; }
-      stage "m2-train-$A:PASS"
-    done
-    stage "m2-ppl:running"
-    python eval/ppl_eval.py --arms base,delta_32k_q3,dense_32k_q3 \
-      --chunks 32 --seq-len 32768 --model "$M2" \
-      || { stage "m2-ppl:FAILED"; exit 1; }
-    stage "m2-ppl:PASS"
-    stage "m2-ppl-dense:running"
-    python eval/ppl_eval.py --forward dense \
-      --arms base,delta_32k_q3,dense_32k_q3 \
-      --chunks 32 --seq-len 32768 --model "$M2" \
-      || { stage "m2-ppl-dense:FAILED"; exit 1; }
-    stage "m2-ppl-dense:PASS"
-  ) &
-  M2B_PID=$!
-  wait "$M2A_PID"; M2A_RC=$?
-  wait "$M2B_PID"; M2B_RC=$?
-  if [ "$M2A_RC" -ne 0 ] || [ "$M2B_RC" -ne 0 ]; then
-    stage "model2:FAILED"; exit 1
-  fi
-  stage "model2:PASS"
+  stage "m2-portgate:PASS"
+  for SL in 8192 32768; do
+    stage "m2-bench-delta-$SL:running"
+    python -m delta_attention.train.train_delta --bench --steps 35 \
+      --bench-warmup 5 --seq-len "$SL" --arm delta --model "$M2" \
+      --probe-every 1000000 --no-artifact --tag "_m2b$SL" \
+      --save-dir "checkpoints/m2b_delta_$SL" \
+      || { stage "m2-bench-delta-$SL:FAILED"; exit 1; }
+    stage "m2-bench-delta-$SL:PASS"
+    stage "m2-bench-densefa2-$SL:running"
+    python -m delta_attention.train.train_delta --bench --steps 35 \
+      --bench-warmup 5 --seq-len "$SL" --arm dense \
+      --dense-impl flash_attention_2 --model "$M2" \
+      --probe-every 1000000 --no-artifact --tag "_m2b${SL}fa2" \
+      --save-dir "checkpoints/m2b_dense_$SL" \
+      || { stage "m2-bench-densefa2-$SL:FAILED"; exit 1; }
+    stage "m2-bench-densefa2-$SL:PASS"
+  done
+  stage "m2-train-smoke:running"
+  python -m delta_attention.train.train_delta --steps 20 --seq-len 32768 \
+    --probe-every 10 --arm delta --model "$M2" --no-artifact \
+    --tag _m2smoke --save-dir checkpoints/m2_smoke \
+    || { stage "m2-train-smoke:FAILED"; exit 1; }
+  stage "m2-train-smoke:PASS"
+  for A in delta dense; do
+    stage "m2-train-$A:running"
+    python -m delta_attention.train.train_delta --steps 500 \
+      --seq-len 32768 --probe-every 100 --arm "$A" --model "$M2" \
+      --tag "_32k_q3" --save-dir "checkpoints/pilot_${A}_32k_q3" \
+      || { stage "m2-train-$A:FAILED"; exit 1; }
+    stage "m2-train-$A:PASS"
+  done
+  stage "m2-ppl:running"
+  python eval/ppl_eval.py --arms base,delta_32k_q3,dense_32k_q3 \
+    --chunks 32 --seq-len 32768 --model "$M2" \
+    || { stage "m2-ppl:FAILED"; exit 1; }
+  stage "m2-ppl:PASS"
+  stage "m2-ppl-dense:running"
+  python eval/ppl_eval.py --forward dense \
+    --arms base,delta_32k_q3,dense_32k_q3 \
+    --chunks 32 --seq-len 32768 --model "$M2" \
+    || { stage "m2-ppl-dense:FAILED"; exit 1; }
+  stage "m2-ppl-dense:PASS"
 fi
 
 if [ -n "$TRAINBENCH" ]; then
@@ -657,26 +656,7 @@ if [ -n "$TRAINBENCH" ]; then
   # 07-17 numbers were timed concurrently with a training job on the other
   # GPU of the same host. Adds the fa2-dense baseline (the 07-17 dense arm
   # ran sdpa, a kernel confound) and probe-free peak memory.
-  # GPU-health preflight (box 31 lesson: an H100 throttled to 495/1980MHz
-  # @87C produced 2.4x-slow, ratio-distorted numbers with no error): burn
-  # 30s of matmuls, then require >=70% of max SM clock and temp <= 82C.
-  stage "tb-gpupreflight:running"
-  python - <<'PYEOF' || { stage "tb-gpupreflight:FAILED"; exit 1; }
-import subprocess, time, torch
-a = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
-t0 = time.monotonic()
-while time.monotonic() - t0 < 30:
-    a = (a @ a).clamp(-1, 1)
-torch.cuda.synchronize()
-q = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,temperature.gpu",
-                    "--format=csv,noheader,nounits"],
-                   capture_output=True, text=True).stdout.strip()
-sm, sm_max, temp = [int(x) for x in q.split(",")[:3]]
-print(f"[preflight] under load: {sm}/{sm_max} MHz, {temp}C", flush=True)
-assert sm >= 0.7 * sm_max, f"GPU THROTTLED: {sm}/{sm_max} MHz — bad box, relaunch elsewhere"
-assert temp <= 82, f"GPU HOT: {temp}C under 30s load — cooling problem, relaunch"
-PYEOF
-  stage "tb-gpupreflight:PASS"
+  gpu_preflight "tb-gpupreflight"
   stage "tb-smoke:running"
   python -m delta_attention.train.train_delta --bench --steps 8 \
     --bench-warmup 5 --seq-len 8192 --arm delta --probe-every 1000000 \
