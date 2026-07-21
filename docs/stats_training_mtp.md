@@ -15,7 +15,45 @@ gradient probes): `stats_2026-07-15.md`. Quick reference:
 ## O. Paper-core triad (07-17, box 30, master@c8b89e4; raw:
 rescue/2026-07-17-triad/ + wandb box_final_state:v20)
 
-### O1. T1 — training-efficiency benchmark (FIRST direct measurement)
+### O4. T1 — DEFINITIVE training-efficiency numbers (07-20 clean rerun,
+box 32; supersedes the O1 table below)
+
+Idle 1×H100 (nothing co-located), strictly sequential, GPU-health
+preflight PASSED (burn-in then 1980/1980MHz @ ≤60C; clocks+temp now
+recorded per row). Probe-free peak memory. Both dense kernels benched.
+Raw: rescue/2026-07-20-trainbench.csv. NOTE: the FIRST rerun attempt
+(box 31) had a thermally throttled GPU — 495/1980MHz @87C, all numbers
+2.4× slow — terminated before archiving; preflight gate added
+(run_wp.sh) so this failure mode is now structural, not luck.
+
+| arm | impl | seq | fwd ms | bwd ms | step ms | tok/s | peak GB |
+|---|---|---|---|---|---|---|---|
+| delta | flex | 8K | 352 | 905 | 1263 | 6484 | 20.36 |
+| detach | flex | 8K | 353 | 897 | 1257 | 6519 | 20.36 |
+| dense | sdpa | 8K | 359 | 845 | 1211 | 6766 | 20.36 |
+| dense | fa2 | 8K | 350 | 822 | 1178 | 6954 | 20.36 |
+| delta | flex | 32K | 1451 | 4560 | 6019 | 5445 | 33.00 |
+| detach | flex | 32K | 1451 | 4539 | 5997 | 5464 | 33.00 |
+| dense | sdpa | 32K | 2034 | 5653 | 7695 | 4258 | 32.95 |
+| dense | fa2 | 32K | 1929 | 5420 | 7357 | 4454 | 32.58 |
+
+**Headline (vs the FAIR fa2 dense baseline): delta trains 1.22× faster
+per step @32K (fwd 1.33×, +22% tok/s) and 7% SLOWER @8K.** Against sdpa
+the ratios are 1.28×/1.40× — the kernel confound was real and worth
+~5 points of speedup; quote the fa2 numbers.
+
+- The 07-17 concurrent-load concern did NOT materialize: box-30 numbers
+  reproduce within ~1% (delta 6084→6019, dense-sdpa 7757→7695). The
+  caveat was correct process; the data survived it.
+- Memory: peaks identical across arms @8K (20.36 — structure-dominated);
+  @32K delta 33.00 vs fa2-dense 32.58 (+1.3%). "Approximately equal,
+  delta marginally higher" — not "equal".
+- Dense arms downclock mildly under load (1680–1740MHz vs delta's
+  1935+) — normal DVFS at higher compute intensity, part of real dense
+  training cost, included in the measurement.
+- GPU-hours for a 500-step 32K run: delta 0.84h vs dense-fa2 1.02h.
+
+### O1. T1 — SUPERSEDED first measurement (07-17; kept for provenance only — quote §O4, not this table)
 
 **VALIDITY CAVEATS (07-20 review) — clean rerun in §O4 supersedes these
 numbers:** (1) this grid was timed CONCURRENTLY with T3's 32K training on
@@ -111,40 +149,3 @@ rerun (§O4); T2 = no detected difference at limited power (NOT
 equivalence-grade parity); T3 = paired directions replicate PG19 on both
 evals, with protocol caveats (a)–(c). Box self-terminated; cost ~$20.
 
-### O4. T1 CLEAN RERUN (07-20, box 32 — DEFINITIVE training-efficiency
-numbers; supersedes O1)
-
-Idle 1×H100 (nothing co-located), strictly sequential, GPU-health
-preflight PASSED (burn-in then 1980/1980MHz @ ≤60C; clocks+temp now
-recorded per row). Probe-free peak memory. Both dense kernels benched.
-Raw: rescue/2026-07-20-trainbench.csv. NOTE: the FIRST rerun attempt
-(box 31) had a thermally throttled GPU — 495/1980MHz @87C, all numbers
-2.4× slow — terminated before archiving; preflight gate added
-(run_wp.sh) so this failure mode is now structural, not luck.
-
-| arm | impl | seq | fwd ms | bwd ms | step ms | tok/s | peak GB |
-|---|---|---|---|---|---|---|---|
-| delta | flex | 8K | 352 | 905 | 1263 | 6484 | 20.36 |
-| detach | flex | 8K | 353 | 897 | 1257 | 6519 | 20.36 |
-| dense | sdpa | 8K | 359 | 845 | 1211 | 6766 | 20.36 |
-| dense | fa2 | 8K | 350 | 822 | 1178 | 6954 | 20.36 |
-| delta | flex | 32K | 1451 | 4560 | 6019 | 5445 | 33.00 |
-| detach | flex | 32K | 1451 | 4539 | 5997 | 5464 | 33.00 |
-| dense | sdpa | 32K | 2034 | 5653 | 7695 | 4258 | 32.95 |
-| dense | fa2 | 32K | 1929 | 5420 | 7357 | 4454 | 32.58 |
-
-**Headline (vs the FAIR fa2 dense baseline): delta trains 1.22× faster
-per step @32K (fwd 1.33×, +22% tok/s) and 7% SLOWER @8K.** Against sdpa
-the ratios are 1.28×/1.40× — the kernel confound was real and worth
-~5 points of speedup; quote the fa2 numbers.
-
-- The 07-17 concurrent-load concern did NOT materialize: box-30 numbers
-  reproduce within ~1% (delta 6084→6019, dense-sdpa 7757→7695). The
-  caveat was correct process; the data survived it.
-- Memory: peaks identical across arms @8K (20.36 — structure-dominated);
-  @32K delta 33.00 vs fa2-dense 32.58 (+1.3%). "Approximately equal,
-  delta marginally higher" — not "equal".
-- Dense arms downclock mildly under load (1680–1740MHz vs delta's
-  1935+) — normal DVFS at higher compute intensity, part of real dense
-  training cost, included in the measurement.
-- GPU-hours for a 500-step 32K run: delta 0.84h vs dense-fa2 1.02h.
