@@ -193,3 +193,29 @@ cannot draft at long context" with "a 25-minute post-hoc recipe cannot
 train one" — this run demonstrates the latter. Distinguishing them would
 take EAGLE-scale training (~days), which Track B/C on the production head
 makes unnecessary.
+
+## Q. Sparse-branch kernel diagnostic (swabench, 07-21, box 37 — Jeff's
+"is flex the problem" test; runs vxyihvka (8K) / 7i7l54rt (32K); raw:
+rescue/2026-07-21-swabench/swabench.csv + wandb box archive)
+
+30 synced full training steps/cell after 8 warmup; variants differ ONLY in
+the sparse branch (anchor/correction branches bit-identical across
+variants); fa2swa rows are timing-only (no sink = knowingly wrong math).
+
+| variant | 8K step ms | 32K step ms | vs flex @32K |
+|---|---|---|---|
+| delta-flex (production) | 1274.2 | 6086.9 | — |
+| delta-flexgqa | 1285.1 | 6115.8 | +0.5% |
+| delta-fa2swa-2048 | 1252.7 | 5916.1 | −2.8% |
+| delta-fa2swa-3072 (sink-sized) | 1298.4 | 6166.1 | +1.3% |
+| dense-fa2 (reference) | 1191.6 | 7428.0 | — |
+
+**Verdict: FlexAttention exonerated.** FA2 native SWA doing LESS work (no
+sink) is only 1.7–2.8% faster; sink-size-bracketed it's a wash. flexgqa ≈
+flex → the GQA-expanded sparse read isn't it either. The gap between
+delta's measured fwd (1470ms @32K) and its theoretical attention floor
+lives in the SHARED branches — anchor-row masked-SDPA + correction
+broadcast — which is where kernel work should aim. Caveats: 2-GPU box (one
+used, sequential); temp/clock CSV columns mangled by a 2-line nvidia-smi
+parse (timing columns unaffected); fa2swa-3072 mildly downclocked
+(1665MHz) — noise at these margins.
