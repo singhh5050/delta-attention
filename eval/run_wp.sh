@@ -527,11 +527,13 @@ if [ -n "$SPECDEC3" ]; then
 fi
 
 if [ -n "$MODEL2" ]; then
-  # Model-2 replication (07-21): DeepSeek-R1-Distill-Llama-8B (Llama-arch
-  # drop-in, built ON Llama-3.1-8B — same shapes, different training
-  # lineage). Quality = template-free ppl 2x2 (the R1 <think> chat template
-  # would corrupt short-budget LongBench, so no QA here). 2 GPUs.
-  M2="deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+  # Model-2 replication (07-21, revised): Qwen3-14B — different family
+  # (dense GQA + per-head QK-norm, ported via delta_attention/qwen3.py),
+  # different scale (14B), Apr-2025 release. Quality = template-free ppl
+  # 2x2 (Qwen3 thinking-mode chat template would corrupt short-budget
+  # LongBench, so no QA here). 2 GPUs. If 32K training OOMs on 80GB at
+  # 14B, fall back to Qwen/Qwen3-8B and rerun this mode.
+  M2="Qwen/Qwen3-14B"
   N_GPU=$(nvidia-smi -L | wc -l)
   [ "$N_GPU" -ge 2 ] || { stage "model2-gpucheck:FAILED"; exit 1; }
   (
@@ -574,6 +576,47 @@ PYEOF
   M2A_PID=$!
   (
     export CUDA_VISIBLE_DEVICES=1
+    # port gate: the Qwen3 delta pipeline must approximate ITS OWN dense
+    # loss sanely on real text before any paid training (a misplaced
+    # q/k-norm or rope bug shows up here as a loss explosion, not 3h in)
+    stage "m2-portgate:running"
+    python - <<'PYEOF' || { stage "m2-portgate:FAILED"; exit 1; }
+import torch
+from delta_attention.config import Config
+from delta_attention.sample import init_model
+
+cfg = Config()
+cfg.model_str = "Qwen/Qwen3-14B"
+cfg.attn_implementation = "window"
+cfg.mode = "delta"
+cfg.delta_lambda = 64
+cfg.sliding_window = 2048
+cfg.attn_implementation_original = cfg.attn_implementation
+model, tok = init_model(cfg)
+model.config.log_drift = False
+model.config.detach_delta = False
+model.config.use_cache = False
+model.eval().cuda()
+from datasets import load_dataset
+ds = load_dataset("emozilla/pg19", split="test", streaming=True)
+toks = tok.encode(next(iter(ds))["text"], add_special_tokens=False)[:8192]
+ids = torch.tensor([toks], device="cuda")
+model.config._attn_implementation = "flex_delta_train"
+with torch.no_grad():
+    l_delta = model(input_ids=ids, labels=ids, use_cache=False).loss.item()
+model.config._attn_implementation = "sdpa"
+with torch.no_grad():
+    l_dense = model(input_ids=ids, labels=ids, use_cache=False).loss.item()
+tax = l_delta - l_dense
+print(f"[portgate] qwen3-14b @8K: pipeline loss {l_delta:.4f}, dense "
+      f"{l_dense:.4f}, tax {tax:.4f}", flush=True)
+assert torch.isfinite(torch.tensor([l_delta, l_dense])).all(), "non-finite loss"
+assert 0.0 < tax < 0.3, (
+    f"PORT SUSPECT: pipeline-dense tax {tax:.4f} outside (0, 0.3) — "
+    "llama reference is ~0.05-0.1 at this length; investigate before "
+    "training")
+PYEOF
+    stage "m2-portgate:PASS"
     stage "m2-train-smoke:running"
     python -m delta_attention.train.train_delta --steps 20 --seq-len 32768 \
       --probe-every 10 --arm delta --model "$M2" --no-artifact \
@@ -584,18 +627,18 @@ PYEOF
       stage "m2-train-$A:running"
       python -m delta_attention.train.train_delta --steps 500 \
         --seq-len 32768 --probe-every 100 --arm "$A" --model "$M2" \
-        --tag "_32k_r1d" --save-dir "checkpoints/pilot_${A}_32k_r1d" \
+        --tag "_32k_q3" --save-dir "checkpoints/pilot_${A}_32k_q3" \
         || { stage "m2-train-$A:FAILED"; exit 1; }
       stage "m2-train-$A:PASS"
     done
     stage "m2-ppl:running"
-    python eval/ppl_eval.py --arms base,delta_32k_r1d,dense_32k_r1d \
+    python eval/ppl_eval.py --arms base,delta_32k_q3,dense_32k_q3 \
       --chunks 32 --seq-len 32768 --model "$M2" \
       || { stage "m2-ppl:FAILED"; exit 1; }
     stage "m2-ppl:PASS"
     stage "m2-ppl-dense:running"
     python eval/ppl_eval.py --forward dense \
-      --arms base,delta_32k_r1d,dense_32k_r1d \
+      --arms base,delta_32k_q3,dense_32k_q3 \
       --chunks 32 --seq-len 32768 --model "$M2" \
       || { stage "m2-ppl-dense:FAILED"; exit 1; }
     stage "m2-ppl-dense:PASS"

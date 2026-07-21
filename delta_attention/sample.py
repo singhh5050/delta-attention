@@ -269,13 +269,31 @@ def init_model(config):
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_str)
 
-    model_config = LlamaConfig.from_pretrained(
+    # model-family dispatch: qwen3 (dense) shares all delta machinery via
+    # subclassing (delta_attention/qwen3.py); anything else must be
+    # Llama-architecture. Fail loudly on unsupported families rather than
+    # loading llama code over mismatched weights.
+    model_type = transformers.AutoConfig.from_pretrained(
+        config.model_str).model_type
+    if model_type == "qwen3":
+        from .qwen3 import Qwen3Config, Qwen3ForCausalLM
+        cls, cfg_cls = Qwen3ForCausalLM, Qwen3Config
+    elif model_type == "llama":
+        cls, cfg_cls = LlamaForCausalLM, LlamaConfig
+    else:
+        raise SystemExit(
+            f"unsupported model_type {model_type!r} for {config.model_str} "
+            "(delta attention is ported to llama + dense qwen3 only; "
+            "hybrid/linear-attention families have no softmax rows to "
+            "correct)")
+
+    model_config = cfg_cls.from_pretrained(
         config.model_str,
         attn_implementation=config.attn_implementation,
         torch_dtype=torch.bfloat16,
     )
 
-    model = LlamaForCausalLM.from_pretrained(
+    model = cls.from_pretrained(
         config.model_str,
         config=model_config,
         torch_dtype=torch.bfloat16,

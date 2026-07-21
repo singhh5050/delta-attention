@@ -823,6 +823,12 @@ class LlamaAttention(nn.Module):
         }
         return torch.cat((corrected, tail_dense), dim=1)
 
+    def _qkv(self, hidden_states, hidden_shape):
+        q = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        return q, k, v
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -836,9 +842,12 @@ class LlamaAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # _qkv is the model-family hook: Qwen3 overrides it to insert
+        # per-head q/k RMSNorm (delta_attention/qwen3.py). Everything the
+        # delta machinery sees is post-projection/post-rope, so the custom
+        # attention paths below are family-agnostic.
+        query_states, key_states, value_states = self._qkv(
+            hidden_states, hidden_shape)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
@@ -895,7 +904,8 @@ class LlamaAttention(nn.Module):
             **kwargs,
         )
 
-        assert attn_output.shape[-2] == 32, attn_output.shape
+        assert attn_output.shape[-2] == self.config.num_attention_heads, \
+            attn_output.shape  # was hardcoded 32 (Llama-8B); Qwen3-14B has 40
         b, s, _, _ = attn_output.size()
         attn_output = attn_output.reshape(b, s, -1).contiguous()
         # attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -905,11 +915,13 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
+    attn_cls = LlamaAttention  # model-family hook (qwen3.py overrides)
+
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = self.attn_cls(config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1104,6 +1116,8 @@ class LlamaModel(LlamaPreTrainedModel):
         config: LlamaConfig
     """
 
+    layer_cls = LlamaDecoderLayer  # model-family hook (qwen3.py overrides)
+
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -1114,7 +1128,7 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                LlamaDecoderLayer(config, layer_idx)
+                self.layer_cls(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -1443,9 +1457,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
+    model_cls = LlamaModel  # model-family hook (qwen3.py overrides)
+
     def __init__(self, config):
         super().__init__(config)
-        self.model = LlamaModel(config)
+        self.model = self.model_cls(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
