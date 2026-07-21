@@ -559,7 +559,7 @@ if [ -n "$MTPA" ]; then
   # near-zero acceptance, not crashes).
   gpu_preflight "mtpa-gpupreflight"
   stage "mtpa-train-smoke:running"
-  python -m delta_attention.train.train_mtp --steps 60 --seq-len 8192 \
+  python -m delta_attention.train.train_mtp --steps 200 --seq-len 8192 \
     --module-attn dense --tag _smoke --save-path checkpoints/mtp_smoke.pt \
     || { stage "mtpa-train-smoke:FAILED"; exit 1; }
   stage "mtpa-train-smoke:PASS"

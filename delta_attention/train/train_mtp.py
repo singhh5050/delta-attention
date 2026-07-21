@@ -78,6 +78,22 @@ def main():
     embed = trunk.model.embed_tokens
     rotary = trunk.model.rotary_emb
 
+    # pre-spend validation (07-21 review: train_delta's startup_validation
+    # has no counterpart here): one tiny forward+backward through the
+    # module's actual attention branch must produce finite loss and grads
+    _b = torch.randint(0, trunk.config.vocab_size, (1, 256), device="cuda")
+    with torch.no_grad():
+        _h = trunk(input_ids=_b).logits
+    _mh = module.forward_parallel(_h[:, :192], embed(_b[:, 1:193]), rotary)
+    _l = chunked_ce_hidden(_mh, lm_w, _b[:, 1:193])
+    _l.backward()
+    assert torch.isfinite(_l), "startup validation: non-finite loss"
+    for _n, _p in module.named_parameters():
+        assert _p.grad is not None and torch.isfinite(_p.grad).all(), \
+            f"startup validation: bad grad for {_n}"
+    module.zero_grad(set_to_none=True)
+    print("[mtp] startup validation PASS", flush=True)
+
     data = packed_stream(tokenizer, args.seq_len, source=args.data_source,
                          seed=args.data_seed)
     opt = torch.optim.AdamW(module.parameters(), lr=args.lr, weight_decay=0.0)
@@ -89,13 +105,18 @@ def main():
         t0 = time.monotonic()
         with torch.no_grad():
             h = trunk(input_ids=batch).logits  # [1, L, d] hidden states
-        # module position t: inputs (h_t, Emb(x_{t+1})), t = 0..L-2
-        hiddens = h[:, :-1]
-        tok_embs = embed(batch[:, 1:])
+        # module position t: inputs (h_t, Emb(x_{t+1})), t = 0..L-2.
+        # Length trimmed to a 64-multiple: the flex delta kernel asserts
+        # s % 64 == 0, and L-1 = 8191 is not (07-21 review — this would
+        # have crashed only AFTER the paid dense run). Same trim for both
+        # variants keeps the comparison symmetric.
+        m_len = ((batch.size(1) - 1) // 64) * 64
+        hiddens = h[:, :m_len]
+        tok_embs = embed(batch[:, 1:m_len + 1])
         mh = module.forward_parallel(hiddens, tok_embs, rotary)
         # chunked_ce_hidden pairs hd[:, :-1] with tg[:, 1:]:
         # hd pos t (=module pos t, predicts x_{t+2}) vs tg[t+1] = x_{t+2}  ✓
-        loss = chunked_ce_hidden(mh, lm_w, batch[:, 1:])
+        loss = chunked_ce_hidden(mh, lm_w, batch[:, 1:m_len + 1])
         if not torch.isfinite(loss):
             print(f"[mtp] FATAL: non-finite loss at step {step}", flush=True)
             sys.exit(1)

@@ -40,6 +40,7 @@ from .llama import (
 )
 
 SINK = 1024
+ANCHOR_EVERY = 32  # module-decode anchor cadence (delta variant)
 
 
 class MTPModule(nn.Module):
@@ -63,6 +64,10 @@ class MTPModule(nn.Module):
         # decode-time KV cache (post-rope), [1, kv_heads, len, head_dim]
         self._ck = None
         self._cv = None
+        # delta-variant decode correction state (WP-3 semantics in the head):
+        # exact full-cache row every ANCHOR_EVERY steps -> cached correction
+        self._delta = None
+        self._since_anchor = 0
 
     # ---- explicit single-layer forward pieces -------------------------
     def _mix(self, hiddens, tok_embs):
@@ -133,14 +138,34 @@ class MTPModule(nn.Module):
         q, k, v = self._qkv_rope(x, rotary, pos_ids)
         self._ck = torch.cat([self._ck, k], dim=2)
         self._cv = torch.cat([self._cv, v], dim=2)
-        ck, cv = self._ck, self._cv
-        if self.module_attn == "delta" and ck.size(2) > SINK + self.window:
-            ck = torch.cat([ck[:, :, :SINK], ck[:, :, -self.window:]], dim=2)
-            cv = torch.cat([cv[:, :, :SINK], cv[:, :, -self.window:]], dim=2)
         attn = self.layer.self_attn
-        kk = repeat_kv(ck, attn.num_key_value_groups)
-        vv = repeat_kv(cv, attn.num_key_value_groups)
-        attn_out = torch.nn.functional.scaled_dot_product_attention(
-            q, kk, vv, scale=attn.head_dim ** -0.5)  # q_len=1: no mask needed
+        scale = attn.head_dim ** -0.5
+        sdpa = torch.nn.functional.scaled_dot_product_attention
+        full = self.module_attn == "dense" \
+            or self._ck.size(2) <= SINK + self.window
+        if full:
+            # q_len=1 over past-only cache: no mask; enable_gqa avoids the
+            # full-cache repeat_kv copy (07-21 review)
+            attn_out = sdpa(q, self._ck, self._cv, scale=scale,
+                            enable_gqa=True)
+        else:
+            ck = torch.cat([self._ck[:, :, :SINK],
+                            self._ck[:, :, -self.window:]], dim=2)
+            cv = torch.cat([self._cv[:, :, :SINK],
+                            self._cv[:, :, -self.window:]], dim=2)
+            sparse_out = sdpa(q, ck, cv, scale=scale, enable_gqa=True)
+            # anchor-corrected decode (07-21 review: training used the
+            # anchor-corrected pipeline; decoding without the correction is
+            # a train/serve mismatch): exact full row every ANCHOR_EVERY
+            # steps refreshes the cached per-head correction
+            if self._delta is None or self._since_anchor >= ANCHOR_EVERY:
+                dense_out = sdpa(q, self._ck, self._cv, scale=scale,
+                                 enable_gqa=True)
+                self._delta = dense_out - sparse_out
+                self._since_anchor = 0
+                attn_out = dense_out
+            else:
+                self._since_anchor += 1
+                attn_out = sparse_out + self._delta
         x = self._finish(x, attn_out)
         return self.final_norm(x)[0, 0]

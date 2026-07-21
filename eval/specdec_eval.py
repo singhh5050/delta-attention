@@ -142,6 +142,27 @@ def spec_token_margin(model, tokenizer, prompt, ref, div, spec_tok):
     return float(logits.max() - logits[spec_tok])
 
 
+def open_csv(path, cols):
+    """Append-mode CSV with a schema guard: appending new-schema rows under
+    an old header silently misaligns column-name-based analysis (07-16
+    review) — refuse instead. Module-level so mtp_eval reuses it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        with path.open() as f:
+            first = f.readline().strip()
+        if first and first.split(",") != cols:
+            raise SystemExit(
+                f"{path} has a different column schema (header: "
+                f"{first[:100]}); appending would silently misalign "
+                "columns — pass a fresh --out/--samples-out")
+        fh = path.open("a", newline="")
+        return fh, csv.writer(fh)
+    fh = path.open("a", newline="")
+    wtr = csv.writer(fh)
+    wtr.writerow(cols)
+    return fh, wtr
+
+
 def positional_stats(nacc, block):
     """From per-block accepted-prefix lengths, compute (pos_acc, genuine).
     Prefix acceptance is monotone, so P(position i accepted) = fraction of
@@ -404,26 +425,6 @@ def main():
     import wandb
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
                      name=f"specdec_{args.suite}", config=vars(args))
-
-    def open_csv(path, cols):
-        """Append-mode CSV with a schema guard: appending new-schema rows
-        under an old header silently misaligns column-name-based analysis
-        (07-16 review) — refuse instead."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            with path.open() as f:
-                first = f.readline().strip()
-            if first and first.split(",") != cols:
-                raise SystemExit(
-                    f"{path} has a different column schema (header: "
-                    f"{first[:100]}); appending would silently misalign "
-                    "columns — pass a fresh --out/--samples-out")
-            fh = path.open("a", newline="")
-            return fh, csv.writer(fh)
-        fh = path.open("a", newline="")
-        wtr = csv.writer(fh)
-        wtr.writerow(cols)
-        return fh, wtr
 
     fh, w = open_csv(Path(args.out),
                      ["suite", "weights", "draft", "block", "n", "acceptance",

@@ -106,7 +106,10 @@ def mtp_generate(trunk, module, tokenizer, prompt, K, max_new):
             for j in range(K):
                 mh = module.decode_step(cur_h, embed_w[cur_tok], rotary,
                                         pos=base + j)
-                proposals.append(int((mh.float() @ lm_w.float().T).argmax()))
+                # bf16 matmul; fp32 cast of lm_w here would copy ~2GB per
+                # drafted token (07-21 review). Draft argmax needs no fp32
+                # exactness — the verify decides acceptance either way.
+                proposals.append(int((mh @ lm_w.T).float().argmax()))
                 cur_h, cur_tok = mh, proposals[-1]
         torch.cuda.synchronize()
         stats["t_draft"] += time.monotonic() - t0
@@ -138,8 +141,15 @@ def mtp_generate(trunk, module, tokenizer, prompt, K, max_new):
         with torch.no_grad():
             for i in range(consumed):
                 h_i = h_pend if i == 0 else hidden_blk[i - 1]
-                module.decode_step(h_i, embed_w[block_toks[i + 1]], rotary,
+                # module pos t pairs h_t with Emb(y_{t+1}) = block_toks[i]
+                # (07-21 review: [i+1] silently corrupted every confirmed
+                # cache entry with next-NEXT-token embeddings)
+                module.decode_step(h_i, embed_w[block_toks[i]], rotary,
                                    pos=base + i)
+        # count ONLY blocks fully inside the emitted sequence — the same
+        # deliberate protocol as specdec_eval (07-16 review): a final block
+        # cut by eos/max_new contains proposals sequential dense decoding
+        # would never have needed
         if consumed == len(emitted):
             stats["proposed"] += len(proposals)
             stats["accepted"] += n_acc
@@ -155,9 +165,12 @@ def mtp_generate(trunk, module, tokenizer, prompt, K, max_new):
 
 def dense_reference(trunk, tokenizer, prompt, max_new):
     trunk.config.use_cache = True
-    # generate() needs REAL logits — no_lm_head must be off for the
-    # reference pass (it stays on everywhere else so forwards yield hiddens)
-    setattr(trunk, "no_lm_head", False)
+    # generate() needs REAL logits. llama.py gates on hasattr(no_lm_head)
+    # — the VALUE is ignored (07-21 review: setattr(False) left generate
+    # emitting hidden-state argmaxes) — so the only correct disable is
+    # delattr
+    if hasattr(trunk, "no_lm_head"):
+        delattr(trunk, "no_lm_head")
     inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     with torch.no_grad():
         out = trunk.generate(**{k: v.cuda() for k, v in inputs.items()},
@@ -200,15 +213,11 @@ def main():
     import wandb
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
                      name=f"mtp_eval_{args.suite}", config=vars(args))
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    new = not out_path.exists()
-    fh = out_path.open("a", newline="")
-    w = csv.writer(fh)
-    if new:
-        w.writerow(["suite", "module", "module_attn", "K", "n", "acceptance",
-                    "pos_acc", "acc_per_verify", "full_block_rate",
-                    "parity_prefix_min", "run_id"])
+    from eval.specdec_eval import open_csv
+    fh, w = open_csv(Path(args.out),
+                     ["suite", "module", "module_attn", "K", "n", "acceptance",
+                      "pos_acc", "acc_per_verify", "full_block_rate",
+                      "parity_prefix_min", "run_id"])
 
     trunk, tokenizer = build_trunk(args.model)
     prompts, budgets = load_prompts(args.suite, tokenizer, args.n_samples)
