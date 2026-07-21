@@ -149,6 +149,8 @@ stage "setup+gate1:PASS"
 
 source .venv/bin/activate
 source ~/.delta-env 2>/dev/null || true
+# bench-only knobs must never leak into a chain from ambient shell state
+unset DELTA_SPARSE_IMPL DELTA_FA2_WINDOW
 
 if [ -n "$TESTS" ]; then
   stage "wp-tests:running"

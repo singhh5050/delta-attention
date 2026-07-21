@@ -120,8 +120,29 @@ def delta_forward_train(
     # gamma=1 identity still holds under ANY impl (every row anchored),
     # so startup_validation stays meaningful.
     impl = os.environ.get("DELTA_SPARSE_IMPL", "flex")
+    if impl not in ("flex", "flexgqa", "fa2swa"):
+        raise SystemExit(f"unknown DELTA_SPARSE_IMPL={impl!r} — refusing to "
+                         "guess (a typo here must not silently mislabel a "
+                         "diagnostic or corrupt a training run)")
+    if impl != "flex":
+        # diagnostic-only paths (fa2swa is KNOWINGLY WRONG math: no sink).
+        # Loud on every call would spam; loud once per process:
+        if not getattr(delta_forward_train, "_impl_warned", False):
+            print(f"[flex_delta] WARNING: DELTA_SPARSE_IMPL={impl} — "
+                  "BENCH-ONLY sparse branch, never train real adapters "
+                  "with this", flush=True)
+            delta_forward_train._impl_warned = True
+
+    # GQA expansion is UNCONDITIONAL (as before this commit): the anchor
+    # branch below always consumes expanded k/v via the identical sdpa
+    # call, so the anchor branch is bit-identical across variants and any
+    # timing difference is attributable to the sparse branch alone.
+    # (07-21 review: enable_gqa TOGETHER with a materialized attn_mask
+    # forces sdpa onto the math backend — slower, ~GBs of transient
+    # attention weights at 32K, and only for the non-flex variants: an
+    # unfair comparison and an OOM risk.)
     kr, vr = k, v
-    if impl == "flex" and k.size(1) != h:
+    if k.size(1) != h:
         kr = k.repeat_interleave(h // k.size(1), dim=1)
         vr = v.repeat_interleave(h // v.size(1), dim=1)
 
@@ -142,13 +163,7 @@ def delta_forward_train(
         sparse = _get_flex()(q, kr, vr, block_mask=bm, scale=scaling)
         sparse = sparse.transpose(1, 2)  # [b, s, h, d]
 
-    # anchor branch below needs expanded k/v under the historical path;
-    # for the GQA-native impls use sdpa's enable_gqa instead
-    if impl == "flex":
-        k, v = kr, vr
-        _anchor_gqa = False
-    else:
-        _anchor_gqa = k.size(1) != h
+    k, v = kr, vr  # anchor branch: expanded k/v, identical for ALL impls
 
     idx, tail, s_p = anchor_layout(s, gamma)
     idx, tail = idx.to(q.device), tail.to(q.device)
@@ -157,8 +172,7 @@ def delta_forward_train(
     key_pos = torch.arange(s, device=q.device)
     row_mask = (key_pos.unsqueeze(0) <= sel.unsqueeze(1)).view(1, 1, sel.numel(), s)
     dense_sel = torch.nn.functional.scaled_dot_product_attention(
-        q[:, :, sel], k, v, attn_mask=row_mask, scale=scaling,
-        enable_gqa=_anchor_gqa,
+        q[:, :, sel], k, v, attn_mask=row_mask, scale=scaling
     ).transpose(1, 2)  # [b, n_sel, h, d]
     dense_anchor = dense_sel[:, : idx.numel()]
     dense_tail = dense_sel[:, idx.numel():]

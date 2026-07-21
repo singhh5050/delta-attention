@@ -54,9 +54,13 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--seq-len", type=int, required=True)
     p.add_argument("--steps", type=int, default=30)
-    p.add_argument("--warmup", type=int, default=5)
+    p.add_argument("--warmup", type=int, default=8)
     p.add_argument("--out", type=str, default="results/swabench.csv")
     args = p.parse_args()
+    # each variant's warmup must absorb its OWN dynamo/flex recompile
+    # (enable_gqa and kernel switches recompile mid-loop); 0 would fold
+    # compile time into timed steps
+    args.warmup = max(args.warmup, 5)
 
     import wandb
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
