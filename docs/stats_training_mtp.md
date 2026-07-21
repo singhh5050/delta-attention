@@ -149,3 +149,47 @@ rerun (§O4); T2 = no detected difference at limited power (NOT
 equivalence-grade parity); T3 = paired directions replicate PG19 on both
 evals, with protocol caveats (a)–(c). Box self-terminated; cost ~$20.
 
+
+## P. MTP Track A — Phase A mechanism probe (07-21, box 34; raw:
+rescue/2026-07-21-mtpa/ + wandb box archive; harness reviewed twice,
+commits ffa17a5 + 6472ce2)
+
+Setup: DeepSeek/MCore-style 1-layer MTP module (shared emb + proj + one
+transformer block + shared head, warm-started from trunk layer 31) on a
+FROZEN dense Llama-3.1-8B trunk; module attention is the ONLY variable
+(dense vs delta = pipeline prefill + anchor-corrected decode at gamma=64).
+Trained 2000 steps x 8K PG19-only (~16.4M tokens; the planned chat-mix was
+cut for the same-day deadline) predicting t+2, teacher-forced parallel.
+Final losses: dense 3.6605 (run mhhuf1pv), delta 3.7072 (p1zq1d3d) —
+sensible t+2 difficulty (~1.4 nats over next-token), so the modules
+trained correctly. Eval: true draft-and-verify @32K, output dense-greedy
+by construction, parity full (QA) / 54+1tie (GovReport). Runs 3v5rg9i5
+(gov n=10) / kxxfbkzr (qa n=20).
+
+| module | suite | K=1 acc | K=2 pos-2 | K=4 pos-3/4 |
+|---|---|---|---|---|
+| dense | gov | 0.2096 | 0.0340 | ~0 |
+| delta | gov | 0.1973 | 0.0293 | ~0 |
+| dense | qa | 0.2314 | 0.0427 | 0 |
+| delta | qa | 0.2114 | 0.0164 | 0 |
+
+**Pre-registered Phase A gate (pos-2 >= 0.5): FAILED decisively.** A
+1-layer head under THIS recipe (16M tokens, books-only, post-hoc) cannot
+draft an instruct model on chat-templated long-context tasks; chaining a
+depth-1-trained module (K>1) collapses immediately — consistent with why
+Nemotron trains "repeated MTP" (the reuse is trained, not improvised).
+
+**What survived — the transferable result: delta ~= dense INSIDE the
+head.** Acceptance delta 1.2-2.0 points absolute (~6-9% relative) at 32K,
+training-loss delta +0.047 — the delta-attention swap inside an MTP head
+is nearly free, measured under a certified harness. This is the number
+that matters for delta-ifying a PROPERLY-trained head (Nemotron 3 Super's,
+trained at pretraining scale with published short-context acceptance
+~3.45): the mechanism costs little; the head quality comes from training
+scale we should not replicate ourselves.
+
+Honest scope note: the gate as pre-registered conflated "1-layer heads
+cannot draft at long context" with "a 25-minute post-hoc recipe cannot
+train one" — this run demonstrates the latter. Distinguishing them would
+take EAGLE-scale training (~days), which Track B/C on the production head
+makes unnecessary.
