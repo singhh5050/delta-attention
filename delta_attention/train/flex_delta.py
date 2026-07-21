@@ -28,6 +28,7 @@ window mask. If T13 regresses again: reconcile THIS mask, not the tolerance.
 from __future__ import annotations
 
 import functools
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -105,16 +106,49 @@ def delta_forward_train(
     assert s % Q_BLOCK == 0, (
         f"s={s} must be a multiple of {Q_BLOCK} (hip block-anchored window "
         "semantics are only reconciled for full query blocks)")
-    if k.size(1) != h:
-        rep = h // k.size(1)
-        k = k.repeat_interleave(rep, dim=1)
-        v = v.repeat_interleave(rep, dim=1)
     if scaling is None:
         scaling = d ** -0.5
 
-    bm = get_block_mask(s, int(window), int(sink), str(q.device))
-    sparse = _get_flex()(q, k, v, block_mask=bm, scale=scaling)
-    sparse = sparse.transpose(1, 2)  # [b, s, h, d]
+    # DELTA_SPARSE_IMPL: sparse-branch kernel selector — a BENCH DIAGNOSTIC
+    # (Jeff, 07-21: "if we run the sparse branch with FA2 sliding window and
+    # it suddenly gets much faster, we know flex attention is a problem").
+    #   flex    (default) production path: compiled flex + materialized GQA
+    #   flexgqa flex with native GQA (isolates the repeat_interleave cost)
+    #   fa2swa  FA2 native sliding window, NO SINK — output is knowingly
+    #           WRONG for rows past the window (timing only, never for
+    #           training real adapters); window via DELTA_FA2_WINDOW
+    # gamma=1 identity still holds under ANY impl (every row anchored),
+    # so startup_validation stays meaningful.
+    impl = os.environ.get("DELTA_SPARSE_IMPL", "flex")
+    kr, vr = k, v
+    if impl == "flex" and k.size(1) != h:
+        kr = k.repeat_interleave(h // k.size(1), dim=1)
+        vr = v.repeat_interleave(h // v.size(1), dim=1)
+
+    if impl == "fa2swa":
+        from flash_attn import flash_attn_func
+        w = int(os.environ.get("DELTA_FA2_WINDOW", window))
+        sparse = flash_attn_func(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            causal=True, window_size=(w, 0),
+            softmax_scale=scaling)  # [b, s, h, d]; GQA native
+    elif impl == "flexgqa":
+        bm = get_block_mask(s, int(window), int(sink), str(q.device))
+        sparse = _get_flex()(q, k, v, block_mask=bm, scale=scaling,
+                             enable_gqa=True)
+        sparse = sparse.transpose(1, 2)
+    else:
+        bm = get_block_mask(s, int(window), int(sink), str(q.device))
+        sparse = _get_flex()(q, kr, vr, block_mask=bm, scale=scaling)
+        sparse = sparse.transpose(1, 2)  # [b, s, h, d]
+
+    # anchor branch below needs expanded k/v under the historical path;
+    # for the GQA-native impls use sdpa's enable_gqa instead
+    if impl == "flex":
+        k, v = kr, vr
+        _anchor_gqa = False
+    else:
+        _anchor_gqa = k.size(1) != h
 
     idx, tail, s_p = anchor_layout(s, gamma)
     idx, tail = idx.to(q.device), tail.to(q.device)
@@ -123,7 +157,8 @@ def delta_forward_train(
     key_pos = torch.arange(s, device=q.device)
     row_mask = (key_pos.unsqueeze(0) <= sel.unsqueeze(1)).view(1, 1, sel.numel(), s)
     dense_sel = torch.nn.functional.scaled_dot_product_attention(
-        q[:, :, sel], k, v, attn_mask=row_mask, scale=scaling
+        q[:, :, sel], k, v, attn_mask=row_mask, scale=scaling,
+        enable_gqa=_anchor_gqa,
     ).transpose(1, 2)  # [b, n_sel, h, d]
     dense_anchor = dense_sel[:, : idx.numel()]
     dense_tail = dense_sel[:, idx.numel():]

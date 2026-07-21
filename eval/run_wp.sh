@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""; MTPA=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""; MTPA=""; SWABENCH=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -138,6 +138,7 @@ case "$WP" in
   trainbench) TESTS="tests/test_flex_delta.py"; TRAINBENCH=1 ;;
   model2) TESTS="tests/test_flex_delta.py"; MODEL2=1 ;;
   mtpa) TESTS="tests/test_flex_delta.py tests/test_specdec_offline.py"; MTPA=1 ;;
+  swabench) TESTS="tests/test_flex_delta.py"; SWABENCH=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -548,6 +549,19 @@ if [ -n "$SPECDEC3" ]; then
     stage "specdec3:FAILED"; exit 1
   fi
   stage "specdec3:PASS"
+fi
+
+if [ -n "$SWABENCH" ]; then
+  # Sparse-branch kernel diagnostic (Jeff 07-21): flex vs flex-native-GQA vs
+  # FA2 sliding window (no sink, timing-only) vs dense-FA2 reference, looped
+  # IN-PROCESS per seq-len (one model load, identical weights). Idle box.
+  gpu_preflight "swa-gpupreflight"
+  for SL in 8192 32768; do
+    stage "swabench-$SL:running"
+    python eval/swa_bench.py --seq-len "$SL" --steps 30 \
+      || { stage "swabench-$SL:FAILED"; exit 1; }
+    stage "swabench-$SL:PASS"
+  done
 fi
 
 if [ -n "$MTPA" ]; then
