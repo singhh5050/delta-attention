@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""; MTPA=""; SWABENCH=""; MIMO=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""; MTPA=""; SWABENCH=""; MIMO=""; ANCHORBENCH=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -140,6 +140,7 @@ case "$WP" in
   mtpa) TESTS="tests/test_flex_delta.py tests/test_specdec_offline.py"; MTPA=1 ;;
   swabench) TESTS="tests/test_flex_delta.py"; SWABENCH=1 ;;
   mimo) TESTS="tests/test_specdec_offline.py"; MIMO=1 ;;
+  anchorbench) TESTS=""; ANCHORBENCH=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -552,6 +553,19 @@ if [ -n "$SPECDEC3" ]; then
     stage "specdec3:FAILED"; exit 1
   fi
   stage "specdec3:PASS"
+fi
+
+if [ -n "$ANCHORBENCH" ]; then
+  # component-level decomposition of delta_forward_train + SDPA backend
+  # adjudication for the anchor branch (07-21, after swabench exonerated
+  # flex). Pure tensor microbench: ~5 minutes.
+  gpu_preflight "ab-gpupreflight"
+  for SL in 8192 32768; do
+    stage "anchorbench-$SL:running"
+    python eval/anchor_bench.py --seq-len "$SL" \
+      || { stage "anchorbench-$SL:FAILED"; exit 1; }
+    stage "anchorbench-$SL:PASS"
+  done
 fi
 
 if [ -n "$MIMO" ]; then
