@@ -83,13 +83,15 @@ t0 = time.monotonic()
 while time.monotonic() - t0 < 30:
     a = (a @ a).clamp(-1, 1)
 torch.cuda.synchronize()
-q = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,temperature.gpu",
-                    "--format=csv,noheader,nounits"],
-                   capture_output=True, text=True).stdout.strip().split("\n")[0]
-sm, sm_max, temp = [int(x) for x in q.split(",")[:3]]
-print(f"[preflight] under load: {sm}/{sm_max} MHz, {temp}C", flush=True)
-assert sm >= 0.7 * sm_max, f"GPU THROTTLED: {sm}/{sm_max} MHz — bad box, relaunch elsewhere"
-assert temp <= 82, f"GPU HOT: {temp}C under 30s load — cooling problem, relaunch"
+out = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,temperature.gpu",
+                      "--format=csv,noheader,nounits"],
+                     capture_output=True, text=True).stdout.strip()
+for line in out.splitlines():  # validate EVERY GPU (wf_c5d06bb1: [0]-only
+    # silently passed multi-GPU boxes with a sick second GPU)
+    sm, sm_max, temp = [int(x) for x in line.split(",")[:3]]
+    print(f"[preflight] under load: {sm}/{sm_max} MHz, {temp}C", flush=True)
+    assert sm >= 0.7 * sm_max, f"GPU THROTTLED: {sm}/{sm_max} MHz — bad box"
+    assert temp <= 82, f"GPU HOT: {temp}C under 30s load — cooling problem"
 PYEOF
   stage "$ST:PASS"
 }
@@ -556,19 +558,22 @@ if [ -n "$SPECDEC3" ]; then
 fi
 
 if [ -n "$ANCHORBENCH" ]; then
-  # component-level decomposition of delta_forward_train + SDPA backend
-  # adjudication for the anchor branch (07-21, after swabench exonerated
-  # flex). Pure tensor microbench: ~5 minutes.
+  # component-level decomposition + Jeff's weightless long-context ladder
+  # (131K -> 1M) + MTP head-read cost curves. Pure tensor microbench.
+  export CUDA_VISIBLE_DEVICES=0  # wf_c5d06bb1: unpinned = contention risk
   gpu_preflight "ab-gpupreflight"
-  for SL in 8192 32768; do
-    stage "anchorbench-$SL:running"
-    python eval/anchor_bench.py --seq-len "$SL" \
-      || { stage "anchorbench-$SL:FAILED"; exit 1; }
-    stage "anchorbench-$SL:PASS"
-  done
+  stage "anchorbench-short:running"
+  python eval/anchor_bench.py --seq-lens 8192,32768 \
+    || { stage "anchorbench-short:FAILED"; exit 1; }
+  stage "anchorbench-short:PASS"
+  stage "anchorbench-long:running"
+  python eval/anchor_bench.py --seq-lens 131072,262144,524288,1048576 \
+    || { stage "anchorbench-long:FAILED"; exit 1; }
+  stage "anchorbench-long:PASS"
 fi
 
 if [ -n "$MIMO" ]; then
+  export DELTA_CSV_ROTATE=1  # schema evolution across reruns must not kill post-training stages
   # MiMo-7B-RL production MTP head x delta attention (docs/mimo_mtp_plan.md).
   # M0 = wiring calibration against their published ~0.9 acceptance (the
   # free harness certification); M1 = dense-head acceptance vs context
@@ -620,6 +625,7 @@ if [ -n "$SWABENCH" ]; then
 fi
 
 if [ -n "$MTPA" ]; then
+  export DELTA_CSV_ROTATE=1  # schema evolution across reruns must not kill post-training stages
   # Track A (mtp_scoping.md Phase A+B compressed): DeepSeek-style 1-layer
   # MTP draft module on a frozen DENSE Llama trunk; module attention is the
   # ONLY variable (dense vs delta). Single GPU, sequential. Eval = true

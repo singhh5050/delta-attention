@@ -1,37 +1,42 @@
-"""anchorbench (07-21): component-level decomposition of delta_forward_train
-plus backend adjudication for the anchor branch.
+"""anchorbench v2 (07-21, post-review wf_c5d06bb1): component-level
+decomposition of delta_forward_train + SDPA backend adjudication + Jeff's
+weightless long-context ladder (131K -> 1M) + MTP head-read cost curves.
 
-Motivated by the swabench result (sparse-kernel choice moves step time
-<=2.8%) and the critique that residual-based inference cannot localize the
-overhead: this bench times each of the three pieces DIRECTLY on realistic
-tensors — no full model, no checkpointing confounds — forward and
-forward+backward, CUDA-synced, plus SDPA backend force-tests for the
-anchor branch's masked call.
+ALL NUMBERS ARE PER ATTENTION LAYER, PER CALL (a 'scope' column says so;
+multiply by n_layers for per-step estimates).
 
-Variants (per the reviewed design):
-  sparse-flex        compiled flex, block mask (the production sparse piece)
-  gqa-expand         repeat_interleave of k/v alone (layout-copy cost)
-  anchor-masked      current masked SDPA (baseline under test)
-  anchor-flash!      sdpa_kernel(FLASH_ATTENTION) forced — expected to
-                     RAISE if the mask blocks flash: the smoking gun,
-                     logged either way
-  anchor-mathonly    sdpa_kernel(MATH) forced — floor
-  anchor-efficient   sdpa_kernel(EFFICIENT_ATTENTION) forced
-  anchor-flexrow     flex with row-restricted mask over GATHERED anchor
-                     queries (same k/v, prefixes in the mask — the
-                     duplication-free reformulation candidate)
-  correction         delta subtract + broadcast add + concat alone
+Methodology (each item exists because review wf_c5d06bb1 confirmed its
+absence distorted v1):
+- Symmetric work: every anchor cell gathers q[:, :, sel] IN-GRAPH inside
+  the timed fn from the same full-q leaf, so forward gather + backward
+  scatter into q.grad is paid identically by masked-SDPA and flexrow.
+- Production-faithful GQA: cells that use expanded k/v perform
+  repeat_interleave IN-GRAPH inside the timed fn (backward pays the
+  32->8-head grad reduction exactly as production does); GQA-native cells
+  consume the 8-head leaves directly.
+- Output-size-independent backward: loss surrogate is out.backward(g)
+  with a pre-allocated bf16 gradient — no fp32 upcast, no reduction.
+- Grads zeroed between iterations (accumulation would grow allocator
+  pressure across 20 iters).
+- Failures PROPAGATE (stage fails loudly). Exactly two exceptions are
+  data, not failure: the anchor-flash! cell (an error IS the smoking gun)
+  and CUDA OOM on the long-context ladder (an OOM row documents that the
+  formulation cannot run at that length — e.g. the masked-SDPA row mask
+  alone is ~16.5GB at 1M).
+- Per-cell tensor lifecycle + empty_cache: a 1M cell's transients must
+  not degrade the next cell.
 
-Shapes mirror Llama-3.1-8B @ 32K training: q [1,32,S,128], kv [1,8,S,128]
-bf16, gamma=64, window 2048, sink 1024. Single layer; multiply by 32 for
-per-step estimates. Runs in ~2 minutes.
+    python eval/anchor_bench.py --seq-lens 8192,32768
+    python eval/anchor_bench.py --seq-lens 131072,262144,524288,1048576
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -48,13 +53,36 @@ from delta_attention.train.flex_delta import (  # noqa: E402
 )
 from torch.nn.attention.flex_attention import create_block_mask  # noqa: E402
 
+SINK, WINDOW, GAMMA = 1024, 2048, 64
+H_Q, H_KV, D = 32, 8, 128  # Llama-3.1-8B geometry
 
-def timed(fn, warmup=5, iters=20, backward=False):
-    """(fwd_ms, fwdbwd_ms_or_None). Fresh graph per iter when backward."""
+
+def gpu_state():
+    try:
+        q = subprocess.run(
+            ["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+        return [x.strip() for x in q.splitlines()[0].split(",")[:3]]
+    except Exception:
+        return ["?", "?", "?"]
+
+
+def timed(fn, out_shape, warmup, iters, leaves, backward=True):
+    """(fwd_ms, fwdbwd_ms|None). backward via out.backward(g) with a
+    pre-allocated bf16 g (size-independent surrogate); leaves' grads
+    zeroed each iteration."""
+    g = torch.randn(out_shape, device="cuda", dtype=torch.bfloat16) \
+        if backward else None
+
+    def zero():
+        for t in leaves:
+            t.grad = None
     for _ in range(warmup):
         out = fn()
         if backward:
-            out.float().sum().backward()
+            out.backward(g)
+            zero()
     torch.cuda.synchronize()
     t0 = time.monotonic()
     for _ in range(iters):
@@ -67,123 +95,190 @@ def timed(fn, warmup=5, iters=20, backward=False):
         t0 = time.monotonic()
         for _ in range(iters):
             out = fn()
-            out.float().sum().backward()
+            out.backward(g)
+            zero()
         torch.cuda.synchronize()
         fb = (time.monotonic() - t0) / iters * 1000
     return fwd, fb
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--seq-len", type=int, default=32768)
-    p.add_argument("--gamma", type=int, default=64)
-    p.add_argument("--window", type=int, default=2048)
-    p.add_argument("--sink", type=int, default=1024)
-    p.add_argument("--out", type=str, default="results/anchorbench.csv")
-    args = p.parse_args()
-    s, gamma, window, sink = args.seq_len, args.gamma, args.window, args.sink
+def bench_seq_len(s, warmup, iters, rows, run):
     assert s % Q_BLOCK == 0
-
-    import wandb
-    run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
-                     name=f"anchorbench_{s}", config=vars(args))
-
     dev, dt = "cuda", torch.bfloat16
-    q = torch.randn(1, 32, s, 128, device=dev, dtype=dt, requires_grad=True)
-    k8 = torch.randn(1, 8, s, 128, device=dev, dtype=dt, requires_grad=True)
-    v8 = torch.randn(1, 8, s, 128, device=dev, dtype=dt, requires_grad=True)
-    scaling = 128 ** -0.5
-
-    idx, tail, s_p = anchor_layout(s, gamma)
+    q = torch.randn(1, H_Q, s, D, device=dev, dtype=dt, requires_grad=True)
+    k8 = torch.randn(1, H_KV, s, D, device=dev, dtype=dt, requires_grad=True)
+    v8 = torch.randn(1, H_KV, s, D, device=dev, dtype=dt, requires_grad=True)
+    leaves = [q, k8, v8]
+    scaling = D ** -0.5
+    idx, tail, s_p = anchor_layout(s, GAMMA)
     sel = torch.cat((idx, tail)).to(dev)
     n_sel = sel.numel()
-    key_pos = torch.arange(s, device=dev)
-    row_mask = (key_pos.unsqueeze(0) <= sel.unsqueeze(1)).view(1, 1, n_sel, s)
-    print(f"[anchorbench] s={s} anchors+tail={n_sel} "
-          f"(score tensor if materialized: "
-          f"{32 * n_sel * s * 2 / 2**30:.2f} GB bf16/layer)", flush=True)
+    rep = H_Q // H_KV
+    print(f"[anchorbench] s={s}: anchors+tail={n_sel}; masked-SDPA row mask "
+          f"= {n_sel * s / 8 / 2**30:.2f} GB bool; materialized scores would "
+          f"be {H_Q * n_sel * s * 2 / 2**30:.2f} GB bf16", flush=True)
 
-    def expand():
-        return (k8.repeat_interleave(4, dim=1),
-                v8.repeat_interleave(4, dim=1))
-
-    k32, v32 = expand()
-    k32r, v32r = k32.detach().requires_grad_(True), \
-        v32.detach().requires_grad_(True)
-    bm = get_block_mask(s, window, sink, dev)
-    qs = q.detach()[:, :, sel].requires_grad_(True)  # gathered anchor queries
-
-    sel_cpu = sel  # captured for the row-restricted flex mask
-    def flexrow_mask(b, h, q_idx, kv_idx):
-        return kv_idx <= sel_cpu[q_idx]
-    bm_row = create_block_mask(flexrow_mask, B=None, H=None,
-                               Q_LEN=n_sel, KV_LEN=s, device=dev)
-
-    rows = []
-
-    def record(label, fn, backward=True, note=""):
+    def cell(label, fn, out_shape, backward=True, expect_raise=False,
+             note=""):
         try:
-            fwd, fb = timed(fn, backward=backward)
-            rows.append([label, s, f"{fwd:.2f}",
+            fwd, fb = timed(fn, out_shape, warmup, iters, leaves,
+                            backward=backward)
+            rows.append([label, s, "per-layer-fwd", f"{fwd:.2f}",
                          f"{fb:.2f}" if fb else "", note])
-            print(f"[anchorbench] {label:18s} fwd {fwd:7.2f}ms  "
-                  f"fwd+bwd {fb:7.2f}ms  {note}" if fb else
-                  f"[anchorbench] {label:18s} fwd {fwd:7.2f}ms  {note}",
-                  flush=True)
+            run.summary[f"{label}_{s}_fwd_ms"] = fwd
+            if fb:
+                run.summary[f"{label}_{s}_fwdbwd_ms"] = fb
+            print(f"[anchorbench] {label:18s} s={s:>7} PER-LAYER "
+                  f"fwd {fwd:8.2f}ms" + (f"  fwd+bwd {fb:8.2f}ms" if fb
+                                          else "") + f"  {note}", flush=True)
+        except torch.cuda.OutOfMemoryError as e:
+            rows.append([label, s, "per-layer-fwd", "OOM", "OOM",
+                         "formulation cannot run at this length on 80GB"])
+            print(f"[anchorbench] {label:18s} s={s:>7} OOM (recorded as "
+                  "data)", flush=True)
+            for t in leaves:
+                t.grad = None
+            gc.collect()
+            torch.cuda.empty_cache()
         except Exception as e:
-            msg = str(e).splitlines()[0][:120]
-            rows.append([label, s, "ERROR", "", msg])
-            print(f"[anchorbench] {label:18s} RAISED: {msg}", flush=True)
+            if expect_raise:
+                msg = str(e).splitlines()[0][:120]
+                rows.append([label, s, "per-layer-fwd", "RAISED", "", msg])
+                print(f"[anchorbench] {label:18s} s={s:>7} RAISED: {msg} "
+                      "(the smoking gun, recorded)", flush=True)
+            else:
+                raise  # genuine failures fail the stage loudly
 
-    record("sparse-flex",
-           lambda: _get_flex()(q, k32r, v32r, block_mask=bm, scale=scaling))
-    record("gqa-expand", lambda: expand()[0], backward=False)
-    record("anchor-masked",
-           lambda: F.scaled_dot_product_attention(
-               q[:, :, sel], k32r, v32r, attn_mask=row_mask, scale=scaling))
+    bm = get_block_mask(s, WINDOW, SINK, dev)
+
+    # ---- production sparse branch: expansion IN-GRAPH (backward pays the
+    # 32->8 grad reduction, exactly as delta_forward_train does)
+    cell("sparse-flex",
+         lambda: _get_flex()(q, k8.repeat_interleave(rep, dim=1),
+                             v8.repeat_interleave(rep, dim=1),
+                             block_mask=bm, scale=scaling),
+         (1, H_Q, s, D))
+    # ---- expansion alone (fwd copy; backward reduction measured in-graph)
+    cell("gqa-expand", lambda: k8.repeat_interleave(rep, dim=1),
+         (1, H_Q, s, D))
+
+    # ---- anchor branch: mask built inside a guarded closure (its
+    # allocation itself OOMs at 1M — that is a result, not a crash)
+    def masked_anchor():
+        key_pos = torch.arange(s, device=dev)
+        row_mask = (key_pos.unsqueeze(0) <= sel.unsqueeze(1)) \
+            .view(1, 1, n_sel, s)
+        return F.scaled_dot_product_attention(
+            q[:, :, sel], k8.repeat_interleave(rep, dim=1),
+            v8.repeat_interleave(rep, dim=1),
+            attn_mask=row_mask, scale=scaling)
+    cell("anchor-masked", masked_anchor, (1, H_Q, n_sel, D))
 
     def forced(backend):
         def fn():
+            key_pos = torch.arange(s, device=dev)
+            row_mask = (key_pos.unsqueeze(0) <= sel.unsqueeze(1)) \
+                .view(1, 1, n_sel, s)
             with sdpa_kernel(backends=[backend]):
                 return F.scaled_dot_product_attention(
-                    q[:, :, sel], k32r, v32r, attn_mask=row_mask,
-                    scale=scaling)
+                    q[:, :, sel], k8.repeat_interleave(rep, dim=1),
+                    v8.repeat_interleave(rep, dim=1),
+                    attn_mask=row_mask, scale=scaling)
         return fn
-    record("anchor-flash!", forced(SDPBackend.FLASH_ATTENTION),
-           note="raises => mask blocks flash (the smoking gun)")
-    record("anchor-mathonly", forced(SDPBackend.MATH))
-    record("anchor-efficient", forced(SDPBackend.EFFICIENT_ATTENTION))
-    record("anchor-flexrow",
-           lambda: _get_flex()(qs, k32r, v32r, block_mask=bm_row,
-                               scale=scaling),
-           note="gathered rows, same k/v, prefixes via mask (no duplication)")
+    cell("anchor-flash!", forced(SDPBackend.FLASH_ATTENTION),
+         (1, H_Q, n_sel, D), expect_raise=True,
+         note="raises => mask blocks flash")
+    cell("anchor-mathonly", forced(SDPBackend.MATH), (1, H_Q, n_sel, D))
+    cell("anchor-efficient", forced(SDPBackend.EFFICIENT_ATTENTION),
+         (1, H_Q, n_sel, D))
 
-    sparse_out = _get_flex()(q, k32, v32, block_mask=bm,
-                             scale=scaling).transpose(1, 2).detach() \
-        .requires_grad_(True)
-    anchor_out = torch.randn(1, n_sel, 32, 128, device=dev, dtype=dt,
+    # ---- duplication-free reformulation: gather IN-GRAPH (symmetric with
+    # anchor-masked: both pay gather fwd + scatter bwd into q.grad)
+    def flexrow_mask(b, h, q_idx, kv_idx):
+        return kv_idx <= sel[q_idx]
+    bm_row = create_block_mask(flexrow_mask, B=None, H=None,
+                               Q_LEN=n_sel, KV_LEN=s, device=dev)
+    cell("anchor-flexrow",
+         lambda: _get_flex()(q[:, :, sel], k8, v8, block_mask=bm_row,
+                             scale=scaling, enable_gqa=True),
+         (1, H_Q, n_sel, D),
+         note="gathered in-graph, GQA-native, prefixes via mask")
+
+    # ---- correction alone (production gradient path shape)
+    sparse_out = torch.randn(1, s, H_Q, D, device=dev, dtype=dt,
                              requires_grad=True)
+    anchor_out = torch.randn(1, n_sel, H_Q, D, device=dev, dtype=dt,
+                             requires_grad=True)
+    n_anchor = idx.numel()
+    idx_dev = idx.to(dev)
 
     def correction():
-        delta = anchor_out[:, :idx.numel()] - sparse_out[:, idx.to(dev)]
-        n = idx.numel()
-        corrected = (sparse_out[:, :s_p].reshape(1, n, gamma, 32, 128)
-                     + delta.reshape(1, n, 1, 32, 128)).reshape(1, s_p, 32, 128)
-        return torch.cat((corrected, anchor_out[:, idx.numel():]), dim=1)
-    record("correction", correction)
+        delta = anchor_out[:, :n_anchor] - sparse_out[:, idx_dev]
+        corrected = (sparse_out[:, :s_p].reshape(1, n_anchor, GAMMA, H_Q, D)
+                     + delta.reshape(1, n_anchor, 1, H_Q, D)) \
+            .reshape(1, s_p, H_Q, D)
+        return torch.cat((corrected, anchor_out[:, n_anchor:]), dim=1)
+    leaves_c = [sparse_out, anchor_out]
+    old_leaves = leaves[:]
+    leaves.clear()
+    leaves.extend(leaves_c)
+    cell("correction", correction, (1, s, H_Q, D))
+    leaves.clear()
+    leaves.extend(old_leaves)
+
+    # ---- MTP head-read cost: ONE query over an s-length cache (the
+    # drafting cost per token: dense reads everything; delta reads
+    # sink+window, plus one dense read per GAMMA confirmed tokens —
+    # amortized delta cost = ((GAMMA-1)*delta + 1*dense)/GAMMA)
+    q1 = torch.randn(1, H_Q, 1, D, device=dev, dtype=dt)
+    cell("headread-dense",
+         lambda: F.scaled_dot_product_attention(
+             q1, k8, v8, scale=scaling, enable_gqa=True),
+         (1, H_Q, 1, D), backward=False)
+    if s > SINK + WINDOW:
+        cell("headread-delta",
+             lambda: F.scaled_dot_product_attention(
+                 q1, torch.cat([k8[:, :, :SINK], k8[:, :, -WINDOW:]], dim=2),
+                 torch.cat([v8[:, :, :SINK], v8[:, :, -WINDOW:]], dim=2),
+                 scale=scaling, enable_gqa=True),
+             (1, H_Q, 1, D), backward=False,
+             note=f"amortized = ({GAMMA-1}*this + headread-dense)/{GAMMA}")
+
+    del q, k8, v8, sparse_out, anchor_out, q1
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--seq-lens", type=str, default="8192,32768")
+    p.add_argument("--iters", type=int, default=20)
+    p.add_argument("--warmup", type=int, default=8)
+    p.add_argument("--out", type=str, default="results/anchorbench.csv")
+    args = p.parse_args()
+
+    import wandb
+    run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
+                     name=f"anchorbench_{args.seq_lens.replace(',', '-')}",
+                     config=vars(args))
+    rows = []
+    for s in [int(x) for x in args.seq_lens.split(",")]:
+        bench_seq_len(s, args.warmup, args.iters, rows, run)
+        sm, sm_max, temp = gpu_state()
+        print(f"[anchorbench] post-{s} clocks {sm}/{sm_max}MHz {temp}C",
+              flush=True)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("a", newline="") as fh:
         w = csv.writer(fh)
         if fh.tell() == 0:
-            w.writerow(["component", "seq_len", "fwd_ms", "fwdbwd_ms", "note"])
+            w.writerow(["component", "seq_len", "scope", "fwd_ms",
+                        "fwdbwd_ms", "note"])
         w.writerows(rows)
-    for r in rows:
-        if r[2] != "ERROR":
-            run.summary[f"{r[0]}_fwd_ms"] = float(r[2])
     run.finish()
-    print("[anchorbench] DONE", flush=True)
+    print("[anchorbench] DONE (all numbers PER LAYER; multiply by "
+          "n_layers for per-step)", flush=True)
 
 
 if __name__ == "__main__":

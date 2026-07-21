@@ -271,7 +271,10 @@ def main():
              for p in prompts]
     prompt_tok_mean = int(sum(plens) / max(len(plens), 1))
     from eval.longbench_eval import MAX_PROMPT_TOKENS as _MPT
-    tier = args.max_prompt_tokens or _MPT
+    # ruler builds fixed-32768 prompts via RULER's own pipeline (the
+    # override is rejected upstream) — label accordingly (wf_c5d06bb1)
+    tier = 32768 if args.suite == "ruler" else (args.max_prompt_tokens
+                                                or _MPT)
     refs = {i: dense_reference(trunk, tokenizer, prompts[i], budgets[i],
                                is_mimo)
             for i in range(min(args.exact_check_n, len(prompts)))}

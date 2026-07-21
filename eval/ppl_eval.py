@@ -107,8 +107,13 @@ def main():
     from delta_attention.config import Config
     from delta_attention.sample import init_model
 
+    mtag = ("_" + args.model.split("/")[-1]) if args.model else ""
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
-                     name=f"wp2_posttrain_ppl_{args.forward}", config=vars(args))
+                     name=f"wp2_posttrain_ppl_{args.forward}{mtag}",
+                     config=vars(args))
+    run.summary["model_str"] = args.model or "default-llama3.1-8b"
+    # NOTE (wf_c5d06bb1): losses are nats/token under THIS model's
+    # tokenizer — never compare ppl across models with different vocabs
     results = {}
     tokenizer_ref = None
     chunks = None
