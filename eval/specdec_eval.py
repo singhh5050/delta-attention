@@ -358,12 +358,16 @@ def dense_lean(model, tokenizer, prompt, max_new):
     return generated, time.monotonic() - t0
 
 
-def load_prompts(suite, tokenizer, n):
-    """Returns (prompts, budgets) with chat templating ALREADY applied."""
+def load_prompts(suite, tokenizer, n, max_prompt_tokens=None):
+    """Returns (prompts, budgets) with chat templating ALREADY applied.
+    max_prompt_tokens overrides the default truncation budget — the
+    length-tier knob for acceptance-vs-context sweeps (same documents,
+    different truncation)."""
+    mpt = max_prompt_tokens or MAX_PROMPT_TOKENS
     if suite == "govreport":
         rows = load_v1("gov_report")[:n]
         prompts = [truncate_middle(GOVREPORT_TEMPLATE.replace("{context}", r["context"]),
-                                   tokenizer, MAX_PROMPT_TOKENS) for r in rows]
+                                   tokenizer, mpt) for r in rows]
         return ([chat_wrap(p, tokenizer) for p in prompts],
                 [GOVREPORT_MAX_NEW] * len(prompts))
     if suite == "qa":
@@ -373,7 +377,7 @@ def load_prompts(suite, tokenizer, n):
             for ex in load_v1(task)[:per]:
                 p = template.format(context=ex["context"], input=ex["input"])
                 prompts.append(chat_wrap(
-                    truncate_middle(p, tokenizer, MAX_PROMPT_TOKENS), tokenizer))
+                    truncate_middle(p, tokenizer, mpt), tokenizer))
                 budgets.append(mx)  # official per-task budget (32/32/32/64)
         return prompts, budgets
     if suite == "ruler":

@@ -43,7 +43,12 @@ from eval.specdec_eval import (  # noqa: E402
 )
 
 
-def build_trunk(model_str=""):
+def build_trunk(model_str="", trunk_kind="llama"):
+    if trunk_kind == "mimo":
+        # vanilla Qwen2 trunk: REAL logits from out.logits, hiddens via
+        # output_hidden_states (post-final-norm — the vLLM-verified tap)
+        from delta_attention.mimo_mtp import build_mimo_trunk
+        return build_mimo_trunk()
     from delta_attention.config import Config
     from delta_attention.sample import init_model
 
@@ -59,17 +64,28 @@ def build_trunk(model_str=""):
     return trunk.eval().cuda(), tokenizer
 
 
-def fwd(trunk, ids_1d, cache):
+def trunk_call(trunk, is_mimo, **kw):
+    """(logits_fp32[len,vocab], hidden[len,d], cache) for one forward —
+    the llama path uses the no_lm_head hack; mimo is vanilla Qwen2."""
+    with torch.no_grad():
+        if is_mimo:
+            out = trunk(output_hidden_states=True, **kw)
+            return (out.logits[0].float(), out.hidden_states[-1][0],
+                    out.past_key_values)
+        out = trunk(**kw)
+        hidden = out.logits[0]
+        return trunk.lm_head(hidden).float(), hidden, out.past_key_values
+
+
+def fwd(trunk, ids_1d, cache, is_mimo=False):
     """Forward ids; returns (logits[len,vocab] fp32, hidden[len,d], cache)."""
     inp = torch.tensor([ids_1d], device="cuda")
-    with torch.no_grad():
-        out = trunk(input_ids=inp, past_key_values=cache, use_cache=True)
-        hidden = out.logits[0]  # no_lm_head
-        logits = trunk.lm_head(hidden).float()
-    return logits, hidden, out.past_key_values
+    return trunk_call(trunk, is_mimo, input_ids=inp, past_key_values=cache,
+                      use_cache=True)
 
 
-def mtp_generate(trunk, module, tokenizer, prompt, K, max_new):
+def mtp_generate(trunk, module, tokenizer, prompt, K, max_new,
+                 is_mimo=False):
     embed_w = trunk.model.embed_tokens.weight
     rotary = trunk.model.rotary_emb
     lm_w = trunk.lm_head.weight
@@ -79,12 +95,10 @@ def mtp_generate(trunk, module, tokenizer, prompt, K, max_new):
                     add_special_tokens=False)["input_ids"][0].tolist()
     L = len(ids)
 
-    with torch.no_grad():
-        out = trunk(input_ids=torch.tensor([ids], device="cuda"),
-                    use_cache=True)
-        hidden_prompt = out.logits[0]  # [L, d]
-        first_logits = trunk.lm_head(hidden_prompt[-1:]).float()[0]
-    cache = out.past_key_values
+    logits_p, hidden_prompt, cache = trunk_call(
+        trunk, is_mimo, input_ids=torch.tensor([ids], device="cuda"),
+        use_cache=True)
+    first_logits = logits_p[-1]
     module.prefill_cache(hidden_prompt[None, :-1, :],
                          trunk.model.embed_tokens(
                              torch.tensor([ids[1:]], device="cuda")),
@@ -116,7 +130,7 @@ def mtp_generate(trunk, module, tokenizer, prompt, K, max_new):
 
         t0 = time.monotonic()
         blk = pending + proposals
-        logits, hidden_blk, cache = fwd(trunk, blk, cache)
+        logits, hidden_blk, cache = fwd(trunk, blk, cache, is_mimo)
         torch.cuda.synchronize()
         stats["t_verify"] += time.monotonic() - t0
         m = len(pending)
@@ -163,8 +177,16 @@ def mtp_generate(trunk, module, tokenizer, prompt, K, max_new):
     return generated, stats
 
 
-def dense_reference(trunk, tokenizer, prompt, max_new):
+def dense_reference(trunk, tokenizer, prompt, max_new, is_mimo=False):
     trunk.config.use_cache = True
+    if is_mimo:  # vanilla model: generate just works
+        inputs = tokenizer(prompt, return_tensors="pt",
+                           add_special_tokens=False)
+        with torch.no_grad():
+            out = trunk.generate(**{k: v.cuda() for k, v in inputs.items()},
+                                 max_new_tokens=max_new, do_sample=False)
+            torch.cuda.synchronize()
+        return out[0, inputs["input_ids"].size(1):].tolist()
     # generate() needs REAL logits. llama.py gates on hasattr(no_lm_head)
     # — the VALUE is ignored (07-21 review: setattr(False) left generate
     # emitting hidden-state argmaxes) — so the only correct disable is
@@ -180,16 +202,16 @@ def dense_reference(trunk, tokenizer, prompt, max_new):
     return out[0, inputs["input_ids"].size(1):].tolist()
 
 
-def margin_at(trunk, tokenizer, prompt, ref, div, spec_tok):
+def margin_at(trunk, tokenizer, prompt, ref, div, spec_tok, is_mimo=False):
     """Tie detector — trunk is plain dense here, so one no-cache forward IS
     the exact reference semantics (unlike specdec's pipeline case)."""
     ids = tokenizer(prompt, return_tensors="pt",
                     add_special_tokens=False)["input_ids"][0].tolist()
-    with torch.no_grad():
-        out = trunk(input_ids=torch.tensor([ids + ref[:div]], device="cuda"),
-                    use_cache=False)
-        logits = trunk.lm_head(out.logits[0][-1:]).float()[0]
-    return float(logits.max() - logits[spec_tok])
+    logits, _, _ = trunk_call(
+        trunk, is_mimo,
+        input_ids=torch.tensor([ids + ref[:div]], device="cuda"),
+        use_cache=False)
+    return float(logits[-1].max() - logits[-1][spec_tok])
 
 
 def main():
@@ -198,7 +220,13 @@ def main():
                    required=True)
     p.add_argument("--n-samples", type=int, default=10)
     p.add_argument("--modules", type=str, required=True,
-                   help="comma list of module checkpoint .pt paths")
+                   help="comma list of module checkpoint .pt paths, or "
+                        "'mimo:dense'/'mimo:delta' to load MiMo-7B-RL's "
+                        "production MTP layer with that attention variant")
+    p.add_argument("--trunk", choices=["llama", "mimo"], default="llama")
+    p.add_argument("--max-prompt-tokens", type=int, default=0,
+                   help="prompt truncation budget override (length-tier "
+                        "sweeps: same documents, different truncation)")
     p.add_argument("--blocks", type=str, default="1,2,4")
     p.add_argument("--model", type=str, default="")
     p.add_argument("--exact-check-n", type=int, default=3)
@@ -214,28 +242,40 @@ def main():
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
                      name=f"mtp_eval_{args.suite}", config=vars(args))
     fh, w = open_csv(Path(args.out),
-                     ["suite", "module", "module_attn", "K", "n", "acceptance",
-                      "pos_acc", "acc_per_verify", "full_block_rate",
-                      "parity_prefix_min", "run_id"])
+                     ["suite", "tier_tokens", "module", "module_attn", "K",
+                      "n", "acceptance", "pos_acc", "acc_per_verify",
+                      "full_block_rate", "parity_prefix_min", "run_id"])
 
-    trunk, tokenizer = build_trunk(args.model)
-    prompts, budgets = load_prompts(args.suite, tokenizer, args.n_samples)
-    refs = {i: dense_reference(trunk, tokenizer, prompts[i], budgets[i])
+    is_mimo = args.trunk == "mimo"
+    trunk, tokenizer = build_trunk(args.model, args.trunk)
+    prompts, budgets = load_prompts(args.suite, tokenizer, args.n_samples,
+                                    max_prompt_tokens=args.max_prompt_tokens
+                                    or None)
+    refs = {i: dense_reference(trunk, tokenizer, prompts[i], budgets[i],
+                               is_mimo)
             for i in range(min(args.exact_check_n, len(prompts)))}
 
     for mod_path in [m.strip() for m in args.modules.split(",")]:
-        ckpt = torch.load(mod_path, map_location="cpu", weights_only=False)
-        module = MTPModule(trunk, module_attn=ckpt["module_attn"],
-                           gamma=ckpt["gamma"], window=ckpt["window"])
-        module.load_state_dict(ckpt["state_dict"])
+        if mod_path.startswith("mimo:"):
+            from delta_attention.mimo_mtp import MiMoMTPModule
+            attn = mod_path.split(":", 1)[1]
+            module = MiMoMTPModule(module_attn=attn)
+            ckpt = {"module_attn": attn}
+            mname = f"mimo_{attn}"
+        else:
+            ckpt = torch.load(mod_path, map_location="cpu",
+                              weights_only=False)
+            module = MTPModule(trunk, module_attn=ckpt["module_attn"],
+                               gamma=ckpt["gamma"], window=ckpt["window"])
+            module.load_state_dict(ckpt["state_dict"])
+            mname = Path(mod_path).stem
         module = module.to(torch.bfloat16).cuda().eval()
-        mname = Path(mod_path).stem
         for K in [int(b) for b in args.blocks.split(",")]:
             agg = {"proposed": 0, "accepted": 0, "blocks": 0,
                    "full_blocks": 0, "nacc": [], "exact": []}
             for i, prompt in enumerate(prompts):
                 toks, st = mtp_generate(trunk, module, tokenizer, prompt, K,
-                                        budgets[i])
+                                        budgets[i], is_mimo)
                 for k_ in ("proposed", "accepted", "blocks", "full_blocks"):
                     agg[k_] += st[k_]
                 agg["nacc"].extend(st["nacc"])
@@ -251,7 +291,7 @@ def main():
                         parity_i = div
                         if args.min_parity_prefix and div < args.min_parity_prefix:
                             mg = margin_at(trunk, tokenizer, prompt, ref, div,
-                                           toks[div])
+                                           toks[div], is_mimo)
                             print(f"[mtp] early divergence @{div}: margin "
                                   f"{mg:.3f}", flush=True)
                             if mg <= TIE_EPS:
@@ -281,7 +321,8 @@ def main():
                     f"ACCEPTANCE GATE: {mname}/K1 acceptance {acc:.3f} < "
                     f"{args.min_smoke_acceptance} — position-indexing bug "
                     "or untrained module")
-            w.writerow([args.suite, mname, ckpt["module_attn"], K,
+            w.writerow([args.suite, args.max_prompt_tokens or "default",
+                        mname, ckpt["module_attn"], K,
                         len(prompts), f"{acc:.4f}",
                         ";".join(f"{x:.4f}" for x in pos_acc),
                         f"{apv:.3f}", f"{fbr:.4f}", parity, run.id])

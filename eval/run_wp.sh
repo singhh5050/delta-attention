@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""; MTPA=""; SWABENCH=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""; MTPA=""; SWABENCH=""; MIMO=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -139,6 +139,7 @@ case "$WP" in
   model2) TESTS="tests/test_flex_delta.py"; MODEL2=1 ;;
   mtpa) TESTS="tests/test_flex_delta.py tests/test_specdec_offline.py"; MTPA=1 ;;
   swabench) TESTS="tests/test_flex_delta.py"; SWABENCH=1 ;;
+  mimo) TESTS="tests/test_specdec_offline.py"; MIMO=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -549,6 +550,44 @@ if [ -n "$SPECDEC3" ]; then
     stage "specdec3:FAILED"; exit 1
   fi
   stage "specdec3:PASS"
+fi
+
+if [ -n "$MIMO" ]; then
+  # MiMo-7B-RL production MTP head x delta attention (docs/mimo_mtp_plan.md).
+  # M0 = wiring calibration against their published ~0.9 acceptance (the
+  # free harness certification); M1 = dense-head acceptance vs context
+  # tier; M2 = zero-shot delta swap on the same tiers. Trunk always dense
+  # vanilla Qwen2. Single GPU, sequential.
+  gpu_preflight "mimo-gpupreflight"
+  stage "mimo-m0:running"
+  python eval/mtp_eval.py --suite qa --n-samples 20 --trunk mimo \
+    --modules mimo:dense --blocks 1 --max-prompt-tokens 3072 \
+    --exact-check-n 3 --min-parity-prefix 24 --min-smoke-acceptance 0.6 \
+    --out results/mimo_m0.csv \
+    || { stage "mimo-m0:FAILED"; exit 1; }
+  stage "mimo-m0:PASS"
+  for T in 4096 8192 16384 31500; do
+    stage "mimo-qa-$T:running"
+    python eval/mtp_eval.py --suite qa --n-samples 20 --trunk mimo \
+      --modules mimo:dense,mimo:delta --blocks 1 --max-prompt-tokens "$T" \
+      --min-parity-prefix 24 --out results/mimo_qa.csv \
+      || { stage "mimo-qa-$T:FAILED"; exit 1; }
+    stage "mimo-qa-$T:PASS"
+    stage "mimo-gov-$T:running"
+    python eval/mtp_eval.py --suite govreport --n-samples 10 --trunk mimo \
+      --modules mimo:dense,mimo:delta --blocks 1 --max-prompt-tokens "$T" \
+      --min-parity-prefix 24 --out results/mimo_gov.csv \
+      || { stage "mimo-gov-$T:FAILED"; exit 1; }
+    stage "mimo-gov-$T:PASS"
+  done
+  # exploratory chaining at the longest tier only (vLLM supports K=1
+  # natively; K>1 is our extension, labeled as such in the plan)
+  stage "mimo-chain:running"
+  python eval/mtp_eval.py --suite govreport --n-samples 10 --trunk mimo \
+    --modules mimo:dense,mimo:delta --blocks 2,4 --max-prompt-tokens 31500 \
+    --min-parity-prefix 24 --out results/mimo_chain.csv \
+    || { stage "mimo-chain:FAILED"; exit 1; }
+  stage "mimo-chain:PASS"
 fi
 
 if [ -n "$SWABENCH" ]; then
