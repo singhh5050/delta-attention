@@ -81,11 +81,15 @@ def main():
     # pre-spend validation (07-21 review: train_delta's startup_validation
     # has no counterpart here): one tiny forward+backward through the
     # module's actual attention branch must produce finite loss and grads
-    _b = torch.randint(0, trunk.config.vocab_size, (1, 256), device="cuda")
+    # 4096 > sink+window (3072): the delta branch's sparse mask is real
+    # here (07-21 review round 2: a 192-length validation had every key
+    # inside the sink, making the "sparse" path identical to dense and the
+    # validation vacuous for --module-attn delta). 4096 is a 64-multiple.
+    _b = torch.randint(0, trunk.config.vocab_size, (1, 4160), device="cuda")
     with torch.no_grad():
         _h = trunk(input_ids=_b).logits
-    _mh = module.forward_parallel(_h[:, :192], embed(_b[:, 1:193]), rotary)
-    _l = chunked_ce_hidden(_mh, lm_w, _b[:, 1:193])
+    _mh = module.forward_parallel(_h[:, :4096], embed(_b[:, 1:4097]), rotary)
+    _l = chunked_ce_hidden(_mh, lm_w, _b[:, 1:4097])
     _l.backward()
     assert torch.isfinite(_l), "startup validation: non-finite loss"
     for _n, _p in module.named_parameters():

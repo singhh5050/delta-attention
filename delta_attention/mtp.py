@@ -11,10 +11,13 @@ Phase-A design decisions (mtp_scoping.md; single-variable experiment):
     * dense  — full causal attention (prefill sdpa, decode over full cache)
     * delta  — pipeline prefill via the differentiable delta op
       (delta_forward_train: sink 1024 + window 2048 + exact anchor row every
-      gamma), decode = sink+window SPARSE reads of the module cache. The
-      module's decode anchoring is depth-1 chaining itself (every confirmed
-      position is recomputed from a TRUE trunk hidden after verify), so the
-      "stale delta" decode problem does not arise at K<=4.
+      gamma), decode = sink+window sparse reads PLUS the WP-3 anchor
+      correction: every `gamma` CONFIRMED positions an exact full-cache row
+      refreshes a cached per-head correction added to sparse rows between
+      anchors. Speculative chaining steps READ the correction but never
+      refresh it or advance the cadence (07-21 review round 2: counting
+      calls instead of confirmed positions halved the effective stride and
+      let anchors fire on speculative queries over later-discarded cache).
 - Module attention is computed EXPLICITLY here (q/k/v/o driven by hand, own
   cache) instead of routing through llama.py's dispatch — one layer does not
   justify inheriting a 2K-line code path, and Phase A needs zero hidden
@@ -40,7 +43,6 @@ from .llama import (
 )
 
 SINK = 1024
-ANCHOR_EVERY = 32  # module-decode anchor cadence (delta variant)
 
 
 class MTPModule(nn.Module):
@@ -121,6 +123,11 @@ class MTPModule(nn.Module):
         pos = torch.arange(x.size(1), device=x.device).unsqueeze(0)
         _, k, v = self._qkv_rope(x, rotary, pos)
         self._ck, self._cv = k, v
+        # correction state is per-prompt (07-21 review round 2: the module
+        # object is reused across mtp_eval's prompt loop — a stale delta
+        # from the previous prompt leaked into early decode steps)
+        self._delta = None
+        self._since_anchor = 0
 
     def cache_len(self):
         return 0 if self._ck is None else self._ck.size(2)
@@ -130,9 +137,14 @@ class MTPModule(nn.Module):
         self._cv = self._cv[:, :, :n]
 
     @torch.no_grad()
-    def decode_step(self, hidden, tok_emb, rotary, pos):
-        """One module position: append to cache, return (module_hidden[1,d]).
-        dense: attend over the full cache. delta: sink+window sparse read."""
+    def decode_step(self, hidden, tok_emb, rotary, pos, speculative=False):
+        """One module position: append to cache, return module_hidden[1,d].
+        dense: attend over the full cache. delta: sink+window sparse read +
+        the WP-3 anchor correction. Cadence counts CONFIRMED positions only:
+        speculative steps read the current correction but never refresh it
+        (their cache tail is discarded by the following crop) and never
+        advance the counter (each emitted position passes through
+        decode_step twice — draft, then confirmed re-append)."""
         x = self._mix(hidden.view(1, 1, -1), tok_emb.view(1, 1, -1))
         pos_ids = torch.tensor([[pos]], device=x.device)
         q, k, v = self._qkv_rope(x, rotary, pos_ids)
@@ -154,18 +166,24 @@ class MTPModule(nn.Module):
             cv = torch.cat([self._cv[:, :, :SINK],
                             self._cv[:, :, -self.window:]], dim=2)
             sparse_out = sdpa(q, ck, cv, scale=scale, enable_gqa=True)
-            # anchor-corrected decode (07-21 review: training used the
-            # anchor-corrected pipeline; decoding without the correction is
-            # a train/serve mismatch): exact full row every ANCHOR_EVERY
-            # steps refreshes the cached per-head correction
-            if self._delta is None or self._since_anchor >= ANCHOR_EVERY:
-                dense_out = sdpa(q, self._ck, self._cv, scale=scale,
-                                 enable_gqa=True)
-                self._delta = dense_out - sparse_out
-                self._since_anchor = 0
-                attn_out = dense_out
+            if speculative:
+                attn_out = sparse_out if self._delta is None \
+                    else sparse_out + self._delta
             else:
                 self._since_anchor += 1
-                attn_out = sparse_out + self._delta
+                # cadence = the module's trained gamma (anchor every gamma
+                # CONFIRMED positions — exactly gamma, not gamma+1: the
+                # counter includes the anchor position itself). Anchors here
+                # always see a confirmed-only cache, so crop() (which only
+                # ever removes the speculative tail) can never invalidate
+                # the keys a live correction was computed over.
+                if self._delta is None or self._since_anchor >= self.gamma:
+                    dense_out = sdpa(q, self._ck, self._cv, scale=scale,
+                                     enable_gqa=True)
+                    self._delta = dense_out - sparse_out
+                    self._since_anchor = 0
+                    attn_out = dense_out
+                else:
+                    attn_out = sparse_out + self._delta
         x = self._finish(x, attn_out)
         return self.final_norm(x)[0, 0]

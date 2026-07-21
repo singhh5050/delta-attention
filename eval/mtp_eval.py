@@ -25,7 +25,6 @@ curves are logged anyway; the K>1 decay measures chaining degradation.
 from __future__ import annotations
 
 import argparse
-import csv
 import gc
 import os
 import sys
@@ -39,7 +38,8 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from delta_attention.mtp import MTPModule  # noqa: E402
 from eval.specdec_eval import (  # noqa: E402
-    TIE_EPS, accept_block, classify_parity, load_prompts, positional_stats,
+    TIE_EPS, accept_block, classify_parity, load_prompts, open_csv,
+    positional_stats,
 )
 
 
@@ -105,7 +105,7 @@ def mtp_generate(trunk, module, tokenizer, prompt, K, max_new):
         with torch.no_grad():
             for j in range(K):
                 mh = module.decode_step(cur_h, embed_w[cur_tok], rotary,
-                                        pos=base + j)
+                                        pos=base + j, speculative=True)
                 # bf16 matmul; fp32 cast of lm_w here would copy ~2GB per
                 # drafted token (07-21 review). Draft argmax needs no fp32
                 # exactness — the verify decides acceptance either way.
@@ -213,7 +213,6 @@ def main():
     import wandb
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
                      name=f"mtp_eval_{args.suite}", config=vars(args))
-    from eval.specdec_eval import open_csv
     fh, w = open_csv(Path(args.out),
                      ["suite", "module", "module_attn", "K", "n", "acceptance",
                       "pos_acc", "acc_per_verify", "full_block_rate",
