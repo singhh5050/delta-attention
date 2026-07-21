@@ -65,23 +65,35 @@ def build_trunk(model_str="", trunk_kind="llama"):
 
 
 def trunk_call(trunk, is_mimo, **kw):
-    """(logits_fp32[len,vocab], hidden[len,d], cache) for one forward —
-    the llama path uses the no_lm_head hack; mimo is vanilla Qwen2."""
+    """(hidden[len,d], cache) for one forward. NO logits here (07-21
+    review: full-prompt fp32 logits at 31.5K x 151K vocab = ~29GB of
+    transients on the mimo path — certain OOM at the long tiers). Callers
+    project exactly the rows they need via lm_logits."""
     with torch.no_grad():
         if is_mimo:
-            out = trunk(output_hidden_states=True, **kw)
-            return (out.logits[0].float(), out.hidden_states[-1][0],
-                    out.past_key_values)
-        out = trunk(**kw)
-        hidden = out.logits[0]
-        return trunk.lm_head(hidden).float(), hidden, out.past_key_values
+            # base model directly: last_hidden_state is post-final-norm
+            # (the vLLM-verified tap) and neither the full-vocab logits
+            # nor the 37-layer hidden_states tuple is ever materialized
+            out = trunk.model(**kw)
+            return out.last_hidden_state[0], out.past_key_values
+        out = trunk(**kw)  # no_lm_head: logits ARE hidden states
+        return out.logits[0], out.past_key_values
+
+
+def lm_logits(trunk, hidden_rows):
+    """fp32 logits for SELECTED rows only ([n,d] -> [n,vocab])."""
+    with torch.no_grad():
+        return trunk.lm_head(hidden_rows).float()
 
 
 def fwd(trunk, ids_1d, cache, is_mimo=False):
-    """Forward ids; returns (logits[len,vocab] fp32, hidden[len,d], cache)."""
+    """Forward ids; returns (logits[len,vocab] fp32, hidden[len,d], cache).
+    Only used for VERIFY blocks (a handful of tokens), so projecting the
+    whole block through lm_head is cheap."""
     inp = torch.tensor([ids_1d], device="cuda")
-    return trunk_call(trunk, is_mimo, input_ids=inp, past_key_values=cache,
-                      use_cache=True)
+    hidden, cache = trunk_call(trunk, is_mimo, input_ids=inp,
+                               past_key_values=cache, use_cache=True)
+    return lm_logits(trunk, hidden), hidden, cache
 
 
 def mtp_generate(trunk, module, tokenizer, prompt, K, max_new,
@@ -95,10 +107,10 @@ def mtp_generate(trunk, module, tokenizer, prompt, K, max_new,
                     add_special_tokens=False)["input_ids"][0].tolist()
     L = len(ids)
 
-    logits_p, hidden_prompt, cache = trunk_call(
+    hidden_prompt, cache = trunk_call(
         trunk, is_mimo, input_ids=torch.tensor([ids], device="cuda"),
         use_cache=True)
-    first_logits = logits_p[-1]
+    first_logits = lm_logits(trunk, hidden_prompt[-1:])[0]
     module.prefill_cache(hidden_prompt[None, :-1, :],
                          trunk.model.embed_tokens(
                              torch.tensor([ids[1:]], device="cuda")),
@@ -179,26 +191,18 @@ def mtp_generate(trunk, module, tokenizer, prompt, K, max_new,
 
 def dense_reference(trunk, tokenizer, prompt, max_new, is_mimo=False):
     trunk.config.use_cache = True
-    if is_mimo:  # vanilla model: generate just works
-        inputs = tokenizer(prompt, return_tensors="pt",
-                           add_special_tokens=False)
-        with torch.no_grad():
-            out = trunk.generate(**{k: v.cuda() for k, v in inputs.items()},
-                                 max_new_tokens=max_new, do_sample=False)
-            torch.cuda.synchronize()
-        return out[0, inputs["input_ids"].size(1):].tolist()
-    # generate() needs REAL logits. llama.py gates on hasattr(no_lm_head)
-    # — the VALUE is ignored (07-21 review: setattr(False) left generate
-    # emitting hidden-state argmaxes) — so the only correct disable is
-    # delattr
-    if hasattr(trunk, "no_lm_head"):
+    # llama trunk: generate() needs REAL logits, and llama.py gates on
+    # hasattr(no_lm_head) — the VALUE is ignored — so the only correct
+    # disable is delattr (07-21 review). The mimo trunk is vanilla.
+    if not is_mimo and hasattr(trunk, "no_lm_head"):
         delattr(trunk, "no_lm_head")
     inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     with torch.no_grad():
         out = trunk.generate(**{k: v.cuda() for k, v in inputs.items()},
                              max_new_tokens=max_new, do_sample=False)
         torch.cuda.synchronize()
-    setattr(trunk, "no_lm_head", True)
+    if not is_mimo:
+        setattr(trunk, "no_lm_head", True)
     return out[0, inputs["input_ids"].size(1):].tolist()
 
 
@@ -207,11 +211,12 @@ def margin_at(trunk, tokenizer, prompt, ref, div, spec_tok, is_mimo=False):
     the exact reference semantics (unlike specdec's pipeline case)."""
     ids = tokenizer(prompt, return_tensors="pt",
                     add_special_tokens=False)["input_ids"][0].tolist()
-    logits, _, _ = trunk_call(
+    hidden, _ = trunk_call(
         trunk, is_mimo,
         input_ids=torch.tensor([ids + ref[:div]], device="cuda"),
         use_cache=False)
-    return float(logits[-1].max() - logits[-1][spec_tok])
+    logits = lm_logits(trunk, hidden[-1:])[0]
+    return float(logits.max() - logits[spec_tok])
 
 
 def main():
@@ -242,11 +247,27 @@ def main():
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
                      name=f"mtp_eval_{args.suite}", config=vars(args))
     fh, w = open_csv(Path(args.out),
-                     ["suite", "tier_tokens", "module", "module_attn", "K",
-                      "n", "acceptance", "pos_acc", "acc_per_verify",
-                      "full_block_rate", "parity_prefix_min", "run_id"])
+                     ["suite", "tier_tokens", "prompt_tok_mean", "module",
+                      "module_attn", "K", "n", "acceptance", "pos_acc",
+                      "acc_per_verify", "full_block_rate",
+                      "parity_prefix_min", "run_id"])
+    # measured prompt lengths: qa/gov documents are often SHORTER than the
+    # upper tiers, so tier_tokens alone would mislabel duplicate rows
+    # (07-21 review) — the measured mean is the honest x-axis
+    plens = [len(tokenizer(p, add_special_tokens=False)["input_ids"])
+             for p in prompts]
+    prompt_tok_mean = int(sum(plens) / max(len(plens), 1))
+    from eval.longbench_eval import MAX_PROMPT_TOKENS as _MPT
+    tier = args.max_prompt_tokens or _MPT
 
     is_mimo = args.trunk == "mimo"
+    mods = [m.strip() for m in args.modules.split(",")]
+    if is_mimo and not all(m.startswith("mimo:") for m in mods):
+        raise SystemExit("--trunk mimo requires mimo:* modules (a .pt "
+                         "module was trained against a different trunk's "
+                         "hidden space — acceptance would be silently junk)")
+    if not is_mimo and any(m.startswith("mimo:") for m in mods):
+        raise SystemExit("mimo:* modules require --trunk mimo")
     trunk, tokenizer = build_trunk(args.model, args.trunk)
     prompts, budgets = load_prompts(args.suite, tokenizer, args.n_samples,
                                     max_prompt_tokens=args.max_prompt_tokens
@@ -321,7 +342,7 @@ def main():
                     f"ACCEPTANCE GATE: {mname}/K1 acceptance {acc:.3f} < "
                     f"{args.min_smoke_acceptance} — position-indexing bug "
                     "or untrained module")
-            w.writerow([args.suite, args.max_prompt_tokens or "default",
+            w.writerow([args.suite, tier, prompt_tok_mean,
                         mname, ckpt["module_attn"], K,
                         len(prompts), f"{acc:.4f}",
                         ";".join(f"{x:.4f}" for x in pos_acc),

@@ -492,6 +492,13 @@ def startup_validation(model, args, run):
 
 def main():
     args = parse_args()
+    import os as _os
+    if _os.environ.get("DELTA_SPARSE_IMPL") and not args.bench:
+        raise SystemExit(
+            "DELTA_SPARSE_IMPL is set but this is not a --bench run — "
+            "refusing to train real adapters under a diagnostic sparse "
+            "branch (07-21 review x2: the first attempt at this guard "
+            "silently failed to apply; this one is assert-anchored).")
     import os
 
     import wandb

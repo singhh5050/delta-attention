@@ -151,10 +151,20 @@ def open_csv(path, cols):
         with path.open() as f:
             first = f.readline().strip()
         if first and first.split(",") != cols:
-            raise SystemExit(
-                f"{path} has a different column schema (header: "
-                f"{first[:100]}); appending would silently misalign "
-                "columns — pass a fresh --out/--samples-out")
+            # rotate the old-schema file aside instead of dying: a schema
+            # mismatch discovered AFTER paid training stages would kill the
+            # chain post-spend (07-21 review). Data is preserved, never
+            # appended-to misaligned.
+            import time as _time
+            bak = path.with_name(
+                f"{path.stem}.schema-{int(_time.time())}{path.suffix}")
+            path.rename(bak)
+            print(f"[open_csv] schema changed: rotated {path} -> {bak}",
+                  flush=True)
+            fh = path.open("a", newline="")
+            wtr = csv.writer(fh)
+            wtr.writerow(cols)
+            return fh, wtr
         fh = path.open("a", newline="")
         return fh, csv.writer(fh)
     fh = path.open("a", newline="")
@@ -381,6 +391,12 @@ def load_prompts(suite, tokenizer, n, max_prompt_tokens=None):
                 budgets.append(mx)  # official per-task budget (32/32/32/64)
         return prompts, budgets
     if suite == "ruler":
+        if max_prompt_tokens:
+            raise SystemExit("ruler prompts are built at fixed 32768 by "
+                             "RULER's own pipeline — --max-prompt-tokens "
+                             "is not supported for this suite (07-21 "
+                             "review: silently ignoring it would mislabel "
+                             "tier rows)")
         # negative control: needle retrieval, where the needle is outside the
         # draft's sink+window — the sparse draft cannot know the answer and
         # acceptance should collapse once positions leave local context.

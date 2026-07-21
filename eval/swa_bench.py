@@ -60,7 +60,10 @@ def main():
     # each variant's warmup must absorb its OWN dynamo/flex recompile
     # (enable_gqa and kernel switches recompile mid-loop); 0 would fold
     # compile time into timed steps
-    args.warmup = max(args.warmup, 5)
+    if args.warmup < 5:
+        print(f"[swabench] WARNING: raising --warmup {args.warmup} -> 5 "
+              "(recompile absorption floor)", flush=True)
+        args.warmup = 5
 
     import wandb
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
