@@ -251,14 +251,6 @@ def main():
                       "module_attn", "K", "n", "acceptance", "pos_acc",
                       "acc_per_verify", "full_block_rate",
                       "parity_prefix_min", "run_id"])
-    # measured prompt lengths: qa/gov documents are often SHORTER than the
-    # upper tiers, so tier_tokens alone would mislabel duplicate rows
-    # (07-21 review) — the measured mean is the honest x-axis
-    plens = [len(tokenizer(p, add_special_tokens=False)["input_ids"])
-             for p in prompts]
-    prompt_tok_mean = int(sum(plens) / max(len(plens), 1))
-    from eval.longbench_eval import MAX_PROMPT_TOKENS as _MPT
-    tier = args.max_prompt_tokens or _MPT
 
     is_mimo = args.trunk == "mimo"
     mods = [m.strip() for m in args.modules.split(",")]
@@ -272,6 +264,14 @@ def main():
     prompts, budgets = load_prompts(args.suite, tokenizer, args.n_samples,
                                     max_prompt_tokens=args.max_prompt_tokens
                                     or None)
+    # measured prompt lengths: qa/gov documents are often SHORTER than the
+    # upper tiers, so tier_tokens alone would mislabel duplicate rows
+    # (07-21 review) — the measured mean is the honest x-axis
+    plens = [len(tokenizer(p, add_special_tokens=False)["input_ids"])
+             for p in prompts]
+    prompt_tok_mean = int(sum(plens) / max(len(plens), 1))
+    from eval.longbench_eval import MAX_PROMPT_TOKENS as _MPT
+    tier = args.max_prompt_tokens or _MPT
     refs = {i: dense_reference(trunk, tokenizer, prompts[i], budgets[i],
                                is_mimo)
             for i in range(min(args.exact_check_n, len(prompts)))}
