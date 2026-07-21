@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""; MTPA=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -137,6 +137,7 @@ case "$WP" in
   triad) TESTS="tests/test_flex_delta.py tests/test_longbench_offline.py"; TRIAD=1 ;;
   trainbench) TESTS="tests/test_flex_delta.py"; TRAINBENCH=1 ;;
   model2) TESTS="tests/test_flex_delta.py"; MODEL2=1 ;;
+  mtpa) TESTS="tests/test_flex_delta.py tests/test_specdec_offline.py"; MTPA=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -547,6 +548,49 @@ if [ -n "$SPECDEC3" ]; then
     stage "specdec3:FAILED"; exit 1
   fi
   stage "specdec3:PASS"
+fi
+
+if [ -n "$MTPA" ]; then
+  # Track A (mtp_scoping.md Phase A+B compressed): DeepSeek-style 1-layer
+  # MTP draft module on a frozen DENSE Llama trunk; module attention is the
+  # ONLY variable (dense vs delta). Single GPU, sequential. Eval = true
+  # draft-and-verify, output dense-greedy by construction, parity-gated;
+  # the acceptance gate catches position-indexing bugs (they read as
+  # near-zero acceptance, not crashes).
+  gpu_preflight "mtpa-gpupreflight"
+  stage "mtpa-train-smoke:running"
+  python -m delta_attention.train.train_mtp --steps 60 --seq-len 8192 \
+    --module-attn dense --tag _smoke --save-path checkpoints/mtp_smoke.pt \
+    || { stage "mtpa-train-smoke:FAILED"; exit 1; }
+  stage "mtpa-train-smoke:PASS"
+  stage "mtpa-eval-smoke:running"
+  python eval/mtp_eval.py --suite govreport --n-samples 2 \
+    --modules checkpoints/mtp_smoke.pt --blocks 1 --exact-check-n 2 \
+    --min-parity-prefix 24 --min-smoke-acceptance 0.02 \
+    --out results/mtp_smoke.csv \
+    || { stage "mtpa-eval-smoke:FAILED"; exit 1; }
+  stage "mtpa-eval-smoke:PASS"
+  for MA in dense delta; do
+    stage "mtpa-train-$MA:running"
+    python -m delta_attention.train.train_mtp --steps 2000 --seq-len 8192 \
+      --module-attn "$MA" --save-path "checkpoints/mtp_${MA}.pt" \
+      || { stage "mtpa-train-$MA:FAILED"; exit 1; }
+    stage "mtpa-train-$MA:PASS"
+  done
+  stage "mtpa-eval-gov:running"
+  python eval/mtp_eval.py --suite govreport --n-samples 10 \
+    --modules checkpoints/mtp_dense.pt,checkpoints/mtp_delta.pt \
+    --blocks 1,2,4 --min-parity-prefix 24 --min-smoke-acceptance 0.10 \
+    --out results/mtp_gov.csv \
+    || { stage "mtpa-eval-gov:FAILED"; exit 1; }
+  stage "mtpa-eval-gov:PASS"
+  stage "mtpa-eval-qa:running"
+  python eval/mtp_eval.py --suite qa --n-samples 20 \
+    --modules checkpoints/mtp_dense.pt,checkpoints/mtp_delta.pt \
+    --blocks 1,2,4 --min-parity-prefix 24 \
+    --out results/mtp_qa.csv \
+    || { stage "mtpa-eval-qa:FAILED"; exit 1; }
+  stage "mtpa-eval-qa:PASS"
 fi
 
 if [ -n "$MODEL2" ]; then
