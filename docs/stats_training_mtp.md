@@ -219,3 +219,40 @@ broadcast — which is where kernel work should aim. Caveats: 2-GPU box (one
 used, sequential); temp/clock CSV columns mangled by a 2-line nvidia-smi
 parse (timing columns unaffected); fa2swa-3072 mildly downclocked
 (1665MHz) — noise at these margins.
+
+## R. MiMo-7B-RL production MTP head × delta (07-21, box 36; runs
+rvyz2m3o/+; raw: rescue/2026-07-21-mimo/ + wandb box archive v23; harness
+per docs/mimo_mtp_plan.md, all parity gates green)
+
+M0 calibration: K=1 acceptance 0.7136 @3K chat QA (Xiaomi claims ~0.9 on
+their reasoning evals — domain difference; wiring certified by parity).
+
+K=1 acceptance, dense head vs ZERO-SHOT delta swap (no retraining;
+prompt_tok_mean = measured mean prompt length — documents cap near
+10–12K, so the top two tiers are near-duplicates and the measured column
+is the honest x-axis):
+
+| suite | measured len | dense | delta (0-shot) | Δ |
+|---|---|---|---|---|
+| qa | 3996 | 0.7058 | 0.7133 | +0.8 |
+| qa | 7674 | 0.6938 | 0.6976 | +0.4 |
+| qa | 12010 | 0.6769 | 0.6595 | −1.7 |
+| qa | 12224 | 0.6645 | 0.6652 | +0.1 |
+| gov | 4115 | 0.5882 | 0.5813 | −0.7 |
+| gov | 7407 | 0.5732 | 0.5743 | +0.1 |
+| gov | 10677 | 0.5549 | 0.5608 | +0.6 |
+| gov | 10722 | 0.5432 | 0.5556 | +1.2 |
+
+- **Headline: the zero-shot delta swap on a production-trained MTP head
+  is FREE within noise** — |Δ| ≤ 1.7pts across all 8 cells, sign flips
+  both ways, mean Δ ≈ +0.1pt. No retraining (M3 may be unnecessary for
+  the core claim).
+- **Acceptance vs context (dense head): gentle decay, no collapse** —
+  qa 0.714→0.665, gov 0.588→0.543 over ~3× length growth (~5pts). BUT
+  measured only to ~12K real tokens: LongBench documents are too short
+  to populate the 16K/31.5K tiers (the review-mandated prompt_tok_mean
+  column is what exposes this). Extending the curve to real 32K needs
+  long documents (InfiniteBench books) — queued as a follow-up cell.
+- Chaining (K=2/4, exploratory): collapses identically for BOTH variants
+  (pos-2 ≈ 0.03) — the head is depth-1-trained and vLLM's K=1-only
+  support is vindicated; delta ≈ dense even in the collapse.
