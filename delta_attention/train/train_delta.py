@@ -55,6 +55,9 @@ def parse_args():
                         "1/sqrt(64) and 0.015625 = 1/64). 1.0 = unchanged")
     p.add_argument("--data-seed", type=int, default=0,
                    help="PG19 shuffle seed (seed replication runs)")
+    p.add_argument("--model", type=str, default="",
+                   help="HF model id override (must be Llama-architecture; "
+                        "empty = Config default Llama-3.1-8B-Instruct)")
     p.add_argument("--data-source", choices=["pg19", "arxiv"], default="pg19",
                    help="pg19: long books, per-doc 32K chunks (original). "
                         "arxiv: LaTeX papers packed ACROSS documents (papers "
@@ -104,6 +107,8 @@ def build_model(args):
     from delta_attention.sample import init_model
 
     cfg = Config()
+    if args.model:
+        cfg.model_str = args.model
     cfg.attn_implementation = "window"
     cfg.mode = "delta"
     cfg.delta_lambda = args.gamma

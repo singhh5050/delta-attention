@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -113,6 +113,7 @@ case "$WP" in
   sdtiming) TESTS="tests/test_specdec_offline.py tests/test_delta_decode.py"; SDTIMING=1 ;;
   triad) TESTS="tests/test_flex_delta.py tests/test_longbench_offline.py"; TRIAD=1 ;;
   trainbench) TESTS="tests/test_flex_delta.py"; TRAINBENCH=1 ;;
+  model2) TESTS="tests/test_flex_delta.py"; MODEL2=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -523,6 +524,89 @@ if [ -n "$SPECDEC3" ]; then
     stage "specdec3:FAILED"; exit 1
   fi
   stage "specdec3:PASS"
+fi
+
+if [ -n "$MODEL2" ]; then
+  # Model-2 replication (07-21): DeepSeek-R1-Distill-Llama-8B (Llama-arch
+  # drop-in, built ON Llama-3.1-8B — same shapes, different training
+  # lineage). Quality = template-free ppl 2x2 (the R1 <think> chat template
+  # would corrupt short-budget LongBench, so no QA here). 2 GPUs.
+  M2="deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+  N_GPU=$(nvidia-smi -L | wc -l)
+  [ "$N_GPU" -ge 2 ] || { stage "model2-gpucheck:FAILED"; exit 1; }
+  (
+    export CUDA_VISIBLE_DEVICES=0
+    stage "m2-gpupreflight:running"
+    python - <<'PYEOF' || { stage "m2-gpupreflight:FAILED"; exit 1; }
+import subprocess, time, torch
+a = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+t0 = time.monotonic()
+while time.monotonic() - t0 < 30:
+    a = (a @ a).clamp(-1, 1)
+torch.cuda.synchronize()
+q = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,temperature.gpu",
+                    "--format=csv,noheader,nounits"],
+                   capture_output=True, text=True).stdout.strip()
+sm, sm_max, temp = [int(x) for x in q.split(",")[:3]]
+print(f"[preflight] under load: {sm}/{sm_max} MHz, {temp}C", flush=True)
+assert sm >= 0.7 * sm_max, f"GPU THROTTLED: {sm}/{sm_max} MHz"
+assert temp <= 82, f"GPU HOT: {temp}C"
+PYEOF
+    stage "m2-gpupreflight:PASS"
+    for SL in 8192 32768; do
+      stage "m2-bench-delta-$SL:running"
+      python -m delta_attention.train.train_delta --bench --steps 35 \
+        --bench-warmup 5 --seq-len "$SL" --arm delta --model "$M2" \
+        --probe-every 1000000 --no-artifact --tag "_m2b$SL" \
+        --save-dir "checkpoints/m2b_delta_$SL" \
+        || { stage "m2-bench-delta-$SL:FAILED"; exit 1; }
+      stage "m2-bench-delta-$SL:PASS"
+      stage "m2-bench-densefa2-$SL:running"
+      python -m delta_attention.train.train_delta --bench --steps 35 \
+        --bench-warmup 5 --seq-len "$SL" --arm dense \
+        --dense-impl flash_attention_2 --model "$M2" \
+        --probe-every 1000000 --no-artifact --tag "_m2b${SL}fa2" \
+        --save-dir "checkpoints/m2b_dense_$SL" \
+        || { stage "m2-bench-densefa2-$SL:FAILED"; exit 1; }
+      stage "m2-bench-densefa2-$SL:PASS"
+    done
+  ) &
+  M2A_PID=$!
+  (
+    export CUDA_VISIBLE_DEVICES=1
+    stage "m2-train-smoke:running"
+    python -m delta_attention.train.train_delta --steps 20 --seq-len 32768 \
+      --probe-every 10 --arm delta --model "$M2" --no-artifact \
+      --tag _m2smoke --save-dir checkpoints/m2_smoke \
+      || { stage "m2-train-smoke:FAILED"; exit 1; }
+    stage "m2-train-smoke:PASS"
+    for A in delta dense; do
+      stage "m2-train-$A:running"
+      python -m delta_attention.train.train_delta --steps 500 \
+        --seq-len 32768 --probe-every 100 --arm "$A" --model "$M2" \
+        --tag "_32k_r1d" --save-dir "checkpoints/pilot_${A}_32k_r1d" \
+        || { stage "m2-train-$A:FAILED"; exit 1; }
+      stage "m2-train-$A:PASS"
+    done
+    stage "m2-ppl:running"
+    python eval/ppl_eval.py --arms base,delta_32k_r1d,dense_32k_r1d \
+      --chunks 32 --seq-len 32768 --model "$M2" \
+      || { stage "m2-ppl:FAILED"; exit 1; }
+    stage "m2-ppl:PASS"
+    stage "m2-ppl-dense:running"
+    python eval/ppl_eval.py --forward dense \
+      --arms base,delta_32k_r1d,dense_32k_r1d \
+      --chunks 32 --seq-len 32768 --model "$M2" \
+      || { stage "m2-ppl-dense:FAILED"; exit 1; }
+    stage "m2-ppl-dense:PASS"
+  ) &
+  M2B_PID=$!
+  wait "$M2A_PID"; M2A_RC=$?
+  wait "$M2B_PID"; M2B_RC=$?
+  if [ "$M2A_RC" -ne 0 ] || [ "$M2B_RC" -ne 0 ]; then
+    stage "model2:FAILED"; exit 1
+  fi
+  stage "model2:PASS"
 fi
 
 if [ -n "$TRAINBENCH" ]; then

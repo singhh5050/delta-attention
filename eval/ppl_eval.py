@@ -36,6 +36,8 @@ def parse_args():
     p.add_argument("--adapters-root", type=str, default="checkpoints")
     p.add_argument("--data-source", choices=["pg19", "arxiv"], default="pg19",
                    help="held-out corpus for the chunks (arxiv = T3 replication)")
+    p.add_argument("--model", type=str, default="",
+                   help="HF model id override (Llama-architecture only)")
     return p.parse_args()
 
 
@@ -113,6 +115,8 @@ def main():
 
     for arm in args.arms.split(","):
         cfg = Config()
+        if args.model:
+            cfg.model_str = args.model
         if args.forward == "dense":
             cfg.attn_implementation = "flash_attention_2"
             cfg.mode = "none"
