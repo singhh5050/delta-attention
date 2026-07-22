@@ -118,6 +118,34 @@ def cap_sliding(kv):
     return out
 
 
+def shared_kv_from_cache(target, cache):
+    """Rebuild shared_kv_states by reading the cache's store_full_length_kv
+    layers AFTER the forward. Under an offloaded cache, passing
+    return_shared_kv_states=True corrupts the TRUNK FORWARD ITSELF once
+    ctx > sliding window (box-45 diagnostic 2026-07-22: greedy chain
+    diverges after 4 tokens at ctx 2000 and degenerates; offload alone and
+    offload+output_hidden_states are token-exact — upstream transformers
+    bug, flag leaks into layer kwargs). The dict the model would return is
+    exactly the post-update states of the last non-shared layer per type,
+    which the cache still holds — so read them out-of-band instead."""
+    torch.cuda.synchronize()  # offload D2H copies run on a side stream
+    mdl = target
+    for _ in range(4):  # unwrap ForCausalLM/ForConditionalGeneration shells
+        if hasattr(mdl, "layers"):
+            break
+        mdl = mdl.model
+    out = {}
+    for i, layer in enumerate(mdl.layers):
+        attn = layer.self_attn
+        if getattr(attn, "store_full_length_kv", False):
+            lay = cache.layers[i]
+            out[attn.layer_type] = (lay.keys, lay.values)
+    if set(out) != {"full_attention", "sliding_attention"}:
+        raise SystemExit(f"shared_kv_from_cache: expected one store layer "
+                         f"per type, got {sorted(out)}")
+    return out
+
+
 def kv_to_dev(kv, dev):
     """Materialize a shared_kv_states view on the compute device. The
     drafter's own forward would do this move INSIDE our timed window
@@ -227,6 +255,14 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
     """
     dev = ids.device
     cache = make_cache(target, offload)
+    # under offload, NEVER pass return_shared_kv_states — it corrupts the
+    # trunk forward (see shared_kv_from_cache); read the cache instead
+    kvflag = {} if offload else {"return_shared_kv_states": True}
+
+    def grab_kv(o):
+        return cap_sliding(shared_kv_from_cache(target, cache) if offload
+                           else o.shared_kv_states)
+
     # two-step prefill: output_hidden_states over the whole prompt would
     # materialize every layer's hidden (~22GB at 32K x 63 layers); we only
     # need the LAST position's hidden, so the bulk runs without it and a
@@ -236,11 +272,10 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
            logits_to_keep=1)
     _st("prefill_last")
     out = target(input_ids=ids[:, -1:], past_key_values=cache,
-                 use_cache=True, output_hidden_states=True,
-                 return_shared_kv_states=True)
+                 use_cache=True, output_hidden_states=True, **kvflag)
     pending_logit = out.logits[:, -1]
     last_hidden = out.hidden_states[-1][:, -1:]
-    kv = cap_sliding(out.shared_kv_states)
+    kv = grab_kv(out)
     validated = ids[0].tolist()
     newest = None  # newest validated token, not yet in trunk cache
 
@@ -299,11 +334,10 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
             _st("verify_step")
             vout = target(input_ids=torch.tensor([[cur]], device=dev),
                           past_key_values=cache, use_cache=True,
-                          output_hidden_states=True,
-                          return_shared_kv_states=True)
+                          output_hidden_states=True, **kvflag)
             nxt = int(vout.logits[0, -1].argmax(-1).item())
             last_hidden = vout.hidden_states[-1][:, -1:]
-            kv = cap_sliding(vout.shared_kv_states)
+            kv = grab_kv(vout)
             if nxt == d:
                 n_match += 1
                 cur = d
@@ -314,11 +348,10 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
             _st("verify_step")
             vout = target(input_ids=torch.tensor([[cur]], device=dev),
                           past_key_values=cache, use_cache=True,
-                          output_hidden_states=True,
-                          return_shared_kv_states=True)
+                          output_hidden_states=True, **kvflag)
             bonus = int(vout.logits[0, -1].argmax(-1).item())
             last_hidden = vout.hidden_states[-1][:, -1:]
-            kv = cap_sliding(vout.shared_kv_states)
+            kv = grab_kv(vout)
         accepted += n_match
         bonus_ct += 1
         validated.extend(drafts[:n_match] + [bonus])
