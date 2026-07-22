@@ -78,3 +78,25 @@ which is itself corroborating evidence for the delta thesis).
    touch the pinned production env).
 4. Centroid head: replicate or disable via use_ordered_embeddings — G0
    measures which the shipped checkpoints use.
+
+## Weight layout (verified 07-22 via safetensors header of
+## google/gemma-4-31b-it-assistant — single file, 41 tensors, 469.5M params;
+## repo NOT gated for our token, so no license blocker)
+
+- `model.embed_tokens.weight [262144, 1024]`, lm_head TIED. **No centroid /
+  masked_embedding tensors in this checkpoint** -> the 31B assistant ships
+  with the plain lm_head path (use_ordered_embeddings off); risk 4 closed.
+- **No k_proj / v_proj anywhere.** Each layer has only q_proj + q_norm +
+  o_proj: the drafter is PURE CROSS-ATTENTION over the trunk's cached KV
+  (num_kv_shared_layers=4 means all four layers borrow trunk KV; drafted
+  tokens see each other only through the chained inputs_embeds). This is
+  the strongest possible version of the delta fit: delta-ifying the
+  drafter = subsampling a read over someone else's cache — there is no
+  drafter-side KV state to keep consistent at all.
+- Layers 0-2 (sliding, window 1024): q_proj [8192,1024] = 32 heads x 256,
+  q_norm [256]. Layer 3 (full attention): q_proj [16384,1024] with q_norm
+  [512] — the full-attn layer queries at head_dim 512 to match the trunk's
+  full-attention KV layout (confirm exact trunk head mapping in G1).
+- `pre_projection [1024, 10752]` = concat of two 5376-dim backbone vectors
+  (trunk hidden state (+) embedding path), `post_projection [5376, 1024]`
+  returns the chaining hidden; per-layer learned `layer_scalar [1]`.
