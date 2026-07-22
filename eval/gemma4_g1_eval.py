@@ -116,6 +116,15 @@ def arm_view(kv, arm, call_idx):
     return out
 
 
+_LAST_STAGE = "?"  # which GPU call OOM'd (module-global; single-threaded)
+_OOM_DUMPED = False
+
+
+def _st(s):
+    global _LAST_STAGE
+    _LAST_STAGE = s
+
+
 @torch.no_grad()
 def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
     """Our draft-verify loop. Returns per-prompt stats dict.
@@ -134,8 +143,10 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
     # materialize every layer's hidden (~22GB at 32K x 63 layers); we only
     # need the LAST position's hidden, so the bulk runs without it and a
     # 1-token step collects hidden + full-length shared KV
+    _st("prefill_bulk")
     target(input_ids=ids[:, :-1], past_key_values=cache, use_cache=True,
            logits_to_keep=1)
+    _st("prefill_last")
     out = target(input_ids=ids[:, -1:], past_key_values=cache,
                  use_cache=True, output_hidden_states=True,
                  return_shared_kv_states=True)
@@ -170,6 +181,7 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
         for c in range(k_drafts):
             emb = embed(t)
             inp = torch.cat([emb, h], dim=-1)
+            _st("draft_call")
             torch.cuda.synchronize()
             tt0 = time.monotonic()
             o = assistant(inputs_embeds=inp, attention_mask=None,
@@ -185,6 +197,7 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
         drafted += len(drafts)
 
         # trunk verifies [newest, d1..dK]
+        _st("verify")
         vin = torch.tensor([[newest] + drafts], device=dev)
         vout = target(input_ids=vin, past_key_values=cache, use_cache=True,
                       output_hidden_states=True,
@@ -260,11 +273,20 @@ def main():
                 try:
                     r = run_arm(target, assistant, embed, ids, arm,
                                 args.k, args.max_new)
-                except torch.cuda.OutOfMemoryError:
-                    w.writerow([tier, i, arm, ids.shape[1], "OOM"] +
+                except torch.cuda.OutOfMemoryError as e:
+                    w.writerow([tier, i, arm, ids.shape[1],
+                                f"OOM@{_LAST_STAGE}"] +
                                [""] * (len(HEADER) - 6) + [run.id])
                     fh.flush()
-                    print(f"[g1] tier {tier} #{i} {arm}: OOM", flush=True)
+                    print(f"[g1] tier {tier} #{i} {arm}: OOM at stage "
+                          f"{_LAST_STAGE}: {str(e)[:200]}", flush=True)
+                    global _OOM_DUMPED
+                    if not _OOM_DUMPED:
+                        _OOM_DUMPED = True
+                        import traceback
+                        traceback.print_exc()
+                        print(torch.cuda.memory_summary(abbreviated=True),
+                              flush=True)
                     torch.cuda.empty_cache()
                     continue
                 if arm == "full":
