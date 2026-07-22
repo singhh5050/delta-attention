@@ -80,11 +80,25 @@ def parse_args():
     p.add_argument("--target", type=str, default=TARGET)
     p.add_argument("--assistant", type=str, default=ASSISTANT)
     p.add_argument("--offload", action="store_true",
-                   help="CPU-offloaded uncapped trunk cache: the hybrid "
-                        "cache kept >=16K from fitting anyway (76GB "
-                        "allocated at the 16K prefill, box 44), and "
-                        "offloading fits any tier at a decode-speed cost "
-                        "that cannot affect acceptance")
+                   help="CPU-offloaded trunk cache. BROKEN UPSTREAM as of "
+                        "transformers 5.15.0.dev0: nondeterministic + "
+                        "degenerate trunk outputs once ctx > ~2K (box-45 "
+                        "diag T1, 2026-07-22 — two identical plain chains "
+                        "diverge at token 0). Kept for when upstream fixes "
+                        "it; do not use for results")
+    p.add_argument("--prefill-chunk", type=int, default=0,
+                   help="bulk-prefill in chunks of this many tokens (0 = "
+                        "single shot). The >=16K OOM was prefill "
+                        "TRANSIENTS, not cache (hybrid cache at 65K is "
+                        "~5GB vs 62GB weights); chunking caps transients "
+                        "on the NATIVE cache instead of offloading")
+    p.add_argument("--chunk-equiv-check", action="store_true",
+                   help="once per tier (first prompt): plain-greedy with "
+                        "chunked prefill must match plain-greedy "
+                        "single-shot exactly — certifies the chunked "
+                        "continuation path (the upstream sliding-mask bug "
+                        "class lives there); only meaningful at tiers "
+                        "that fit single-shot (4K/8K)")
     p.add_argument("--out", type=str, default="results/g1_tiers.csv")
     return p.parse_args()
 
@@ -184,8 +198,19 @@ def arm_view(kv, arm, call_idx):
     return out
 
 
+def bulk_prefill(target, ids_prefix, cache, chunk):
+    """Prefill all but the last prompt token, optionally in chunks to cap
+    transient memory (positions derive from cache length, so chunk
+    boundaries are transparent to the model)."""
+    L = ids_prefix.shape[1]
+    step = chunk if chunk and chunk > 0 else L
+    for s in range(0, L, step):
+        target(input_ids=ids_prefix[:, s:s + step], past_key_values=cache,
+               use_cache=True, logits_to_keep=1)
+
+
 @torch.no_grad()
-def plain_greedy(target, ids, max_new, offload=False):
+def plain_greedy(target, ids, max_new, offload=False, chunk=0):
     """Reference chain via the EXACT forward pattern of run_arm — split
     prefill (bulk, then 1-token) + sequential q_len=1 decode + the same
     make_cache — so every position's kernel shapes align, token 0
@@ -194,8 +219,7 @@ def plain_greedy(target, ids, max_new, offload=False):
     token 0, and the tolerance that excused it also passed real
     divergences at >=24)."""
     cache = make_cache(target, offload)
-    target(input_ids=ids[:, :-1], past_key_values=cache, use_cache=True,
-           logits_to_keep=1)
+    bulk_prefill(target, ids[:, :-1], cache, chunk)
     out = target(input_ids=ids[:, -1:], past_key_values=cache,
                  use_cache=True)
     toks = [int(out.logits[0, -1].argmax(-1).item())]
@@ -237,7 +261,7 @@ def make_cache(target, offload):
 
 @torch.no_grad()
 def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
-            offload=False):
+            offload=False, chunk=0):
     """Our draft-verify loop. Returns per-prompt stats dict.
 
     Cache invariant: the trunk cache holds the validated prefix EXCLUDING
@@ -271,8 +295,7 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
     # need the LAST position's hidden, so the bulk runs without it and a
     # 1-token step collects hidden + full-length shared KV
     _st("prefill_bulk")
-    target(input_ids=ids[:, :-1], past_key_values=cache, use_cache=True,
-           logits_to_keep=1)
+    bulk_prefill(target, ids[:, :-1], cache, chunk)
     _st("prefill_last")
     out = target(input_ids=ids[:, -1:], past_key_values=cache,
                  use_cache=True, output_hidden_states=True, **kvflag)
@@ -432,7 +455,7 @@ def main():
         ids_s = tok(sp, return_tensors="pt",
                     add_special_tokens=False)["input_ids"].cuda()
         r_full = run_arm(target, assistant, embed, ids_s, "full", args.k,
-                         32, offload=args.offload)
+                         32, offload=args.offload, chunk=args.prefill_chunk)
         with torch.no_grad():
             nat = target.generate(input_ids=ids_s, max_new_tokens=32,
                                   do_sample=False, assistant_model=assistant,
@@ -461,19 +484,53 @@ def main():
 
     for tier in [int(x) for x in args.tiers.split(",")]:
         ctxs = load_contexts(tok, args.n, tier)
+        chunk_certified = False
         for i, ctx in enumerate(ctxs):
             prompt = tok.apply_chat_template(
                 [{"role": "user", "content": INSTR + ctx}],
                 add_generation_prompt=True, tokenize=False)
             ids = tok(prompt, return_tensors="pt",
                       add_special_tokens=False)["input_ids"].cuda()
+
+            if (args.chunk_equiv_check and args.prefill_chunk
+                    and not chunk_certified):
+                # chunked prefill must be OUTPUT-IDENTICAL to single-shot:
+                # the chunk-continuation forward (q_len>1 over a past
+                # sliding cache) is the upstream sliding-mask bug zone,
+                # and both the loop AND its parity reference chunk — a
+                # broken continuation would be invisible to the gate
+                ref_c = plain_greedy(target, ids, args.max_new,
+                                     offload=args.offload,
+                                     chunk=args.prefill_chunk)
+                ref_1 = plain_greedy(target, ids, args.max_new,
+                                     offload=args.offload, chunk=0)
+                mc = 0
+                for a, b in zip(ref_c, ref_1):
+                    if a != b:
+                        break
+                    mc += 1
+                nc = min(len(ref_c), len(ref_1))
+                print(f"[g1] chunk-equiv (tier {tier}): prefix {mc}/{nc}",
+                      flush=True)
+                run.summary[f"chunk_equiv_t{tier}"] = mc
+                if mc < nc:
+                    raise SystemExit(
+                        f"G1 GATE FAILED: chunked prefill (chunk="
+                        f"{args.prefill_chunk}) diverges from single-shot "
+                        f"at token {mc}/{nc} — chunk-continuation path is "
+                        "broken; results at chunked tiers would be wrong")
+                chunk_certified = True
+                gc.collect()
+                torch.cuda.empty_cache()
+
             ref_tokens = None
             full_oomed = False
             for arm in arms:
                 try:
                     r = run_arm(target, assistant, embed, ids, arm,
                                 args.k, args.max_new,
-                                offload=args.offload)
+                                offload=args.offload,
+                                chunk=args.prefill_chunk)
                 except (torch.cuda.OutOfMemoryError, MemoryError,
                         RuntimeError) as e:
                     # --offload can fail host-side (pinned/pageable alloc),
@@ -548,7 +605,8 @@ def main():
                         "G1 GATE MISCONFIGURED: --parity-check needs the "
                         "'full' arm in --arms — cannot certify")
                 ref2 = plain_greedy(target, ids, args.max_new,
-                                    offload=args.offload)
+                                    offload=args.offload,
+                                    chunk=args.prefill_chunk)
                 n_cmp = min(len(ref2), len(ref_tokens))
                 m = 0
                 for a, b in zip(ref2, ref_tokens):
