@@ -1099,31 +1099,30 @@ if [ -n "$GEMMA4G1" ]; then
     && "$G4PY" -c "from transformers import Gemma4AssistantForCausalLM; print('gemma4_assistant import OK')" \
     || { stage "g1-venv:FAILED"; exit 1; }
   stage "g1-venv:PASS"
-  # v6: NO --offload (upstream-broken: nondeterministic trunk outputs at
-  # ctx>2K, box-45 diag T1); >=16K instead via CHUNKED prefill on the
-  # NATIVE hybrid cache (the 16K wall was prefill transients, not cache —
-  # the hybrid cache at 65K is ~5GB vs 62GB of weights).
-  # Smoke gates, in order of what they certify:
-  #   chunk-equiv   — chunked prefill == single-shot, exact (8K with a 4K
-  #                   chunk exercises the chunk-continuation forward,
-  #                   which is the upstream sliding-mask bug zone)
-  #   parity        — zero-tolerance vs shape-aligned plain trunk greedy
-  #   cross-check   — short-context native assisted decoding
-  #   anchor        — full-arm acc/round must reproduce run 92y2luja
-  #                   (4K ~1.97, 8K ~1.18) — check the log before quoting
+  # v7: SINGLE-SHOT prefill everywhere — the same code path certified at
+  # 4K/8K (run 92y2luja). Box-45 diags (2026-07-22): --offload is
+  # upstream-broken (nondeterministic trunk at ctx>2K); chunked prefill
+  # is uncertifiable (13-sigma sliding-KV outliers vs single-shot);
+  # fit ladder (diag4): 16K single-shot FITS (75.8GB peak incl. the
+  # hidden-states last-token step); 32K and 65K OOM — on 1xH100 with
+  # this upstream, 16K is the ceiling, so the long run is 16K ONLY
+  # (32K/65K would only churn OOM rows). Box 44's "16K wall" was
+  # allocator litter across 48 arm runs, fixed by the b156083 cleanup.
+  # Smoke gates: parity (zero-tolerance vs shape-aligned plain greedy),
+  # native cross-check, and the acceptance anchor — full-arm acc/round
+  # must reproduce 92y2luja (4K ~1.97, 8K ~1.18); check log before quoting.
   stage "g1-smoke:running"
   "$G4PY" eval/gemma4_g1_eval.py --n 2 --tiers 4096,8192 --max-new 64 \
-    --arms full --parity-check --prefill-chunk 4096 --chunk-equiv-check \
-    --out results/g1_smoke.csv \
+    --arms full --parity-check --out results/g1_smoke.csv \
     || { stage "g1-smoke:FAILED"; exit 1; }
   stage "g1-smoke:PASS"
   # --parity-check STAYS ON at the long tiers: these are the tiers the
   # results come from, so the gate must run where they run (review
   # 2026-07-22: an ungated 16K+ arms run would certify nothing)
   stage "g1-arms:running"
-  "$G4PY" eval/gemma4_g1_eval.py --n 4 --tiers 16384,32768,65536 \
+  "$G4PY" eval/gemma4_g1_eval.py --n 6 --tiers 16384 \
     --max-new 128 --k 5 --arms full,sparse,delta2,delta4 \
-    --prefill-chunk 4096 --parity-check --out results/g1_tiers.csv \
+    --parity-check --out results/g1_tiers.csv \
     || { stage "g1-arms:FAILED"; exit 1; }
   stage "g1-arms:PASS"
 fi
