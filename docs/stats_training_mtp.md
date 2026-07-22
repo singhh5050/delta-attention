@@ -524,3 +524,57 @@ independent short-context native-assisted cross-check 32/32.
   whose full-arm acc/round must reproduce 92y2luja (4K 1.97, 8K 1.18).
   Do NOT compare 16K+ absolute draft-ms against the non-offloaded 4K/8K
   rows; within-tier arm gaps are the valid comparison.
+
+### V2. 16K extension CERTIFIED (07-22 evening, box 46, runs dmeohmup
+### smoke / xxk5nkqv arms @fa3bf57; CSVs rescue/2026-07-22-g1-16k/)
+
+The ≥16K campaign burned three strategies before landing (full incident
+log in the campaign memory + commits 7d99331/db29d06/408b167/99ad69d):
+- **--offload RETIRED, upstream-broken**: DynamicCache(offloading=True)
+  on transformers 5.15.0.dev0 is NONDETERMINISTIC past ~2K ctx (two
+  identical plain-greedy chains diverge at token 0 at 4096, degenerate
+  outputs; token-exact at 2000 — box-45 diag T1). Separately,
+  return_shared_kv_states=True under offload corrupts the trunk forward
+  (diag arms C/D). Never use offload for results until upstream fixes.
+- **Chunked prefill RETIRED, uncertifiable**: source-level equivalence
+  vs single-shot shows argmax same + max|dlogit| 0.672 but 13σ max
+  outliers in the sliding shared-KV entry — cannot separate deep-layer
+  bf16 amplification from the upstream continuation-mask bug.
+- **Single-shot WORKS at 16K** with expandable_segments (v7 arms OOM'd
+  on fragmentation: 674MB ask / 467MB free / 78.7GB held; the fix is
+  allocator-policy only). Fit ladder: 16K peak 75.8GB (target-only),
+  32K/65K OOM ⇒ **32K+ G1 remains BLOCKED on 1×H100** (all three
+  routes exhausted); unblocking = 2×H100 + device_map=auto changes.
+
+Gates (all green, run xxk5nkqv): zero-tolerance shape-aligned
+plain-greedy parity 128/128 ×6 AT 16K (first long-tier gate ever run —
+the review fix); native cross-check 32/32; smoke re-certification of
+4K/8K on the identical code path (dmeohmup; draft-call 4.4/5.0ms
+matches 92y2luja exactly). match_vs_full=1 on all 18 non-full rows.
+
+| tier  | arm    | acc/round | acc_rate | draft ms | n |
+|-------|--------|-----------|----------|----------|---|
+| 16384 | full   | 1.244     | 0.249    | 6.28     | 6 |
+| 16384 | sparse | 1.198     | 0.240    | 4.23     | 6 |
+| 16384 | delta2 | 1.221     | 0.244    | 5.25     | 6 |
+| 16384 | delta4 | 1.208     | 0.242    | 4.73     | 6 |
+
+- **The cost gap grows exactly as predicted**: sparse drafter call is
+  33% cheaper than full at 16K (4.23 vs 6.28ms), vs 16% at 8K and ~5%
+  at 4K — full's read cost grows with cache length, sparse's is flat
+  (4.2ms at every tier).
+- **Acceptance near-parity at 18.75% visibility**: sparse 1.198 vs full
+  1.244 acc/round = 96.3% of full. HONEST CAVEAT: unlike 8K (where
+  sparse was a nose ahead), at 16K the paired per-prompt diffs are
+  full−sparse = +0.018/+0.075/0/+0.094/0/+0.088 — 4/6 positive, 2 exact
+  ties, 0 negative: a small but CONSISTENT full edge appears at 16K.
+  Do not say "indistinguishable" for 16K; say ~96% of full acceptance
+  at ~1/5 visibility and 2/3 the read cost. delta2 recovers about half
+  the gap (1.221, 98.2%); delta4 sits between (1.208, 97.1%).
+- Acceptance is NOT monotone in ctx across tiers here (16K full 1.244 >
+  8K 1.18) — different PG19 docs per tier; only within-tier arm
+  comparisons are controlled.
+- Smoke-vs-table acc note: the smoke rows (max_new 64, n=2) read lower
+  at 4K (1.48/1.20) than the certified table mean (1.97, max_new 128,
+  n=6) — parameter mismatch, not a regression; smoke certifies gates
+  and timing, the n=6 tables are the quotable acceptance numbers.
