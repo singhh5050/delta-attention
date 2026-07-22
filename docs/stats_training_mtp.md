@@ -287,7 +287,7 @@ the QWEN tokenizer — NOT comparable to any Llama number in this file.
 
 ## T. Anchor-branch decomposition + Jeff's 1M ladder (anchorbench, 07-22,
 ## box 39; short ladder run zofiwhdq @ f4da7c5+dccd103, CSV rescued to
-## rescue/2026-07-22-anchorbench/; long ladder IN FLIGHT @ 1895aad)
+## rescue/2026-07-22-anchorbench/; long ladder completed across §T2/§T3)
 
 Jeff's protocol verbatim: weightless single attention layer, torch.randn
 inputs, fwd/bwd, Llama-8B dims (32 q / 8 kv heads, D=128), gamma 64,
@@ -352,9 +352,12 @@ Whole-function fwd+bwd, ms PER LAYER (multiply by n_layers for a step):
 - 1M: NOTHING whole-function fits on one 80GB H100 with backward — dense
   included, so no comparison point exists on this hardware. Components
   that DO run at 1M: anchor-flexrow 1747.2, correction 57.1, gqa-expand
-  16.5 (sparse-flex-hc4 OOMs on its expanded 32-head K/V copies — a
-  GQA-native chunked sparse cell would likely fit; queued if Jeff wants
-  a composed 1M delta number).
+  16.5 (sparse-flex-hc4 OOMs on its expanded 32-head K/V copies).
+  NOTE anchor-flexrow @1M is allocator-MARGINAL: it ran here (n6qht8yh)
+  but OOM'd in two later processes with different preceding-cell
+  residue (16ja2q7c, 3y4k2c44) — treat 1747.2 as "fits with a clean
+  allocator", not unconditional. The composed 1M delta number landed
+  via the no-grad infer cells instead (§T3).
 - Anchor branch confirmed as the scaling bottleneck of the CURRENT impl:
   anchor-masked fwd+bwd 247 -> 585 -> 2097ms (131K->524K), i.e. the
   mem-efficient-backend backward, while flexrow does the same math in
@@ -366,9 +369,11 @@ Whole-function fwd+bwd, ms PER LAYER (multiply by n_layers for a step):
   delta read is ~2.4x cheaper at 131K and ~14x at 1M, and unlike dense
   it does not grow with cache length.
 
-### T3. 1M closed out (07-22, box 41 runs; v3 ladder run 16ja2q7c @0f2add5,
-### v4 delta-only run 2c3ufi39 @f6beab5; archives xend1cbc/rpf5y49q;
-### local rescue/2026-07-22-box41-final/)
+### T3. 1M closed out (07-22; sources: box-40 full ladder 16ja2q7c
+### @e3ff495 [+short jcqso3pg, archive nfl5gbyz, CSV
+### rescue/2026-07-22-anchorbench-v2/], box-41 v3 131K+1M run 3y4k2c44
+### @0f2add5, box-41 v4 1M-delta-only run 2c3ufi39 @f6beab5 [archives
+### xend1cbc/rpf5y49q, CSVs rescue/2026-07-22-box41-final/])
 
 INFERENCE latency (no-grad fwd, ms PER LAYER; 131K/1M from dedicated
 infer-* cells, 262K/524K from the fwd_ms column of the fwd+bwd cells —
@@ -384,6 +389,14 @@ validated at 131K where both exist: 430.0 vs 432.5, <1% apart):
 - THE 1M point Jeff asked for: 612.5ms (flexrow, 4 head chunks) and
   600.8ms (lowmem in-place variant — independent implementation, same
   math, 2% apart = mutual confirmation) vs 29.0s dense.
+- Repro stability: 1M infer-dense measured in two independent processes
+  — 29004.6 (16ja2q7c) vs 29151.1 (3y4k2c44), 0.5% apart; 131K infer
+  cells likewise (dense 428.2/432.5, delta-current 63.1/63.2, flexrow
+  30.1/30.3). The 262K/524K fwd_ms proxy is validated against TRUE
+  no-grad infer-dense from 16ja2q7c: 1761.0 vs 1770.9 (262K) and 7128.0
+  vs 7186.0 (524K), both <1%. No true no-grad DELTA measurement exists
+  at 262K/524K (pre-fix runs OOM'd those cells) — only those two delta
+  entries in the table above are proxies.
 - Training (fwd+bwd) at 1M remains unmeasurable on one 80GB H100 for the
   delta composition (full-delta-chunkbwd4 OOM even in a minimal-residue
   process, run 2c3ufi39); dense needed chunked backward (98.6s). The
@@ -399,9 +412,11 @@ validated at 131K where both exist: 430.0 vs 432.5, <1% apart):
   labels + KNOWN_CELLS validation; residue allocations (correction
   leaves, chunkbwd seed) gated behind skips.
 
-## U. Gemma 4 native MTP drafter — G0 baseline (07-22, box 41; runs
-## ygdlc85d (v2, superseded methodology) and vx6ldm79 (v3, two-length
-## differencing + symmetric DynamicCache); CSVs in box archives)
+## U. Gemma 4 native MTP drafter — G0 baseline (07-22, box 41; v2 runs
+## 1utfcnzp smoke / qobgwn2z tiers (superseded methodology), v3 runs
+## ygdlc85d smoke / vx6ldm79 tiers (two-length differencing + symmetric
+## DynamicCache); run_ids verified against the CSV rows; CSVs in
+## rescue/2026-07-22-box41-final/ + archives v3ih9yss/xend1cbc/rpf5y49q)
 
 - UPSTREAM BUG (transformers 5.15.0.dev0): assisted decoding with any
   prompt past the trunk sliding window (1024) crashes in the verify
@@ -410,12 +425,22 @@ validated at 131K where both exist: 430.0 vs 432.5, <1% apart):
   BOTH modes, parity-gated.
 - G0 gate PASS (fraction gate; parity scatter = kernel tie-flips in the
   batched verify path, pp spread 6..256 with ~40% exact rows).
-- Decode-only speedup (two-length differencing, 256 max_new, PG19):
-  ~1.2-1.5x at 4K and 8K tiers (8K example: 9.8 -> 14.3 tok/s);
-  occasional fully-accepted prompts reach ~4x. Below Google's ~3x
-  claim — ours is the naive HF assisted path, no server batching.
-- Tiers >= 16K OOM on 80GB in EVERY mode (both cache types) — consistent
-  with full-sequence prefill logits (16K x 262K vocab); 8K fits. G1's
+- Decode-only speedup (two-length differencing, 256 max_new, PG19,
+  n=10/tier, run vx6ldm79 — the corrected methodology):
+
+  | tier | plain tok/s | assisted tok/s | speedup median [min-max] | exact | pp median |
+  |------|-------------|----------------|--------------------------|-------|-----------|
+  | 4096 | 13.8        | 24.0           | 1.43 [1.18-4.57]         | 1/10  | 84.5      |
+  | 8192 | 9.9         | 13.5           | 1.36 [1.08-1.64]         | 1/10  | 74.0      |
+
+  QUOTE THE MEDIANS: the 4K mean (1.73x) is dragged by one 4.57x
+  fully-accepted outlier prompt. Below Google's ~3x claim — ours is the
+  naive HF assisted path, single prompt, no server batching/CUDA graphs.
+  (v2-methodology 4K rows from run qobgwn2z are superseded — asymmetric
+  caches + prefill conflation — but agree in ballpark, 1.16-1.29x.)
+- Tiers >= 16K OOM on 80GB in EVERY mode (both cache types; run
+  qobgwn2z, all 30 rows at 16K/32K/64K) — consistent with full-sequence
+  prefill logits (16K x 262K vocab); 8K fits (vx6ldm79). G1's
   custom loop prefills with logits_to_keep=1 and owns the draft loop,
   which removes both this cap and the upstream-bug workaround.
 - KNOWN CAVEAT on v3 speedups: the heuristic num_assistant_tokens
