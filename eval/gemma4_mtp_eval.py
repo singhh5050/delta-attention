@@ -100,6 +100,13 @@ def main():
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    import transformers
+    # transformers is installed from git main (gemma4 support) — record the
+    # exact build or rows are unattributable across reruns (review
+    # wf_02383daf)
+    run.config.update({"transformers_version": transformers.__version__})
+    print(f"[g4] transformers {transformers.__version__}", flush=True)
+
     tok = AutoTokenizer.from_pretrained(args.target)
     print(f"[g4] loading target {args.target} (bf16)", flush=True)
     target = AutoModelForCausalLM.from_pretrained(
@@ -118,14 +125,25 @@ def main():
     fh = out_path.open("a", newline="")
     w = csv.writer(fh)
     if new:
-        w.writerow(["tier", "idx", "prompt_toks", "plain_toks", "plain_s",
-                    "assisted_toks", "assisted_s", "speedup",
-                    "parity_prefix", "exact_match", "run_id"])
+        # decode-only tok/s: t_prefill (measured via a max_new=1 generate,
+        # identical work for both modes) is subtracted before dividing —
+        # otherwise prefill dominance at long tiers drags speedup toward
+        # 1.0 and fabricates an "MTP decays with context" curve (review
+        # wf_02383daf; the same prefill/decode conflation that invalidated
+        # specdec timing twice)
+        w.writerow(["tier", "idx", "prompt_toks", "prefill_s",
+                    "plain_toks", "plain_s", "plain_dec_tok_s",
+                    "assisted_toks", "assisted_s", "assisted_dec_tok_s",
+                    "decode_speedup", "parity_prefix", "exact_match",
+                    "run_id"])
 
     gate_vals = []
     for tier in [int(x) for x in args.tiers.split(",")]:
         ctxs = load_contexts(tok, args.n, tier)
         rows_done = 0
+        warmed = False  # retried until it succeeds — a prompt-0 OOM must
+        # not leave the rest of the tier timed cold (plain runs first and
+        # would absorb the cold-start, inflating speedup)
         for i, ctx in enumerate(ctxs):
             prompt = tok.apply_chat_template(
                 [{"role": "user", "content": INSTR + ctx}],
@@ -134,43 +152,61 @@ def main():
                          add_special_tokens=False).to("cuda")
             n_prompt = inputs["input_ids"].shape[1]
             try:
-                if i == 0:  # per-tier warmup: compile/cache paths, both modes
+                if not warmed:  # compile/cache paths, both modes
                     gen(target, inputs, 16)
                     gen(target, inputs, 16, assistant)
+                    warmed = True
                 plain, t_p = gen(target, inputs, args.max_new)
+                _, t_pre = gen(target, inputs, 1)  # prefill(+1), mode-shared
                 assisted, t_a = gen(target, inputs, args.max_new, assistant)
             except torch.cuda.OutOfMemoryError:
-                w.writerow([tier, i, n_prompt, "OOM", "", "", "", "", "", "",
-                            run.id])
+                w.writerow([tier, i, n_prompt, "OOM", "", "", "", "", "",
+                            "", "", "", "", run.id])
                 fh.flush()
                 print(f"[g4] tier {tier} #{i}: OOM (recorded)", flush=True)
                 torch.cuda.empty_cache()
                 continue
-            if plain.numel() == 0 or assisted.numel() == 0:
-                w.writerow([tier, i, n_prompt, plain.numel(), f"{t_p:.2f}",
-                            assisted.numel(), f"{t_a:.2f}", "", "", "",
+            if plain.numel() < 2 or assisted.numel() < 2:
+                w.writerow([tier, i, n_prompt, f"{t_pre:.2f}",
+                            plain.numel(), f"{t_p:.2f}", "",
+                            assisted.numel(), f"{t_a:.2f}", "", "", "", "",
                             run.id])
                 fh.flush()
-                print(f"[g4] tier {tier} #{i}: empty generation (immediate "
-                      "eos) — recorded, skipped for stats", flush=True)
+                print(f"[g4] tier {tier} #{i}: near-empty generation "
+                      "(immediate eos) — recorded, skipped for stats",
+                      flush=True)
                 continue
             pp = parity_prefix(plain, assisted)
-            exact = int(pp == min(plain.numel(), assisted.numel()))
-            sp = (assisted.numel() / t_a) / (plain.numel() / t_p)
-            w.writerow([tier, i, n_prompt, plain.numel(), f"{t_p:.2f}",
-                        assisted.numel(), f"{t_a:.2f}", f"{sp:.3f}",
-                        pp, exact, run.id])
+            # exact requires SAME length AND full match — a matching prefix
+            # with different stopping points is a real divergence
+            exact = int(plain.numel() == assisted.numel()
+                        and pp == plain.numel())
+            dec_p = (plain.numel() - 1) / max(t_p - t_pre, 1e-6)
+            dec_a = (assisted.numel() - 1) / max(t_a - t_pre, 1e-6)
+            sp = dec_a / dec_p
+            w.writerow([tier, i, n_prompt, f"{t_pre:.2f}",
+                        plain.numel(), f"{t_p:.2f}", f"{dec_p:.1f}",
+                        assisted.numel(), f"{t_a:.2f}", f"{dec_a:.1f}",
+                        f"{sp:.3f}", pp, exact, run.id])
             fh.flush()
-            gate_vals.append(pp)
+            # gate scores DIVERGENCE, not length: an exact match that ends
+            # in a legitimate early eos in both modes is perfect parity
+            gate_vals.append(args.min_parity_prefix if exact
+                             and args.min_parity_prefix else pp)
             rows_done += 1
-            print(f"[g4] tier {tier} #{i}: plain {plain.numel()/t_p:.1f} tok/s"
-                  f"  assisted {assisted.numel()/t_a:.1f} tok/s"
-                  f"  speedup {sp:.2f}x  parity_prefix {pp}"
+            print(f"[g4] tier {tier} #{i}: decode plain {dec_p:.1f} tok/s"
+                  f"  assisted {dec_a:.1f} tok/s  speedup {sp:.2f}x"
+                  f"  (prefill {t_pre:.2f}s)  parity_prefix {pp}"
                   f"  exact={exact}", flush=True)
         run.summary[f"tier{tier}_rows"] = rows_done
     fh.close()
 
-    if args.min_parity_prefix and gate_vals:
+    if args.min_parity_prefix:
+        if not gate_vals:
+            raise SystemExit(
+                "G0 GATE FAILED: no parity measurements at all (every row "
+                "OOM'd or generated <2 tokens) — the gate cannot certify "
+                "an unmeasured harness")
         mean_pp = sum(gate_vals) / len(gate_vals)
         run.summary["mean_parity_prefix"] = mean_pp
         if mean_pp < args.min_parity_prefix:

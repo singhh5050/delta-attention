@@ -55,6 +55,7 @@ from torch.nn.attention.flex_attention import create_block_mask  # noqa: E402
 
 SINK, WINDOW, GAMMA = 1024, 2048, 64
 H_Q, H_KV, D = 32, 8, 128  # Llama-3.1-8B geometry
+_HC_CERTIFIED = False  # flex_hc parity cert ran in THIS process
 
 
 def gpu_state():
@@ -83,6 +84,10 @@ def timed(fn, out_shape, warmup, iters, leaves, backward=True):
         if backward:
             out.backward(g)
             zero()
+    # drop the last warmup output BEFORE timing: at 1M it is ~8.6GB, and
+    # holding it through the fwd loop can push an infer cell that genuinely
+    # fits into a false OOM row (review wf_02383daf)
+    out = None  # noqa: F841
     torch.cuda.synchronize()
     t0 = time.monotonic()
     for _ in range(iters):
@@ -221,10 +226,14 @@ def bench_seq_len(s, warmup, iters, rows, run):
                          enable_gqa=enable_gqa)
              for i in range(HC)], dim=1)
 
-    if s == 8192:
-        # one-time numeric certification of head-chunking, BOTH kv modes
-        # (review wf_0e865084: the GQA-native chunk alignment was untested):
-        # chunked outputs must match the monolithic kernel to bf16 noise
+    global _HC_CERTIFIED
+    if not _HC_CERTIFIED and not needs_hc:
+        # once-per-process numeric certification of head-chunking, BOTH kv
+        # modes (reviews wf_0e865084/wf_02383daf: it must run in the SAME
+        # process that emits -hc/chunkbwd data — the long ladder never
+        # includes 8K, so an s==8192 gate certified nothing there). Needs a
+        # length where the monolithic kernel still compiles (not needs_hc).
+        _HC_CERTIFIED = True
         with torch.no_grad():
             ref = _get_flex()(q, k8.repeat_interleave(rep, dim=1),
                               v8.repeat_interleave(rep, dim=1),
@@ -433,8 +442,21 @@ def bench_seq_len(s, warmup, iters, rows, run):
         # per head group, so only one group's graph is alive at a time.
         # GQA-native sparse (no 32-head K/V copies — those are what OOM'd
         # the expanded -hc4 cell at 1M); flexgqa == flex within 0.5%
-        # (swabench §Q), and flex_hc gqa-native parity is asserted at 8K.
-        g_cb = torch.randn(1, s, H_Q, D, device=dev, dtype=dt)
+        # (swabench §Q), and flex_hc gqa-native parity is asserted once per
+        # process at the smallest non-capped length.
+        try:
+            # the seed alone is ~8.6GB at 1M — its OOM is a result for BOTH
+            # chunkbwd cells, not a crash that loses the length's rows
+            g_cb = torch.randn(1, s, H_Q, D, device=dev, dtype=dt)
+        except torch.cuda.OutOfMemoryError:
+            for lbl in (f"full-delta-chunkbwd{HC}", f"full-dense-chunkbwd{HC}"):
+                rows.append([lbl, s, "per-layer-fwd", "OOM", "OOM",
+                             "gradient seed alone does not fit"])
+                print(f"[anchorbench] {lbl:18s} s={s:>7} OOM on grad seed "
+                      "(recorded as data)", flush=True)
+            g_cb = None
+            gc.collect()
+            torch.cuda.empty_cache()
         gq, gkv = H_Q // HC, H_KV // HC
 
         def full_delta_chunkbwd():
@@ -450,9 +472,10 @@ def bench_seq_len(s, warmup, iters, rows, run):
                     .transpose(1, 2)
                 delta_compose(sparse, dsel, gq) \
                     .backward(g_cb[:, :, i * gq:(i + 1) * gq])
-        cell(f"full-delta-chunkbwd{HC}", full_delta_chunkbwd, None,
-             self_backward=True,
-             note=f"GQA-native, backward per head group x{HC}")
+        if g_cb is not None:
+            cell(f"full-delta-chunkbwd{HC}", full_delta_chunkbwd, None,
+                 self_backward=True,
+                 note=f"GQA-native, backward per head group x{HC}")
 
         def full_dense_chunkbwd():
             for i in range(HC):
@@ -463,9 +486,10 @@ def bench_seq_len(s, warmup, iters, rows, run):
                     is_causal=True, scale=scaling, enable_gqa=True) \
                     .transpose(1, 2)
                 out_i.backward(g_cb[:, :, i * gq:(i + 1) * gq])
-        cell(f"full-dense-chunkbwd{HC}", full_dense_chunkbwd, None,
-             self_backward=True,
-             note=f"causal dense reference, backward per head group x{HC}")
+        if g_cb is not None:
+            cell(f"full-dense-chunkbwd{HC}", full_dense_chunkbwd, None,
+                 self_backward=True,
+                 note=f"causal dense reference, backward per head group x{HC}")
         del g_cb
 
     del q, k8, v8, sparse_out, anchor_out, q1
