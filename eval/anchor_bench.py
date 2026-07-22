@@ -227,6 +227,16 @@ def bench_seq_len(s, warmup, iters, rows, run):
              for i in range(HC)], dim=1)
 
     global _HC_CERTIFIED
+    if needs_hc and not _HC_CERTIFIED:
+        # every length in this run is above the int32 cap, so the parity
+        # cert can never execute — say so IN THE DATA, not just the log
+        # (review wf_e370eeb8: an all-long partial rerun would otherwise
+        # emit -hc/chunkbwd rows that look certified)
+        rows.append(["hc-parity-cert", s, "per-layer-fwd", "", "",
+                     "UNCERTIFIED in this process — include a length "
+                     "< 524288 so the cert can run"])
+        print(f"[anchorbench] WARNING: hc cells at s={s} UNCERTIFIED in "
+              "this process (no non-capped length ran first)", flush=True)
     if not _HC_CERTIFIED and not needs_hc:
         # once-per-process numeric certification of head-chunking, BOTH kv
         # modes (reviews wf_0e865084/wf_02383daf: it must run in the SAME
