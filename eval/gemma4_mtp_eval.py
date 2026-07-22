@@ -73,11 +73,23 @@ def load_contexts(tokenizer, n, max_ctx_tokens):
 
 
 @torch.no_grad()
-def gen(model, inputs, max_new, assistant=None):
-    """(new_token_ids, wall_seconds). Greedy; assisted iff assistant given."""
+def gen(model, inputs, max_new, assistant=None, dyncache=False):
+    """(new_token_ids, wall_seconds). Greedy; assisted iff assistant given.
+
+    dyncache: pass a fresh DynamicCache. REQUIRED for assisted decoding
+    with prompts past the trunk sliding window (1024): transformers-main
+    (5.15.0.dev0, probed 07-22 box 41) crashes in the verify forward —
+    the hybrid cache window-caps sliding-layer KV (1030) while the mask
+    is built full-length (e.g. 4103). An uncapped DynamicCache sidesteps
+    the mismatch; the parity gate certifies the outputs still equal plain
+    greedy. Plain baselines keep the default hybrid cache, so prefill is
+    measured PER MODE below."""
     kw = dict(max_new_tokens=max_new, do_sample=False)
     if assistant is not None:
         kw["assistant_model"] = assistant
+    if dyncache:
+        from transformers import DynamicCache
+        kw["past_key_values"] = DynamicCache()
     torch.cuda.synchronize()
     t0 = time.monotonic()
     ids = model.generate(**inputs, **kw)
@@ -131,7 +143,8 @@ def main():
         # 1.0 and fabricates an "MTP decays with context" curve (review
         # wf_02383daf; the same prefill/decode conflation that invalidated
         # specdec timing twice)
-        w.writerow(["tier", "idx", "prompt_toks", "prefill_s",
+        w.writerow(["tier", "idx", "prompt_toks",
+                    "prefill_plain_s", "prefill_assist_s",
                     "plain_toks", "plain_s", "plain_dec_tok_s",
                     "assisted_toks", "assisted_s", "assisted_dec_tok_s",
                     "decode_speedup", "parity_prefix", "exact_match",
@@ -154,20 +167,25 @@ def main():
             try:
                 if not warmed:  # compile/cache paths, both modes
                     gen(target, inputs, 16)
-                    gen(target, inputs, 16, assistant)
+                    gen(target, inputs, 16, assistant, dyncache=True)
                     warmed = True
                 plain, t_p = gen(target, inputs, args.max_new)
-                _, t_pre = gen(target, inputs, 1)  # prefill(+1), mode-shared
-                assisted, t_a = gen(target, inputs, args.max_new, assistant)
+                # prefill(+1) measured PER MODE: plain runs on the default
+                # hybrid cache, assisted on DynamicCache (see gen())
+                _, t_pre_p = gen(target, inputs, 1)
+                _, t_pre_a = gen(target, inputs, 1, dyncache=True)
+                assisted, t_a = gen(target, inputs, args.max_new, assistant,
+                                    dyncache=True)
             except torch.cuda.OutOfMemoryError:
                 w.writerow([tier, i, n_prompt, "OOM", "", "", "", "", "",
-                            "", "", "", "", run.id])
+                            "", "", "", "", "", run.id])
                 fh.flush()
                 print(f"[g4] tier {tier} #{i}: OOM (recorded)", flush=True)
                 torch.cuda.empty_cache()
                 continue
             if plain.numel() < 2 or assisted.numel() < 2:
-                w.writerow([tier, i, n_prompt, f"{t_pre:.2f}",
+                w.writerow([tier, i, n_prompt, f"{t_pre_p:.2f}",
+                            f"{t_pre_a:.2f}",
                             plain.numel(), f"{t_p:.2f}", "",
                             assisted.numel(), f"{t_a:.2f}", "", "", "", "",
                             run.id])
@@ -181,10 +199,11 @@ def main():
             # with different stopping points is a real divergence
             exact = int(plain.numel() == assisted.numel()
                         and pp == plain.numel())
-            dec_p = (plain.numel() - 1) / max(t_p - t_pre, 1e-6)
-            dec_a = (assisted.numel() - 1) / max(t_a - t_pre, 1e-6)
+            dec_p = (plain.numel() - 1) / max(t_p - t_pre_p, 1e-6)
+            dec_a = (assisted.numel() - 1) / max(t_a - t_pre_a, 1e-6)
             sp = dec_a / dec_p
-            w.writerow([tier, i, n_prompt, f"{t_pre:.2f}",
+            w.writerow([tier, i, n_prompt, f"{t_pre_p:.2f}",
+                        f"{t_pre_a:.2f}",
                         plain.numel(), f"{t_p:.2f}", f"{dec_p:.1f}",
                         assisted.numel(), f"{t_a:.2f}", f"{dec_a:.1f}",
                         f"{sp:.3f}", pp, exact, run.id])
@@ -196,8 +215,8 @@ def main():
             rows_done += 1
             print(f"[g4] tier {tier} #{i}: decode plain {dec_p:.1f} tok/s"
                   f"  assisted {dec_a:.1f} tok/s  speedup {sp:.2f}x"
-                  f"  (prefill {t_pre:.2f}s)  parity_prefix {pp}"
-                  f"  exact={exact}", flush=True)
+                  f"  (prefill {t_pre_p:.2f}/{t_pre_a:.2f}s)"
+                  f"  parity_prefix {pp}  exact={exact}", flush=True)
         run.summary[f"tier{tier}_rows"] = rows_done
     fh.close()
 
