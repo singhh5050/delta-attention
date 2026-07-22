@@ -335,26 +335,37 @@ def bench_seq_len(s, warmup, iters, rows, run):
          note="gathered in-graph, GQA-native, prefixes via mask")
 
     # ---- correction alone (production gradient path shape)
-    sparse_out = torch.randn(1, s, H_Q, D, device=dev, dtype=dt,
-                             requires_grad=True)
-    anchor_out = torch.randn(1, n_sel, H_Q, D, device=dev, dtype=dt,
-                             requires_grad=True)
     n_anchor = idx.numel()
-    idx_dev = idx.to(dev)
+    idx_dev = idx.to(dev)  # needed by delta_compose even when skipping
+    sparse_out = anchor_out = None
+    if not any("correction".startswith(sk) for sk in SKIP_CELLS):
+        # leaves allocated ONLY when the cell runs: sparse_out alone is
+        # ~8.6GB at 1M and skipping the cell but keeping its residue
+        # defeats the minimal-residue --skip run (review wf_feecd1bf)
+        sparse_out = torch.randn(1, s, H_Q, D, device=dev, dtype=dt,
+                                 requires_grad=True)
+        anchor_out = torch.randn(1, n_sel, H_Q, D, device=dev, dtype=dt,
+                                 requires_grad=True)
 
-    def correction():
-        delta = anchor_out[:, :n_anchor] - sparse_out[:, idx_dev]
-        corrected = (sparse_out[:, :s_p].reshape(1, n_anchor, GAMMA, H_Q, D)
-                     + delta.reshape(1, n_anchor, 1, H_Q, D)) \
-            .reshape(1, s_p, H_Q, D)
-        return torch.cat((corrected, anchor_out[:, n_anchor:]), dim=1)
-    leaves_c = [sparse_out, anchor_out]
-    old_leaves = leaves[:]
-    leaves.clear()
-    leaves.extend(leaves_c)
-    cell("correction", correction, (1, s, H_Q, D))
-    leaves.clear()
-    leaves.extend(old_leaves)
+        def correction():
+            delta = anchor_out[:, :n_anchor] - sparse_out[:, idx_dev]
+            corrected = (sparse_out[:, :s_p]
+                         .reshape(1, n_anchor, GAMMA, H_Q, D)
+                         + delta.reshape(1, n_anchor, 1, H_Q, D)) \
+                .reshape(1, s_p, H_Q, D)
+            return torch.cat((corrected, anchor_out[:, n_anchor:]), dim=1)
+        leaves_c = [sparse_out, anchor_out]
+        old_leaves = leaves[:]
+        leaves.clear()
+        leaves.extend(leaves_c)
+        cell("correction", correction, (1, s, H_Q, D))
+        leaves.clear()
+        leaves.extend(old_leaves)
+    else:
+        rows.append(["correction", s, "per-layer-fwd", "SKIPPED", "",
+                     "skipped via --skip (leaf alloc avoided)"])
+        print(f"[anchorbench] {'correction':18s} s={s:>7} SKIPPED "
+              "(--skip, leaves not allocated)", flush=True)
 
     # ---- MTP head-read cost: ONE query over an s-length cache (the
     # drafting cost per token: dense reads everything; delta reads
