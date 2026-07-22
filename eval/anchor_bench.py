@@ -152,10 +152,44 @@ def bench_seq_len(s, warmup, iters, rows, run):
                 rows.append([label, s, "per-layer-fwd", "RAISED", "", msg])
                 print(f"[anchorbench] {label:18s} s={s:>7} RAISED: {msg} "
                       "(the smoking gun, recorded)", flush=True)
+            elif "64-bit indexing" in str(e):
+                # torch 2.8 flex triton templates are int32-indexed: any
+                # tensor over 2^31 elements (q at s>=524288 with 32 heads)
+                # cannot compile. A formulation cap, so a RESULT — the
+                # -hc cells below carry the delta curve past it.
+                rows.append([label, s, "per-layer-fwd", "RAISED-64BIT", "",
+                             "flex triton templates lack 64-bit indexing "
+                             "(torch 2.8): >2^31-element tensors"])
+                print(f"[anchorbench] {label:18s} s={s:>7} RAISED-64BIT "
+                      "(recorded as data)", flush=True)
+                for t in leaves:
+                    t.grad = None
+                gc.collect()
+                torch.cuda.empty_cache()
             else:
                 raise  # genuine failures fail the stage loudly
 
     bm = get_block_mask(s, WINDOW, SINK, dev)
+
+    # head-chunked flex: N sequential head-group calls, each under the
+    # int32 element limit of flex's triton templates. GQA group alignment
+    # holds for both expanded and native kv (q head i <-> kv head i//rep,
+    # and chunks split both on the same group boundaries). Costs only N-1
+    # extra kernel launches — the honest workaround to carry the curve to
+    # 1M, labeled -hcN so nobody mistakes it for the monolithic kernel.
+    HC = 4
+
+    def flex_hc(qq, kk, vv, block_mask, enable_gqa=False):
+        gq, gkv = qq.shape[1] // HC, kk.shape[1] // HC
+        return torch.cat(
+            [_get_flex()(qq[:, i * gq:(i + 1) * gq],
+                         kk[:, i * gkv:(i + 1) * gkv],
+                         vv[:, i * gkv:(i + 1) * gkv],
+                         block_mask=block_mask, scale=scaling,
+                         enable_gqa=enable_gqa)
+             for i in range(HC)], dim=1)
+
+    needs_hc = H_Q * s * D >= 2 ** 31  # monolithic flex will RAISED-64BIT
 
     # ---- production sparse branch: expansion IN-GRAPH (backward pays the
     # 32->8 grad reduction, exactly as delta_forward_train does)
@@ -164,6 +198,11 @@ def bench_seq_len(s, warmup, iters, rows, run):
                              v8.repeat_interleave(rep, dim=1),
                              block_mask=bm, scale=scaling),
          (1, H_Q, s, D))
+    if needs_hc:
+        cell(f"sparse-flex-hc{HC}",
+             lambda: flex_hc(q, k8.repeat_interleave(rep, dim=1),
+                             v8.repeat_interleave(rep, dim=1), bm),
+             (1, H_Q, s, D), note=f"{HC} head-group calls (int32 dodge)")
     # ---- expansion alone (fwd copy; backward reduction measured in-graph)
     cell("gqa-expand", lambda: k8.repeat_interleave(rep, dim=1),
          (1, H_Q, s, D))
@@ -284,6 +323,27 @@ def bench_seq_len(s, warmup, iters, rows, run):
     cell("full-delta-flexrow", full_delta_flexrow, (1, s, H_Q, D),
          note="anchor branch reformulated (flexrow), same math")
 
+    if needs_hc:
+        # same composition with the sparse branch head-chunked (the anchor
+        # branch's n_sel x s shapes stay far below the int32 limit) — the
+        # cell that carries the whole-function delta number to 1M
+        def full_delta_flexrow_hc():
+            sparse = flex_hc(q, k8.repeat_interleave(rep, dim=1),
+                             v8.repeat_interleave(rep, dim=1), bm) \
+                .transpose(1, 2)
+            dense_sel = _get_flex()(q[:, :, sel], k8, v8, block_mask=bm_row,
+                                    scale=scaling, enable_gqa=True) \
+                .transpose(1, 2)
+            n_a = idx.numel()
+            delta = dense_sel[:, :n_a] - sparse[:, idx_dev]
+            corrected = (sparse[:, :s_p].reshape(1, n_a, GAMMA, H_Q, D)
+                         + delta.reshape(1, n_a, 1, H_Q, D)) \
+                .reshape(1, s_p, H_Q, D)
+            return torch.cat((corrected, dense_sel[:, n_a:]), dim=1)
+        cell(f"full-delta-flexrow-hc{HC}", full_delta_flexrow_hc,
+             (1, s, H_Q, D),
+             note=f"flexrow composition, sparse branch in {HC} head chunks")
+
     cell("full-dense",
          lambda: F.scaled_dot_product_attention(
              q, k8, v8, is_causal=True, scale=scaling,
@@ -307,21 +367,25 @@ def main():
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
                      name=f"anchorbench_{args.seq_lens.replace(',', '-')}",
                      config=vars(args))
-    rows = []
-    for s in [int(x) for x in args.seq_lens.split(",")]:
-        bench_seq_len(s, args.warmup, args.iters, rows, run)
-        sm, sm_max, temp = gpu_state()
-        print(f"[anchorbench] post-{s} clocks {sm}/{sm_max}MHz {temp}C",
-              flush=True)
-
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    written = 0
+    # flush after EVERY length — the 07-22 524K crash cost the completed
+    # 131K/262K rows (they survived only in the wandb summary)
     with out_path.open("a", newline="") as fh:
         w = csv.writer(fh)
         if fh.tell() == 0:
             w.writerow(["component", "seq_len", "scope", "fwd_ms",
                         "fwdbwd_ms", "note"])
-        w.writerows(rows)
+        for s in [int(x) for x in args.seq_lens.split(",")]:
+            bench_seq_len(s, args.warmup, args.iters, rows, run)
+            w.writerows(rows[written:])
+            fh.flush()
+            written = len(rows)
+            sm, sm_max, temp = gpu_state()
+            print(f"[anchorbench] post-{s} clocks {sm}/{sm_max}MHz {temp}C",
+                  flush=True)
     run.finish()
     print("[anchorbench] DONE (all numbers PER LAYER; multiply by "
           "n_layers for per-step)", flush=True)
