@@ -1,0 +1,27 @@
+{
+  "os":  "macOS-26.5.1-arm64-arm-64bit",
+  "python":  "CPython 3.9.6",
+  "startedAt":  "2026-07-16T00:03:37.358146Z",
+  "program":  "<stdin>",
+  "git":  {
+    "remote":  "https://github.com/singhh5050/delta-attention.git",
+    "commit":  "3cbcaae569336ad203a518c3443afbdeb334e209"
+  },
+  "email":  "singhh5050@gmail.com",
+  "root":  "/Users/harshvardhan@nvidia.com/Development/delta-attention/repo",
+  "host":  "H766QV2N26",
+  "executable":  "/Library/Developer/CommandLineTools/usr/bin/python3",
+  "cpu_count":  18,
+  "cpu_count_logical":  18,
+  "disk":  {
+    "/":  {
+      "total":  "994610155520",
+      "used":  "183756599296"
+    }
+  },
+  "memory":  {
+    "total":  "51539607552"
+  },
+  "apple":  {},
+  "writerId":  "hi6j3rcj805z12vam8nxpmcz3o59jrnb"
+}

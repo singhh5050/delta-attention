@@ -1,0 +1,36 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            1stv1w0uec35yxp1svv8fsqdu4tl6r8n:
+                apple: {}
+                cpu_count: 18
+                cpu_count_logical: 18
+                disk:
+                    /:
+                        total: "994610155520"
+                        used: "182002532352"
+                email: singhh5050@gmail.com
+                executable: /Library/Developer/CommandLineTools/usr/bin/python3
+                git:
+                    commit: a9f5b57f24dc5a620c3beab975a522d91383456a
+                    remote: https://github.com/singhh5050/delta-attention.git
+                host: H766QV2N26
+                memory:
+                    total: "51539607552"
+                os: macOS-26.5.1-arm64-arm-64bit
+                program: <python with no main file>
+                python: CPython 3.9.6
+                root: /Users/harshvardhan@nvidia.com/Development/delta-attention/repo
+                startedAt: "2026-07-15T22:30:04.323883Z"
+                writerId: 1stv1w0uec35yxp1svv8fsqdu4tl6r8n
+        m: []
+        python_version: 3.9.6
+        t:
+            "3":
+                - 2
+                - 13
+            "4": 3.9.6
+            "5": 0.26.1
+            "12": 0.26.1
+            "13": darwin-arm64

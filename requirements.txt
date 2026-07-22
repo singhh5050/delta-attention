@@ -109,3 +109,7 @@ uvicorn==0.37.0
 xxhash==3.6.0
 yarl==1.22.0
 rouge==1.0.1
+# vendored third_party/LongBench/metrics.py imports these at module level
+# (v1full suite + its offline test gate); both pure-python
+jieba==0.42.1
+fuzzywuzzy==0.18.0

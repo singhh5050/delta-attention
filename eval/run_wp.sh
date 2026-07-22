@@ -143,6 +143,10 @@ case "$WP" in
   swabench) TESTS="tests/test_flex_delta.py"; SWABENCH=1 ;;
   mimo) TESTS="tests/test_specdec_offline.py"; MIMO=1 ;;
   anchorbench) TESTS=""; ANCHORBENCH=1 ;;
+  # eval gaps (user-approved 07-22): full 16-task English LongBench on the
+  # 32K-trained arms + RULER on the same arms (both firsts — V1 ran 4 QA
+  # tasks; trained-arm RULER was 8K-era t2eval only)
+  evalgaps) TESTS="tests/test_longbench_offline.py"; EVALGAPS=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -1017,6 +1021,32 @@ if [ -n "$SEEDSDISTILL" ]; then
   done
   run_ppl_2x2 ppl32k-seedsdistill \
     base,delta_s1,distill_dft_s1,delta_s2,distill_dft_s2
+fi
+
+if [ -n "$EVALGAPS" ]; then
+  export CUDA_VISIBLE_DEVICES=0
+  gpu_preflight "eg-gpupreflight"
+  stage "adapter-fetch:running"
+  fetch_adapters delta_32k dense_32k detach_32k \
+    || { stage "adapter-fetch:FAILED"; exit 1; }
+  stage "adapter-fetch:PASS"
+  # cheap first: RULER (prefill-only scoring) before the generation-heavy
+  # LongBench pass, so a LongBench failure can't cost the RULER rows
+  stage "ruler32k:running"
+  python eval/run_matrix.py --configs ruler32k \
+    || { stage "ruler32k:FAILED"; exit 1; }
+  stage "ruler32k:PASS"
+  stage "lbfull-smoke:running"
+  python eval/longbench_eval.py --suite v1full --n-samples 2 \
+    --arms base_delta --out results/lbfull_smoke.csv \
+    || { stage "lbfull-smoke:FAILED"; exit 1; }
+  stage "lbfull-smoke:PASS"
+  stage "lbfull:running"
+  python eval/longbench_eval.py --suite v1full --n-samples 50 \
+    --arms base_dense,base_delta,ce32k_delta,dense32k_delta,detach32k_delta \
+    --out results/lbfull.csv \
+    || { stage "lbfull:FAILED"; exit 1; }
+  stage "lbfull:PASS"
 fi
 
 stage "ALL-DONE"

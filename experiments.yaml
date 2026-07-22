@@ -291,8 +291,33 @@ configs:
     tasks: [niah_single_1, niah_multikey_2, qa_1]
     n_samples: 50
 
+  # RULER on the 32K-TRAINED arms (Jeff 07-21: "some real task aside from
+  # just perplexity ... Ruler stays the same"; user-approved 07-22 as eval
+  # gap 2 — the only trained-arm RULER to date was the 8K-era t2eval).
+  # Same tasks/lengths/n as t2eval so rows are comparable across eras.
+  - name: p32_ft32k_delta
+    <<: *defaults
+    checkpoint: checkpoints/pilot_delta_32k
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+  - name: p32_ft32k_dense
+    <<: *defaults
+    checkpoint: checkpoints/pilot_dense_32k
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+  - name: p32_ft32k_detach
+    <<: *defaults
+    checkpoint: checkpoints/pilot_detach_32k
+    context_lengths: [32768]
+    tasks: [niah_single_1, niah_multikey_2, qa_1]
+    n_samples: 50
+
 groups:
   t2eval:      [p32_base_g128, p32_t2ce_g64, p32_t2ce_g128, p32_t2ce_dec_g2, p32_t2ce_dec_g16]
+  # base refs (dense ceiling + untrained pipeline) + the three 32K adapters
+  ruler32k:    [p32_dense_fa2, p32_delta_g64, p32_ft32k_delta, p32_ft32k_dense, p32_ft32k_detach]
   decsweep:    [p32_delta_dec_g2, p32_delta_dec_g4, p32_delta_dec_g8, p32_delta_dec_g64]
   poc32k:     [p32_dense_fa2, p32_delta_g64, p32_fixed_g256, p32_adaptive_thr60,
                p32_adaptive_thr95, p32_sparse_decode, p32_delta_dec_g16]

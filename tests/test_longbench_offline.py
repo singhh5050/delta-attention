@@ -7,8 +7,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eval.longbench_eval import (  # noqa: E402
     DECODE_ARMS, ENMC_TEMPLATE, enmc_correct_letter, f1_score,
-    GOVREPORT_TEMPLATE, normalize_answer, qa_f1_score, truncate_middle,
-    V1_TASKS,
+    FIRST_LINE_ONLY, GOVREPORT_TEMPLATE, lb_official, NO_CHAT_WRAP,
+    normalize_answer, qa_f1_score, truncate_middle, V1_FULL_EN, V1_TASKS,
 )
 
 
@@ -88,6 +88,36 @@ def test_govreport_template():
     assert "{context}" in GOVREPORT_TEMPLATE
     # rendered via .replace, so no other format fields may exist
     assert GOVREPORT_TEMPLATE.count("{") == GOVREPORT_TEMPLATE.count("{context}")
+
+
+def test_v1full_vendored_files_cover_all_tasks():
+    """The vendored THUDM/LongBench files (templates/maxlens/metrics) must
+    resolve every English task; requires jieba/fuzzywuzzy/rouge (chain setup
+    installs them before this gate runs)."""
+    prompts, maxlens, metrics = lb_official()
+    assert len(V1_FULL_EN) == 16
+    for t in V1_FULL_EN:
+        assert "{context}" in prompts[t], t
+        assert isinstance(maxlens[t], int) and maxlens[t] > 0, t
+        assert callable(metrics[t]), t
+    # protocol sets must only name real tasks (lsht is zh-only: in the
+    # official lists but never run by v1full)
+    assert NO_CHAT_WRAP - {"lsht"} <= set(V1_FULL_EN)
+    assert FIRST_LINE_ONLY - {"lsht"} <= set(V1_FULL_EN)
+    # str.format only parses the template, so brace-laden code contexts pass
+    assert "{x: 1}" in prompts["lcc"].format(context="return {x: 1}")
+
+
+def test_v1full_metric_families():
+    """One canary per metric family, scored through the OFFICIAL functions."""
+    _, _, metrics = lb_official()
+    assert metrics["passage_count"]("The final answer is: 7", "7") == 1.0
+    assert metrics["passage_retrieval_en"]("Paragraph 12", "Paragraph 12") == 1.0
+    assert metrics["trec"]("location", "location",
+                           all_classes=["location", "human"]) == 1.0
+    assert metrics["lcc"]("return x + 1", "return x + 1") == 1.0
+    assert metrics["gov_report"]("a summary", "a summary") > 0.99
+    assert metrics["hotpotqa"]("Paris", "Paris", all_classes=None) == 1.0
 
 
 def test_decode_arm_gamma_sweep():

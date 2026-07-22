@@ -65,6 +65,56 @@ V1_TASKS = {
     "multifieldqa_en": (MULTIFIELD_TEMPLATE, 64),
 }
 
+# Full English LongBench v1 (Jeff, 07-21: "maybe with all of the LongBench
+# tasks"). NOTHING here is transcribed: templates, generation lengths, and
+# metric functions load at runtime from the official THUDM/LongBench files
+# vendored verbatim in third_party/LongBench (commit pinned in
+# LongBench.lock) — the same never-reimplement pattern as ruler_client.py.
+# The only protocol facts encoded locally are the two task-name sets below,
+# which live in official control flow that cannot be imported:
+V1_FULL_EN = [  # the 16 English tasks (LongBench README, "en" column)
+    "narrativeqa", "qasper", "multifieldqa_en",          # single-doc QA
+    "hotpotqa", "2wikimqa", "musique",                   # multi-doc QA
+    "gov_report", "qmsum", "multi_news",                 # summarization
+    "trec", "triviaqa", "samsum",                        # few-shot
+    "passage_count", "passage_retrieval_en",             # synthetic
+    "lcc", "repobench-p",                                # code
+]
+# pred.py: build_chat skipped for these ("chat models are better off without
+# build prompts on these tasks") — few-shot and code completion run raw
+NO_CHAT_WRAP = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
+# eval.py scorer: prediction.lstrip('\n').split('\n')[0] applied ONLY here;
+# all other tasks score the raw generation (run_v1 above predates this and
+# takes the first line on QA tasks — v1full follows the official scorer)
+FIRST_LINE_ONLY = {"trec", "triviaqa", "samsum", "lsht"}
+
+LB_OFFICIAL_DIR = REPO_ROOT / "third_party" / "LongBench"
+
+
+@lru_cache(maxsize=None)
+def lb_official():
+    """(dataset2prompt, dataset2maxlen, dataset2metric) from the vendored
+    official files. eval.py is loaded under a private module name (our repo
+    has an eval/ package, and `eval` shadows it); its `from metrics import
+    ...` resolves against the vendored dir, which needs jieba/fuzzywuzzy/
+    rouge installed (chain setup does this for the lbfull stage)."""
+    import importlib.util
+
+    prompts = json.loads((LB_OFFICIAL_DIR / "dataset2prompt.json").read_text())
+    maxlens = json.loads((LB_OFFICIAL_DIR / "dataset2maxlen.json").read_text())
+    sys.path.insert(0, str(LB_OFFICIAL_DIR))
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_lb_official_eval", LB_OFFICIAL_DIR / "eval.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.remove(str(LB_OFFICIAL_DIR))
+    missing = [t for t in V1_FULL_EN
+               if t not in prompts or t not in maxlens or t not in mod.dataset2metric]
+    assert not missing, f"vendored LongBench files lack tasks: {missing}"
+    return prompts, maxlens, mod.dataset2metric
+
 # LongBench gov_report (dataset2prompt/dataset2maxlen: summarization, 512 new
 # tokens). Jeff's speculative-decoding probe: long natural-language generation
 # where locally-predictable tokens dominate — the regime where a sparse/delta
@@ -130,7 +180,8 @@ DECODE_ARMS = {"sparse_dec": ("sparse", None),
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--suite", choices=["v1", "v2", "enmc", "govreport", "mmlu"],
+    p.add_argument("--suite", choices=["v1", "v1full", "v2", "enmc",
+                                       "govreport", "mmlu"],
                    required=True)
     p.add_argument("--arms", type=str, default=",".join(DEFAULT_ARMS))
     p.add_argument("--n-samples", type=int, default=50)
@@ -292,11 +343,12 @@ def build_model(arm: str, gamma: int, window: int, force_dense: bool = False):
 
 
 def generate_answer(model, tokenizer, prompt: str, max_new: int,
-                    first_line_only: bool = True) -> str:
+                    first_line_only: bool = True, **gen_kwargs) -> str:
     inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     inputs = {k: v.cuda() for k, v in inputs.items()}
     with torch.no_grad():
-        ids = model.generate(**inputs, max_new_tokens=max_new, do_sample=False)
+        ids = model.generate(**inputs, max_new_tokens=max_new, do_sample=False,
+                             **gen_kwargs)
     text = tokenizer.decode(ids[0, inputs["input_ids"].size(1):],
                             skip_special_tokens=True).strip()
     # short-answer QA: first line only; summarization: keep the whole thing
@@ -347,6 +399,52 @@ def run_v1(model, tokenizer, arm: str, n: int, log, slog=None):
         log(arm, "v1", task, len(vals), scores[task])
         print(f"[lb-v1] {arm}/{task}: F1 {scores[task]:.4f} (n={len(vals)})",
               flush=True)
+    return scores
+
+
+def run_v1full(model, tokenizer, arm: str, n: int, log, slog=None):
+    """All 16 English LongBench tasks under the official protocol: vendored
+    templates/maxlens/metrics, official chat-wrap and first-line rules, and
+    pred.py's samsum eos special-case (newline as extra eos + min_length,
+    'prevent illegal output on samsum'). Scoring mirrors eval.py's scorer:
+    max over ground truths, all_classes passed through."""
+    prompts, maxlens, metrics = lb_official()
+    scores = {}
+    for task, rows in ((t, load_v1(t)[:n]) for t in V1_FULL_EN):
+        if not rows:
+            raise SystemExit(f"no samples for {task} (n={n})")
+        template, max_new, metric_fn = prompts[task], maxlens[task], metrics[task]
+        vals = []
+        for i, ex in enumerate(rows):
+            prompt = template.format(context=ex["context"], input=ex["input"])
+            prompt = truncate_middle(prompt, tokenizer, MAX_PROMPT_TOKENS)
+            if task not in NO_CHAT_WRAP:
+                prompt = chat_wrap(prompt, tokenizer)
+            extra = {}
+            if task == "samsum":
+                inp_len = len(tokenizer.encode(prompt, add_special_tokens=False))
+                extra = {"min_length": inp_len + 1,
+                         "eos_token_id": [tokenizer.eos_token_id,
+                                          tokenizer.encode("\n", add_special_tokens=False)[-1]]}
+            pred = generate_answer(model, tokenizer, prompt, max_new,
+                                   first_line_only=False, **extra)
+            scored = (pred.lstrip("\n").split("\n")[0]
+                      if task in FIRST_LINE_ONLY else pred)
+            vals.append(max(metric_fn(scored, gt,
+                                      all_classes=ex.get("all_classes"))
+                            for gt in ex["answers"]))
+            if slog:
+                slog("v1full", task, arm, i, pred[:80],
+                     " | ".join(ex["answers"])[:80], round(vals[-1], 4))
+            if i < 2:
+                print(f"[lb-full] {arm}/{task} #{i}: score {vals[-1]:.3f} "
+                      f"pred[:80]={pred[:80]!r}", flush=True)
+        scores[task] = sum(vals) / len(vals)
+        log(arm, "v1full", task, len(vals), scores[task])
+        print(f"[lb-full] {arm}/{task}: {scores[task]:.4f} (n={len(vals)})",
+              flush=True)
+    log(arm, "v1full", "MEAN", len(scores),
+        sum(scores.values()) / len(scores))
     return scores
 
 
@@ -519,6 +617,8 @@ def main():
             arm = arm + "@dense"  # label only — adapter already resolved
         if args.suite == "v1":
             run_v1(model, tokenizer, arm, args.n_samples, log, slog)
+        elif args.suite == "v1full":
+            run_v1full(model, tokenizer, arm, args.n_samples, log, slog)
         elif args.suite == "govreport":
             run_govreport(model, tokenizer, arm, args.n_samples, log, slog)
         elif args.suite == "mmlu":

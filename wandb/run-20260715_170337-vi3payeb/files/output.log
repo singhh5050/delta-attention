@@ -1,0 +1,10 @@
+Processing Files (1 / 1)      : 100%|██████████| 54.6MB / 54.6MB, 4.05MB/s  
+New Data Upload               : 100%|██████████| 54.6MB / 54.6MB, 4.05MB/s  
+  ...adapter_model.safetensors: 100%|██████████| 54.6MB / 54.6MB            
+wandb: Adding directory to artifact (/Users/harshvardhan@nvidia.com/Development/delta-attention/rescue/2026-07-15/pilot_delta_32k_gsqrt)... Done. 0.2s
+restored delta_32k_gsqrt to HF + wandb
+Processing Files (1 / 1)      : 100%|██████████| 54.6MB / 54.6MB, 3.80MB/s  
+New Data Upload               : 100%|██████████| 54.6MB / 54.6MB, 3.80MB/s  
+  ...adapter_model.safetensors: 100%|██████████| 54.6MB / 54.6MB            
+wandb: Adding directory to artifact (/Users/harshvardhan@nvidia.com/Development/delta-attention/rescue/2026-07-15/pilot_delta_32k_gsinv)... Done. 0.1s
+restored delta_32k_gsinv to HF + wandb

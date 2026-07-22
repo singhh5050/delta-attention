@@ -1,0 +1,4 @@
+repo: https://github.com/THUDM/LongBench
+commit: 2e00731f8d0bff23dc4325161044d0ed8af94c1e
+files: LongBench/config/dataset2prompt.json, LongBench/config/dataset2maxlen.json, LongBench/metrics.py, LongBench/eval.py
+fetched: 2026-07-22 (verbatim, unmodified)
