@@ -1,1 +1,4 @@
 __pycache__/
+
+# wandb run dirs are local telemetry (triple-archive goes through box_final_state artifacts, not git)
+wandb/
