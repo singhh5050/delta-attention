@@ -340,12 +340,20 @@ def main():
                       flush=True)
 
             if args.parity_check:
-                from transformers import DynamicCache
+                # THE exactness invariant of speculative greedy decoding:
+                # the output must equal PLAIN trunk greedy. Plain decode
+                # uses the same hybrid cache and the same q_len=1 kernel
+                # shapes as our verify steps, so there is no tie-flip
+                # escape hatch — any mismatch is a real loop bug. (The
+                # earlier reference, native assisted generate on an
+                # UNCAPPED cache, differed in both cache semantics and
+                # verify kernel shapes and tie-flipped at 4K; it also
+                # could not run past 8K. Review wf_4081ce31 + box-44
+                # gate failure analysis.)
                 with torch.no_grad():
                     nat = target.generate(
                         input_ids=ids, max_new_tokens=args.max_new,
-                        do_sample=False, assistant_model=assistant,
-                        past_key_values=DynamicCache())
+                        do_sample=False)
                 nat_new = nat[0, ids.shape[1]:].tolist()
                 if ref_tokens is None:
                     raise SystemExit(
@@ -358,7 +366,7 @@ def main():
                         break
                     m += 1
                 full_match = (m == min(len(nat_new), len(ref_tokens)))
-                print(f"[g1] parity vs native: prefix {m}/"
+                print(f"[g1] parity vs plain-greedy: prefix {m}/"
                       f"{min(len(nat_new), len(ref_tokens))}"
                       f"{' (full common prefix)' if full_match else ''}",
                       flush=True)
@@ -367,8 +375,8 @@ def main():
                 # eos) is perfect parity, not a failure
                 if not full_match and m < min(24, args.max_new // 2):
                     raise SystemExit(
-                        "G1 GATE FAILED: our loop diverges from native "
-                        f"assisted decoding at token {m} — loop bug")
+                        "G1 GATE FAILED: our loop diverges from PLAIN trunk "
+                        f"greedy at token {m} — loop bug")
     fh.close()
     run.finish()
     print("[g1] DONE", flush=True)
