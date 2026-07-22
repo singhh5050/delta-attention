@@ -437,6 +437,30 @@ def bench_seq_len(s, warmup, iters, rows, run):
          note="no-grad fwd, GQA-native sparse"
               + (f", {HC} head chunks" if needs_hc else ""))
 
+    def infer_delta_flexrow_lowmem():
+        # no_grad-only in-place composition in the flex-native (1,H,s,D)
+        # layout (transposing first would make reshape a silent 8.5GB
+        # copy): correction added directly into the sparse buffer, tail
+        # rows overwritten — no `corrected` clone, no cat output (each
+        # ~8.5GB at 1M; the 07-22 box-40 run showed the out-of-place
+        # variant is OOM-marginal there). Same math as delta_compose;
+        # output layout differs (head-major) which is timing-irrelevant.
+        sparse = (flex_hc(q, k8, v8, bm, enable_gqa=True) if needs_hc
+                  else _get_flex()(q, k8, v8, block_mask=bm, scale=scaling,
+                                   enable_gqa=True))  # (1, H, s, D)
+        dsel = _get_flex()(q[:, :, sel], k8, v8, block_mask=bm_row,
+                           scale=scaling, enable_gqa=True)  # (1, H, n_sel, D)
+        n_a = idx.numel()
+        delta = dsel[:, :, :n_a] - sparse[:, :, idx_dev]
+        sparse[:, :, :s_p].reshape(1, H_Q, n_a, GAMMA, D)[:] += \
+            delta.reshape(1, H_Q, n_a, 1, D)
+        sparse[:, :, s_p:] = dsel[:, :, n_a:]
+        return sparse
+    if needs_hc:  # only worth timing where the out-of-place variant is
+        cell("infer-delta-flexrow-lowmem",  # OOM-marginal
+             nograd(infer_delta_flexrow_lowmem), None, backward=False,
+             note="no-grad fwd, in-place correction (same math, no clones)")
+
     if needs_hc:
         # ---- fwd+bwd at lengths where no monolithic graph fits: backward
         # per head group, so only one group's graph is alive at a time.
