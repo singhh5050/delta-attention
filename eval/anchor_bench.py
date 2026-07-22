@@ -56,6 +56,7 @@ from torch.nn.attention.flex_attention import create_block_mask  # noqa: E402
 SINK, WINDOW, GAMMA = 1024, 2048, 64
 H_Q, H_KV, D = 32, 8, 128  # Llama-3.1-8B geometry
 _HC_CERTIFIED = False  # flex_hc parity cert ran in THIS process
+SKIP_CELLS = ()  # label prefixes skipped via --skip (rows say SKIPPED)
 
 
 def gpu_state():
@@ -153,6 +154,18 @@ def bench_seq_len(s, warmup, iters, rows, run):
 
     def cell(label, fn, out_shape, backward=True, expect_raise=False,
              note="", self_backward=False):
+        if any(label.startswith(sk) for sk in SKIP_CELLS):
+            # e.g. anchor-masked at 1M: its mem-efficient backward hits an
+            # ILLEGAL MEMORY ACCESS under expandable_segments (07-22 box
+            # 41), which poisons the CUDA context for every later cell —
+            # unrecoverable in-process, so known-fatal cells are skipped
+            # by flag and documented as rows (their clean OOM rows exist
+            # from the box-40 run without expandable_segments)
+            rows.append([label, s, "per-layer-fwd", "SKIPPED", "",
+                         "skipped via --skip (known-fatal at this config)"])
+            print(f"[anchorbench] {label:18s} s={s:>7} SKIPPED (--skip)",
+                  flush=True)
+            return
         try:
             if self_backward:  # fn runs fwd+bwd internally (chunked bwd)
                 fb = timed_self(fn, warmup, iters, leaves)
@@ -537,7 +550,12 @@ def main():
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=8)
     p.add_argument("--out", type=str, default="results/anchorbench.csv")
+    p.add_argument("--skip", type=str, default="",
+                   help="comma list of cell-label prefixes to skip "
+                        "(recorded as SKIPPED rows)")
     args = p.parse_args()
+    global SKIP_CELLS
+    SKIP_CELLS = tuple(x.strip() for x in args.skip.split(",") if x.strip())
 
     import wandb
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),
