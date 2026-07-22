@@ -56,6 +56,7 @@ from torch.nn.attention.flex_attention import create_block_mask  # noqa: E402
 SINK, WINDOW, GAMMA = 1024, 2048, 64
 H_Q, H_KV, D = 32, 8, 128  # Llama-3.1-8B geometry
 _HC_CERTIFIED = False  # flex_hc parity cert ran in THIS process
+_ANCHOR_CERTIFIED = False  # flexrow-vs-masked anchor cert ran in THIS process
 SKIP_CELLS = ()  # EXACT cell labels skipped via --skip (rows say SKIPPED)
 # every cell label that can appear, for --skip validation: a typo'd entry
 # silently no-ops and the known-fatal cell it meant to skip executes
@@ -345,6 +346,39 @@ def bench_seq_len(s, warmup, iters, rows, run):
     bm_row = create_block_mask(flexrow_mask, B=None, H=None,
                                Q_LEN=n_sel, KV_LEN=s, device=dev,
                                _compile=True)
+
+    global _ANCHOR_CERTIFIED
+    if (not _ANCHOR_CERTIFIED
+            and not any(lbl in SKIP_CELLS
+                        for lbl in ("anchor-masked", "anchor-flexrow"))):
+        # once-per-process numeric certification that the FLEXROW anchor
+        # branch computes the SAME rows as the production masked-SDPA
+        # anchor branch — the "same math" claim behind every flexrow
+        # speed number was previously by-construction only. Runs at the
+        # smallest length where masked SDPA fits (it ran clean at 131K).
+        try:
+            with torch.no_grad():
+                ref_rows = masked_anchor()
+                fx_rows = _get_flex()(q[:, :, sel], k8, v8,
+                                      block_mask=bm_row, scale=scaling,
+                                      enable_gqa=True)
+                md = (ref_rows - fx_rows).abs().max().item()
+            assert md < 2e-2, \
+                f"flexrow-vs-masked anchor parity FAILED: maxdiff {md}"
+            print(f"[anchorbench] flexrow-vs-masked anchor parity OK "
+                  f"(maxdiff {md:.2e})", flush=True)
+            rows.append(["hc-parity-cert", s, "per-layer-fwd", "", "",
+                         f"flexrow==masked anchor maxdiff {md:.2e}"])
+            _ANCHOR_CERTIFIED = True
+            torch.cuda.empty_cache()
+        except torch.cuda.OutOfMemoryError:
+            # masked reference too big at this length; try again at the
+            # next length (long-only ladders may never certify — the
+            # UNCERTIFIED hc row already flags that situation)
+            print(f"[anchorbench] anchor parity cert OOM at s={s} — "
+                  "deferred to a smaller-length run", flush=True)
+            torch.cuda.empty_cache()
+
     cell("anchor-flexrow",
          lambda: _get_flex()(q[:, :, sel], k8, v8, block_mask=bm_row,
                              scale=scaling, enable_gqa=True),
