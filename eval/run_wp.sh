@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""; MTPA=""; SWABENCH=""; MIMO=""; ANCHORBENCH=""; EVALGAPS=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""; MTPA=""; SWABENCH=""; MIMO=""; ANCHORBENCH=""; EVALGAPS=""; GEMMA4=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -147,6 +147,9 @@ case "$WP" in
   # 32K-trained arms + RULER on the same arms (both firsts — V1 ran 4 QA
   # tasks; trained-arm RULER was 8K-era t2eval only)
   evalgaps) TESTS="tests/test_longbench_offline.py"; EVALGAPS=1 ;;
+  # Gemma 4 native MTP drafter G0 (docs/gemma4_mtp_plan.md): isolated
+  # transformers-MAIN venv; the delta stack never loads in that process
+  gemma4) TESTS=""; GEMMA4=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -1047,6 +1050,36 @@ if [ -n "$EVALGAPS" ]; then
     --out results/lbfull.csv \
     || { stage "lbfull:FAILED"; exit 1; }
   stage "lbfull:PASS"
+fi
+
+if [ -n "$GEMMA4" ]; then
+  export CUDA_VISIBLE_DEVICES=0
+  gpu_preflight "g4-gpupreflight"
+  # isolated venv: gemma4/gemma4_assistant live only in transformers MAIN,
+  # which must never touch the pinned production venv
+  stage "g4-venv:running"
+  G4PY="$PWD/.venv-g4/bin/python"
+  python3 -m venv .venv-g4 \
+    && "$G4PY" -m pip install -q --upgrade pip \
+    && "$G4PY" -m pip install -q torch==2.8.0 \
+    && "$G4PY" -m pip install -q \
+         "git+https://github.com/huggingface/transformers" \
+         datasets accelerate wandb sentencepiece protobuf \
+    && "$G4PY" -c "from transformers import Gemma4AssistantForCausalLM; print('gemma4_assistant import OK')" \
+    || { stage "g4-venv:FAILED"; exit 1; }
+  stage "g4-venv:PASS"
+  # smoke gate BEFORE the tier sweep: parity between plain and assisted
+  # greedy is the wiring certification (assisted greedy is exact)
+  stage "g4-smoke:running"
+  "$G4PY" eval/gemma4_mtp_eval.py --n 2 --tiers 4096 --max-new 64 \
+    --min-parity-prefix 24 --out results/g4_smoke.csv \
+    || { stage "g4-smoke:FAILED"; exit 1; }
+  stage "g4-smoke:PASS"
+  stage "g4-tiers:running"
+  "$G4PY" eval/gemma4_mtp_eval.py --n 10 --tiers 4096,16384,32768,65536 \
+    --max-new 256 --out results/g4_tiers.csv \
+    || { stage "g4-tiers:FAILED"; exit 1; }
+  stage "g4-tiers:PASS"
 fi
 
 stage "ALL-DONE"
