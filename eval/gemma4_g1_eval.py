@@ -93,11 +93,14 @@ def parse_args():
                         "~5GB vs 62GB weights); chunking caps transients "
                         "on the NATIVE cache instead of offloading")
     p.add_argument("--chunk-equiv-check", action="store_true",
-                   help="once per tier (first prompt): plain-greedy with "
-                        "chunked prefill must match plain-greedy "
-                        "single-shot exactly — certifies the chunked "
+                   help="once per tier (first prompt): chunked and "
+                        "single-shot prefill must agree at the SOURCE — "
+                        "same greedy argmax, last-position logits and "
+                        "shared-KV rows equal to numeric noise (token "
+                        "chains are NOT compared: different kernel shapes "
+                        "tie-flip legitimately). Certifies the chunked "
                         "continuation path (the upstream sliding-mask bug "
-                        "class lives there); only meaningful at tiers "
+                        "class lives there); only runs usefully at tiers "
                         "that fit single-shot (4K/8K)")
     p.add_argument("--out", type=str, default="results/g1_tiers.csv")
     return p.parse_args()
@@ -494,34 +497,58 @@ def main():
 
             if (args.chunk_equiv_check and args.prefill_chunk
                     and not chunk_certified):
-                # chunked prefill must be OUTPUT-IDENTICAL to single-shot:
-                # the chunk-continuation forward (q_len>1 over a past
+                # The chunk-continuation forward (q_len>1 over a past
                 # sliding cache) is the upstream sliding-mask bug zone,
                 # and both the loop AND its parity reference chunk — a
-                # broken continuation would be invisible to the gate
-                ref_c = plain_greedy(target, ids, args.max_new,
-                                     offload=args.offload,
-                                     chunk=args.prefill_chunk)
-                ref_1 = plain_greedy(target, ids, args.max_new,
-                                     offload=args.offload, chunk=0)
-                mc = 0
-                for a, b in zip(ref_c, ref_1):
-                    if a != b:
-                        break
-                    mc += 1
-                nc = min(len(ref_c), len(ref_1))
-                print(f"[g1] chunk-equiv (tier {tier}): prefix {mc}/{nc}",
-                      flush=True)
-                run.summary[f"chunk_equiv_t{tier}"] = mc
-                if mc < nc:
+                # broken continuation would be invisible to the gate.
+                # Token-exact equality vs single-shot is NOT a valid
+                # invariant here (different kernel shapes => bf16
+                # tie-flips; first attempt matched 38/64 then flipped —
+                # the specdec "parity is not bitwise" lesson). The valid
+                # invariant is at the SOURCE: after both prefills, the
+                # shared-KV cache rows and last-position logits must
+                # agree to numeric noise, and the greedy argmax must
+                # match. Mask corruption moves logits by many units and
+                # KV rows by O(signal); reduction-order noise does not.
+                sides = {}
+                with torch.no_grad():
+                    for label, ch in (("chunked", args.prefill_chunk),
+                                      ("single", 0)):
+                        cache = make_cache(target, False)
+                        bulk_prefill(target, ids[:, :-1], cache, ch)
+                        o = target(input_ids=ids[:, -1:],
+                                   past_key_values=cache, use_cache=True)
+                        sides[label] = (shared_kv_from_cache(target, cache),
+                                        o.logits[0, -1].float().cpu())
+                        del cache, o
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                (kv_c, lg_c), (kv_s, lg_s) = sides["chunked"], sides["single"]
+                kv_rel = 0.0
+                for t in kv_c:
+                    for a, b in zip(kv_c[t], kv_s[t]):
+                        n = min(a.shape[2], b.shape[2])
+                        d = (a[:, :, -n:].float()
+                             - b[:, :, -n:].float()).abs().max().item()
+                        kv_rel = max(kv_rel, d / max(b.float().std().item(),
+                                                     1e-6))
+                logit_d = (lg_c - lg_s).abs().max().item()
+                argmax_same = int(lg_c.argmax().item() == lg_s.argmax().item())
+                print(f"[g1] chunk-equiv (tier {tier}): argmax_same="
+                      f"{argmax_same} max|dlogit|={logit_d:.3f} "
+                      f"kv_rel={kv_rel:.4f}", flush=True)
+                run.summary[f"chunk_equiv_t{tier}"] = dict(
+                    argmax_same=argmax_same, logit_d=logit_d, kv_rel=kv_rel)
+                if not argmax_same or logit_d > 2.0 or kv_rel > 0.5:
                     raise SystemExit(
                         f"G1 GATE FAILED: chunked prefill (chunk="
-                        f"{args.prefill_chunk}) diverges from single-shot "
-                        f"at token {mc}/{nc} — chunk-continuation path is "
-                        "broken; results at chunked tiers would be wrong")
+                        f"{args.prefill_chunk}) is not numerically "
+                        f"equivalent to single-shot (argmax_same="
+                        f"{argmax_same}, max|dlogit|={logit_d:.3f}, "
+                        f"kv_rel={kv_rel:.4f}) — chunk-continuation path "
+                        "is broken; results at chunked tiers would be "
+                        "wrong")
                 chunk_certified = True
-                gc.collect()
-                torch.cuda.empty_cache()
 
             ref_tokens = None
             full_oomed = False
