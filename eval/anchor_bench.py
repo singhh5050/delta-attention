@@ -104,6 +104,12 @@ def timed(fn, out_shape, warmup, iters, leaves, backward=True):
 
 def bench_seq_len(s, warmup, iters, rows, run):
     assert s % Q_BLOCK == 0
+    # long-ladder cells cost seconds per iteration — scale counts so 1M
+    # doesn't run for hours (Jeff's ask is the curve, not 20 replicates)
+    if s >= 524288:
+        warmup, iters = min(warmup, 3), min(iters, 3)
+    elif s >= 131072:
+        warmup, iters = min(warmup, 4), min(iters, 6)
     dev, dt = "cuda", torch.bfloat16
     q = torch.randn(1, H_Q, s, D, device=dev, dtype=dt, requires_grad=True)
     k8 = torch.randn(1, H_KV, s, D, device=dev, dtype=dt, requires_grad=True)
@@ -243,6 +249,41 @@ def bench_seq_len(s, warmup, iters, rows, run):
                  scale=scaling, enable_gqa=True),
              (1, H_Q, 1, D), backward=False,
              note=f"amortized = ({GAMMA-1}*this + headread-dense)/{GAMMA}")
+
+    # ---- WHOLE-FUNCTION cells (Jeff 07-21: "init random inputs and call
+    # this one function with fwd/bwd"). full-delta-current = production
+    # delta_forward_train verbatim; its OOM at long lengths is itself the
+    # result (mask + expansion + scores). full-delta-flexrow = the same
+    # math with the anchor branch reformulated (gathered rows, GQA-native,
+    # prefixes via block mask) and in-graph expansion only for the sparse
+    # branch. full-dense = FA2-class causal reference via sdpa.
+    from delta_attention.train.flex_delta import delta_forward_train
+
+    cell("full-delta-current",
+         lambda: delta_forward_train(q, k8, v8, gamma=GAMMA, window=WINDOW,
+                                     sink=SINK),
+         (1, s, H_Q, D), note="production composition, verbatim")
+
+    def full_delta_flexrow():
+        kr = k8.repeat_interleave(rep, dim=1)
+        vr = v8.repeat_interleave(rep, dim=1)
+        sparse = _get_flex()(q, kr, vr, block_mask=bm, scale=scaling)
+        sparse = sparse.transpose(1, 2)
+        dense_sel = _get_flex()(q[:, :, sel], k8, v8, block_mask=bm_row,
+                                scale=scaling, enable_gqa=True)             .transpose(1, 2)
+        n_a = idx.numel()
+        delta = dense_sel[:, :n_a] - sparse[:, idx_dev]
+        corrected = (sparse[:, :s_p].reshape(1, n_a, GAMMA, H_Q, D)
+                     + delta.reshape(1, n_a, 1, H_Q, D))             .reshape(1, s_p, H_Q, D)
+        return torch.cat((corrected, dense_sel[:, n_a:]), dim=1)
+    cell("full-delta-flexrow", full_delta_flexrow, (1, s, H_Q, D),
+         note="anchor branch reformulated (flexrow), same math")
+
+    cell("full-dense",
+         lambda: F.scaled_dot_product_attention(
+             q, k8, v8, is_causal=True, scale=scaling,
+             enable_gqa=True).transpose(1, 2),
+         (1, s, H_Q, D), note="causal dense reference")
 
     del q, k8, v8, sparse_out, anchor_out, q1
     gc.collect()
