@@ -92,10 +92,20 @@ def test_chunks(tokenizer, seq_len, n, source="pg19"):
 
 @torch.no_grad()
 def pipeline_ppl(model, chunks):
+    """CE via the chunked fused-lm_head path (mathematically identical to
+    the labels= path — validated by train_delta's startup checks — but
+    never materializes full-vocab logits: the labels= path allocates
+    seq x vocab fp32, ~19GB for a 152K vocab at 32K, which OOM'd the
+    Qwen3-14B eval on 07-22 AFTER both paid trainings completed)."""
+    from delta_attention.train.train_delta import chunked_ce_hidden
+
+    setattr(model, "no_lm_head", True)  # forward returns hidden states
+    lm_w = model.lm_head.weight
     losses = []
     for ids in chunks:
-        out = model(input_ids=ids.cuda(), labels=ids.cuda(), use_cache=False)
-        losses.append(out.loss.item())
+        ids = ids.cuda()
+        hidden = model(input_ids=ids, use_cache=False).logits
+        losses.append(chunked_ce_hidden(hidden, lm_w, ids).item())
     mean = sum(losses) / len(losses)
     return mean, math.exp(mean), losses
 
