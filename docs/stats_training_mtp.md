@@ -384,7 +384,7 @@ validated at 131K where both exist: 430.0 vs 432.5, <1% apart):
 | dense           | 432.5 | 1761.0 | 7128.0 | 29004.6 |
 | delta (current) | 63.2  | 188.2  | int32  | —       |
 | delta (flexrow) | 30.3  | 78.8   | 202.6  | 612.5   |
-| ratio (flexrow) | 14.3x | 22.3x  | 35.2x  | 47.3x   |
+| ratio (flexrow) | 14.3x | 22.3x  | 35.2x  | 47.4x   |
 
 - THE 1M point Jeff asked for: 612.5ms (flexrow, 4 head chunks) and
   600.8ms (lowmem in-place variant — independent implementation, same
