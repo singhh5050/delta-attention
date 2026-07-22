@@ -1102,7 +1102,7 @@ if [ -n "$GEMMA4G1" ]; then
   # gate: OUR loop with the untouched-KV arm must reproduce native
   # assisted decoding token-for-token (min prefix) before any arm runs
   stage "g1-smoke:running"
-  "$G4PY" eval/gemma4_g1_eval.py --n 2 --tiers 4096 --max-new 64 \
+  "$G4PY" eval/gemma4_g1_eval.py --n 2 --tiers 4096,8192 --max-new 64 \
     --arms full --parity-check --out results/g1_smoke.csv \
     || { stage "g1-smoke:FAILED"; exit 1; }
   stage "g1-smoke:PASS"

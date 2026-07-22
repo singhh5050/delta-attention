@@ -81,8 +81,9 @@ def load_contexts(tokenizer, n, max_ctx_tokens):
     out = []
     for doc in ds:
         ids = tokenizer.encode(doc["text"], add_special_tokens=False)
-        if len(ids) < max_ctx_tokens // 2:
-            continue
+        if len(ids) < max_ctx_tokens:
+            continue  # tier label must equal actual prompt length
+            # (review wf_4081ce31: >=tier/2 let ~33K docs into the 64K tier)
         out.append(tokenizer.decode(ids[:max_ctx_tokens],
                                     skip_special_tokens=True))
         if len(out) == n:
@@ -91,19 +92,18 @@ def load_contexts(tokenizer, n, max_ctx_tokens):
                      f"{max_ctx_tokens}")
 
 
-def crop_kv(kv, length):
-    return {k: (v[0][:, :, :length, :], v[1][:, :, :length, :])
-            for k, v in kv.items()}
-
-
 def arm_view(kv, arm, call_idx):
-    """The intervention: how THIS drafter call sees the trunk KV.
-    kv is already cropped to the validated prefix."""
+    """The intervention: how THIS drafter call sees the trunk KV (already
+    exactly the validated prefix). call_idx is GLOBAL across rounds
+    (review wf_4081ce31: a per-round index made the first call of every
+    round a full read — delta2 was 60% full reads and any N>k collapsed
+    to the same arm). deltaN = full read on every N-th drafter call over
+    the whole generation, 1/N full-read fraction."""
     if arm == "full":
         return kv
     if arm.startswith("delta"):
         n = int(arm[len("delta"):])
-        if call_idx % n == 0:  # anchor-refresh call reads everything
+        if call_idx % n == n - 1:  # every N-th call reads everything
             return kv
     k, v = kv["full_attention"]
     L = k.shape[2]
@@ -172,25 +172,30 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
 
     rounds = drafted = accepted = bonus_ct = 0
     call_ms = []
+    g_call = 0  # global drafter-call counter (deltaN cadence)
     while len(validated) - ids.shape[1] < max_new:
         L = len(validated)
-        # kv covers exactly the L-1 trunk-forwarded tokens (see docstring
-        # for the deliberate 1-row deviation from the native slice)
-        kv_c = crop_kv(kv, L - 1)
+        # kv from the last 1-token forward covers EXACTLY the L-1
+        # trunk-forwarded tokens (sequential verify never forwards a
+        # rejected draft) — no cropping exists or is needed; see the
+        # docstring for the deliberate 1-row deviation from native
+        kv_c = kv
         last_tok = torch.tensor([[newest]], device=dev)
         pos = torch.tensor([[L - 1]], dtype=torch.long, device=dev)
         drafts = []
         h = last_hidden
         t = last_tok
         for c in range(k_drafts):
+            _st("draft_call")
             emb = embed(t)
             inp = torch.cat([emb, h], dim=-1)
-            _st("draft_call")
+            view = arm_view(kv_c, arm, g_call)  # OUTSIDE the timed window
+            g_call += 1                         # (review wf_4081ce31)
             torch.cuda.synchronize()
             tt0 = time.monotonic()
             o = assistant(inputs_embeds=inp, attention_mask=None,
                           position_ids=pos,
-                          shared_kv_states=arm_view(kv_c, arm, c),
+                          shared_kv_states=view,
                           use_cache=False)
             torch.cuda.synchronize()
             call_ms.append((time.monotonic() - tt0) * 1000)
@@ -300,12 +305,29 @@ def main():
                         traceback.print_exc()
                         print(torch.cuda.memory_summary(abbreviated=True),
                               flush=True)
+                    oomed = True
+                else:
+                    oomed = False
+                if oomed:
+                    # empty_cache INSIDE the handler ran while the live
+                    # exception still pinned run_arm's multi-GB locals —
+                    # cleanup only works after the frame is released
+                    import gc
+                    gc.collect()
                     torch.cuda.empty_cache()
                     continue
                 if arm == "full":
                     ref_tokens = r["tokens"]
-                match = ("" if ref_tokens is None or arm == "full"
-                         else int(r["tokens"] == ref_tokens))
+                # every validated token is a trunk argmax, so all arms
+                # must share a common prefix BY CONSTRUCTION — this
+                # column is a bug invariant, not an output-quality
+                # metric (review wf_4081ce31; lengths differ benignly
+                # with round-boundary overshoot)
+                if ref_tokens is None or arm == "full":
+                    match = ""
+                else:
+                    m = min(len(r["tokens"]), len(ref_tokens))
+                    match = int(r["tokens"][:m] == ref_tokens[:m])
                 apr = r["accepted"] / max(r["rounds"], 1)
                 rate = r["accepted"] / max(r["drafted"], 1)
                 w.writerow([tier, i, arm, ids.shape[1], r["rounds"],
@@ -325,16 +347,25 @@ def main():
                         do_sample=False, assistant_model=assistant,
                         past_key_values=DynamicCache())
                 nat_new = nat[0, ids.shape[1]:].tolist()
+                if ref_tokens is None:
+                    raise SystemExit(
+                        "G1 GATE MISCONFIGURED: --parity-check needs a "
+                        "successful 'full' arm run (it OOM'd or --arms "
+                        "omits it) — cannot certify")
                 m = 0
-                for a, b in zip(nat_new, ref_tokens or []):
+                for a, b in zip(nat_new, ref_tokens):
                     if a != b:
                         break
                     m += 1
+                full_match = (m == min(len(nat_new), len(ref_tokens)))
                 print(f"[g1] parity vs native: prefix {m}/"
-                      f"{min(len(nat_new), len(ref_tokens or []))}",
+                      f"{min(len(nat_new), len(ref_tokens))}"
+                      f"{' (full common prefix)' if full_match else ''}",
                       flush=True)
                 run.summary[f"parity_prefix_t{tier}_p{i}"] = m
-                if m < min(24, args.max_new // 2):
+                # a short native output that matches END TO END (early
+                # eos) is perfect parity, not a failure
+                if not full_match and m < min(24, args.max_new // 2):
                     raise SystemExit(
                         "G1 GATE FAILED: our loop diverges from native "
                         f"assisted decoding at token {m} — loop bug")
