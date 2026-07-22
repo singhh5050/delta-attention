@@ -129,16 +129,25 @@ def _st(s):
 def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
     """Our draft-verify loop. Returns per-prompt stats dict.
 
-    Cache invariant: the trunk DynamicCache holds the validated prefix
-    EXCLUDING the newest validated token; each verify forward feeds
-    [newest_validated, d1..dK], so logits[i] checks draft i+1 and
-    hidden[j] is the hidden of the last validated token when j drafts
-    match (mirrors the native generator's n_last_matches indexing).
+    Cache invariant: the trunk cache holds the validated prefix EXCLUDING
+    the newest validated token. VERIFY IS SEQUENTIAL (one token per
+    forward): q_len=1 never triggers the upstream sliding-mask/shared-KV
+    length bug, so the trunk runs on its NATIVE hybrid cache
+    (DynamicCache(config=...), window-capped sliding layers — the
+    uncapped-cache workaround was what OOM'd the trunk prefill at >=16K
+    on box 43), and stopping at the first mismatch removes cache
+    cropping entirely. KNOWN 1-ROW DEVIATION from native: the native
+    generator's KV slice exposes the rejected draft's KV at the bonus
+    position (we never forward rejected drafts); the parity gate
+    measures whether that row ever matters.
     """
     from transformers import DynamicCache
 
     dev = ids.device
-    cache = DynamicCache()
+    try:
+        cache = DynamicCache(config=target.config)
+    except TypeError:  # older cache API
+        cache = DynamicCache(config=target.config.get_text_config())
     # two-step prefill: output_hidden_states over the whole prompt would
     # materialize every layer's hidden (~22GB at 32K x 63 layers); we only
     # need the LAST position's hidden, so the bulk runs without it and a
@@ -165,14 +174,9 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
     call_ms = []
     while len(validated) - ids.shape[1] < max_new:
         L = len(validated)
-        # NATIVE-EXACT crop: the generator slices KV to current_length =
-        # len(validated INCLUDING the bonus token), even though the trunk
-        # never forwarded the bonus — so the row at the bonus position is
-        # the REJECTED draft's KV (or absent when all drafts matched:
-        # slicing past the end just returns what exists). Deliberately
-        # replicated, staleness and all, so the full arm is bit-comparable
-        # to native assisted decoding (the parity gate depends on it).
-        kv_c = crop_kv(kv, L)
+        # kv covers exactly the L-1 trunk-forwarded tokens (see docstring
+        # for the deliberate 1-row deviation from the native slice)
+        kv_c = crop_kv(kv, L - 1)
         last_tok = torch.tensor([[newest]], device=dev)
         pos = torch.tensor([[L - 1]], dtype=torch.long, device=dev)
         drafts = []
@@ -196,29 +200,38 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
         rounds += 1
         drafted += len(drafts)
 
-        # trunk verifies [newest, d1..dK]
-        _st("verify")
-        vin = torch.tensor([[newest] + drafts], device=dev)
-        vout = target(input_ids=vin, past_key_values=cache, use_cache=True,
-                      output_hidden_states=True,
-                      return_shared_kv_states=True)
-        vlogits = vout.logits[0]  # (K+1, vocab)
+        # SEQUENTIAL verify: forward one validated token at a time; stop
+        # before ever forwarding a rejected draft (cache stays clean)
         n_match = 0
-        for j, d in enumerate(drafts):
-            if int(vlogits[j].argmax(-1).item()) == d:
+        cur = newest
+        for d in drafts:
+            _st("verify_step")
+            vout = target(input_ids=torch.tensor([[cur]], device=dev),
+                          past_key_values=cache, use_cache=True,
+                          output_hidden_states=True,
+                          return_shared_kv_states=True)
+            nxt = int(vout.logits[0, -1].argmax(-1).item())
+            last_hidden = vout.hidden_states[-1][:, -1:]
+            kv = vout.shared_kv_states
+            if nxt == d:
                 n_match += 1
+                cur = d
             else:
+                bonus = nxt
                 break
+        else:  # every draft matched: one more step for the bonus
+            _st("verify_step")
+            vout = target(input_ids=torch.tensor([[cur]], device=dev),
+                          past_key_values=cache, use_cache=True,
+                          output_hidden_states=True,
+                          return_shared_kv_states=True)
+            bonus = int(vout.logits[0, -1].argmax(-1).item())
+            last_hidden = vout.hidden_states[-1][:, -1:]
+            kv = vout.shared_kv_states
         accepted += n_match
-        b = int(vlogits[n_match].argmax(-1).item())
         bonus_ct += 1
-        validated.extend(drafts[:n_match] + [b])
-        newest = b
-        last_hidden = vout.hidden_states[-1][:, n_match:n_match + 1]
-        kv = vout.shared_kv_states
-        # cache now holds old + K+1 tokens; keep only old + newest_prev +
-        # accepted drafts (the invariant: exclude the NEW newest = bonus)
-        cache.crop(len(validated) - 1)
+        validated.extend(drafts[:n_match] + [bonus])
+        newest = bonus
 
     new_tokens = validated[ids.shape[1]:]
     return dict(rounds=rounds, drafted=drafted, accepted=accepted,
