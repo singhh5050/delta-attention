@@ -10,7 +10,7 @@ set -uo pipefail
 WP="${1:?usage: run_wp.sh <mode>}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""; MTPA=""; SWABENCH=""; MIMO=""; ANCHORBENCH=""; EVALGAPS=""; GEMMA4=""
+SMOKE=""; SMOKE_RAW=""; TESTS=""; TRAIN=""; PROBE=""; PILOT=""; ARM=""; T2EVAL=""; LONGBENCH=""; PPL32K=""; GAP=""; TRAIN32K=""; DISTILL=""; ENMC=""; DISTILL2=""; SPECDEC=""; DISTILL3=""; BENCH32K=""; MMLU=""; GRADSCALE=""; SEEDS32K=""; SEEDSDISTILL=""; SPECDEC2=""; SPECDEC3=""; SDTIMING=""; TRIAD=""; TRAINBENCH=""; MODEL2=""; MTPA=""; SWABENCH=""; MIMO=""; ANCHORBENCH=""; EVALGAPS=""; GEMMA4=""; GEMMA4G1=""
 STATUS=~/wp_status
 stage() { echo "$(date -u '+%H:%M:%S') $1" >> "$STATUS"; echo; echo "=== WP: $1 ==="; }
 : > "$STATUS"
@@ -150,6 +150,9 @@ case "$WP" in
   # Gemma 4 native MTP drafter G0 (docs/gemma4_mtp_plan.md): isolated
   # transformers-MAIN venv; the delta stack never loads in that process
   gemma4) TESTS=""; GEMMA4=1 ;;
+  # G1: delta-read the native Gemma 4 drafter via our own draft-verify
+  # loop (the shared_kv_states dict is the intervention point)
+  gemma4g1) TESTS=""; GEMMA4G1=1 ;;
   *) stage "unknown-wp:FAILED"; exit 1 ;;
 esac
 
@@ -1080,6 +1083,35 @@ if [ -n "$GEMMA4" ]; then
     --max-new 256 --out results/g4_tiers.csv \
     || { stage "g4-tiers:FAILED"; exit 1; }
   stage "g4-tiers:PASS"
+fi
+
+if [ -n "$GEMMA4G1" ]; then
+  export CUDA_VISIBLE_DEVICES=0
+  gpu_preflight "g1-gpupreflight"
+  stage "g1-venv:running"
+  G4PY="$PWD/.venv-g4/bin/python"
+  python3 -m venv .venv-g4 \
+    && "$G4PY" -m pip install -q --upgrade pip \
+    && "$G4PY" -m pip install -q torch==2.8.0 \
+    && "$G4PY" -m pip install -q \
+         "git+https://github.com/huggingface/transformers" \
+         datasets accelerate wandb sentencepiece protobuf \
+    && "$G4PY" -c "from transformers import Gemma4AssistantForCausalLM; print('gemma4_assistant import OK')" \
+    || { stage "g1-venv:FAILED"; exit 1; }
+  stage "g1-venv:PASS"
+  # gate: OUR loop with the untouched-KV arm must reproduce native
+  # assisted decoding token-for-token (min prefix) before any arm runs
+  stage "g1-smoke:running"
+  "$G4PY" eval/gemma4_g1_eval.py --n 2 --tiers 4096 --max-new 64 \
+    --arms full --parity-check --out results/g1_smoke.csv \
+    || { stage "g1-smoke:FAILED"; exit 1; }
+  stage "g1-smoke:PASS"
+  stage "g1-arms:running"
+  "$G4PY" eval/gemma4_g1_eval.py --n 8 --tiers 4096,16384,32768 \
+    --max-new 128 --k 5 --arms full,sparse,delta2,delta4 \
+    --out results/g1_tiers.csv \
+    || { stage "g1-arms:FAILED"; exit 1; }
+  stage "g1-arms:PASS"
 fi
 
 stage "ALL-DONE"
