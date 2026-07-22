@@ -130,10 +130,13 @@ def shared_kv_from_cache(target, cache):
     which the cache still holds — so read them out-of-band instead."""
     torch.cuda.synchronize()  # offload D2H copies run on a side stream
     mdl = target
-    for _ in range(4):  # unwrap ForCausalLM/ForConditionalGeneration shells
+    for _ in range(4):  # unwrap ForCausalLM/multimodal shells to the decoder
         if hasattr(mdl, "layers"):
             break
-        mdl = mdl.model
+        mdl = (mdl.language_model if hasattr(mdl, "language_model")
+               else mdl.model)
+    else:
+        raise SystemExit("shared_kv_from_cache: no decoder .layers found")
     out = {}
     for i, layer in enumerate(mdl.layers):
         attn = layer.self_attn
