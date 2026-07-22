@@ -331,3 +331,37 @@ Short ladder (8K / 32K), fwd+bwd ms unless noted:
   32 heads exceeds 2^31 elements per tensor -> RAISED-64BIT recorded as
   the production formulation's per-GPU cap; head-chunked -hc4 cells
   (1895aad) carry the delta curve to 1M.
+
+### T2. Long ladder DEFINITIVE (07-22, box 39, run n6qht8yh @ 1895aad;
+### CSV + logs: rescue/2026-07-22-anchorbench/final/ + box_final_state
+### artifact @ run rys676u0)
+
+Whole-function fwd+bwd, ms PER LAYER (multiply by n_layers for a step):
+
+| cell                     | 131K        | 262K        | 524K         | 1M   |
+|--------------------------|-------------|-------------|--------------|------|
+| full-dense (causal SDPA) | 1523.6      | 6110.8      | 24432.4      | OOM  |
+| full-delta-current       | 328.3 (4.6x)| 750.3 (8.1x)| int32-cap    | OOM  |
+| full-delta-flexrow(-hc4) | 122.8 (12.4x)| 293.1 (20.9x)| 920.9 (26.5x)| OOM |
+
+- The delta training-efficiency story SCALES: the 32K step-level 1.22x
+  (O4) grows to 4.6x/8.1x/26.5x at the attention layer as context grows —
+  exactly the long-context-effect framing, now with Jeff's own protocol.
+- 524K: production composition hits the torch-2.8 flex int32 cap
+  (RAISED-64BIT recorded); the -hc4 head-chunked flexrow carries it.
+- 1M: NOTHING whole-function fits on one 80GB H100 with backward — dense
+  included, so no comparison point exists on this hardware. Components
+  that DO run at 1M: anchor-flexrow 1747.2, correction 57.1, gqa-expand
+  16.5 (sparse-flex-hc4 OOMs on its expanded 32-head K/V copies — a
+  GQA-native chunked sparse cell would likely fit; queued if Jeff wants
+  a composed 1M delta number).
+- Anchor branch confirmed as the scaling bottleneck of the CURRENT impl:
+  anchor-masked fwd+bwd 247 -> 585 -> 2097ms (131K->524K), i.e. the
+  mem-efficient-backend backward, while flexrow does the same math in
+  37 -> 123 -> 453ms.
+- headread (the "is the MTP head cheaper with delta" answer, one-token
+  read per layer): dense grows linearly 0.19 / 0.36 / 0.71 / 1.38ms
+  (131K->1M); delta window-read is FLAT ~0.08ms at every length ->
+  amortized ((63*delta + dense)/64) ~0.08-0.10ms. Per drafted token the
+  delta read is ~2.4x cheaper at 131K and ~14x at 1M, and unlike dense
+  it does not grow with cache length.
