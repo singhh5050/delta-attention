@@ -365,3 +365,62 @@ Whole-function fwd+bwd, ms PER LAYER (multiply by n_layers for a step):
   amortized ((63*delta + dense)/64) ~0.08-0.10ms. Per drafted token the
   delta read is ~2.4x cheaper at 131K and ~14x at 1M, and unlike dense
   it does not grow with cache length.
+
+### T3. 1M closed out (07-22, box 41 runs; v3 ladder run 16ja2q7c @0f2add5,
+### v4 delta-only run 2c3ufi39 @f6beab5; archives xend1cbc/rpf5y49q;
+### local rescue/2026-07-22-box41-final/)
+
+INFERENCE latency (no-grad fwd, ms PER LAYER; 131K/1M from dedicated
+infer-* cells, 262K/524K from the fwd_ms column of the fwd+bwd cells —
+validated at 131K where both exist: 430.0 vs 432.5, <1% apart):
+
+| cell            | 131K  | 262K   | 524K   | 1M      |
+|-----------------|-------|--------|--------|---------|
+| dense           | 432.5 | 1761.0 | 7128.0 | 29004.6 |
+| delta (current) | 63.2  | 188.2  | int32  | —       |
+| delta (flexrow) | 30.3  | 78.8   | 202.6  | 612.5   |
+| ratio (flexrow) | 14.3x | 22.3x  | 35.2x  | 47.3x   |
+
+- THE 1M point Jeff asked for: 612.5ms (flexrow, 4 head chunks) and
+  600.8ms (lowmem in-place variant — independent implementation, same
+  math, 2% apart = mutual confirmation) vs 29.0s dense.
+- Training (fwd+bwd) at 1M remains unmeasurable on one 80GB H100 for the
+  delta composition (full-delta-chunkbwd4 OOM even in a minimal-residue
+  process, run 2c3ufi39); dense needed chunked backward (98.6s). The
+  training curve stands on 131K/262K/524K (12.4x/20.9x/26.5x, §T2).
+- Caveat: the v4 process ran no length below the int32 cap, so its hc
+  parity cert is marked UNCERTIFIED in-process (first CSV row, by
+  design); flex_hc parity was certified at maxdiff EXACTLY 0.0 in three
+  other processes across two boxes (8K x2, 131K).
+- Incident ledger for the 1M chase (all recorded as rows): eager block
+  mask O(s^2) OOM -> _compile=True; flex int32 cap -> head chunking;
+  anchor-masked mem-efficient backward ILLEGAL MEMORY ACCESS under
+  expandable_segments (poisons CUDA context) -> --skip with exact-match
+  labels + KNOWN_CELLS validation; residue allocations (correction
+  leaves, chunkbwd seed) gated behind skips.
+
+## U. Gemma 4 native MTP drafter — G0 baseline (07-22, box 41; runs
+## ygdlc85d (v2, superseded methodology) and vx6ldm79 (v3, two-length
+## differencing + symmetric DynamicCache); CSVs in box archives)
+
+- UPSTREAM BUG (transformers 5.15.0.dev0): assisted decoding with any
+  prompt past the trunk sliding window (1024) crashes in the verify
+  forward (hybrid cache window-caps sliding KV, mask built full-length;
+  reproduces under sdpa AND eager). Workaround: explicit DynamicCache,
+  BOTH modes, parity-gated.
+- G0 gate PASS (fraction gate; parity scatter = kernel tie-flips in the
+  batched verify path, pp spread 6..256 with ~40% exact rows).
+- Decode-only speedup (two-length differencing, 256 max_new, PG19):
+  ~1.2-1.5x at 4K and 8K tiers (8K example: 9.8 -> 14.3 tok/s);
+  occasional fully-accepted prompts reach ~4x. Below Google's ~3x
+  claim — ours is the naive HF assisted path, no server batching.
+- Tiers >= 16K OOM on 80GB in EVERY mode (both cache types) — consistent
+  with full-sequence prefill logits (16K x 262K vocab); 8K fits. G1's
+  custom loop prefills with logits_to_keep=1 and owns the draft loop,
+  which removes both this cap and the upstream-bug workaround.
+- KNOWN CAVEAT on v3 speedups: the heuristic num_assistant_tokens
+  schedule was NOT reset between the half and full generates (fix
+  2c34534 landed after the box terminated), so each speedup mixes two
+  speculation depths. Direction/magnitude small (walls are consistent
+  across rows); G1 re-measures under our own loop. Do not quote v3
+  speedups beyond "~1.2-1.5x ballpark".
