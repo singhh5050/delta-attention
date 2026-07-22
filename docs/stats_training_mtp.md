@@ -256,3 +256,78 @@ is the honest x-axis):
 - Chaining (K=2/4, exploratory): collapses identically for BOTH variants
   (pos-2 ≈ 0.03) — the head is depth-1-trained and vLLM's K=1-only
   support is vindicated; delta ≈ dense even in the collapse.
+
+## S. Model-2 replication: Qwen3-14B training-efficiency 2x2 (07-22, box 33;
+## runs vwnp2zf6 pipeline-eval, wz35nqkp dense-eval; trainings m2-train-delta /
+## m2-train-dense on the same box, archived in box_final_state @ box 33)
+
+Setup: Qwen3-14B (2025 release, QK-norm port, portgate PASSED vs vanilla
+transformers), LoRA r16 q/k/v/o, 500 steps @ 32K PG19, delta vs dense arms
+trained SEQUENTIALLY on one idle H100 (O4 discipline). Eval: 32 held-out
+PG19 TEST chunks @ 32768, identical chunks across arms, chunked fused-CE
+(the labels= path materializes seq x 152K-vocab fp32 logits = ~19GB and
+OOM'd the first eval attempt, run n282nw74 — fix dccd103, adapters were
+safe on disk; both paid trainings unaffected). All losses nats/token under
+the QWEN tokenizer — NOT comparable to any Llama number in this file.
+
+| eval path      | base   | delta-ft | dense-ft | paired delta-dense (sem) | chunks |
+|----------------|--------|----------|----------|--------------------------|--------|
+| pipeline (g64) | 13.291 | 10.690   | 11.427   | -0.0666 (0.0018)         | 32/32 delta better |
+| dense (fa2)    | 11.533 | 10.303   | 10.065   | +0.0234 (0.0014)         | 32/32 dense better |
+
+- The Llama-3.1-8B pattern REPLICATES on a second, newer architecture:
+  each arm wins under its own eval path, and delta's advantage under the
+  pipeline (0.067 nats) is ~3x dense's advantage under dense (0.023) —
+  the same asymmetry as Llama's 32K 2x2 (§ stats_2026-07-15.md).
+- Capability retention: delta-ft under DENSE eval (10.30) recovers most
+  of the dense-ft gain over base (11.53 -> 10.06), i.e. delta training
+  does not wreck the model's native-attention quality.
+- Every paired comparison is 32/32 unanimous across chunks — not a mean
+  driven by outliers.
+
+## T. Anchor-branch decomposition + Jeff's 1M ladder (anchorbench, 07-22,
+## box 39; short ladder run zofiwhdq @ f4da7c5+dccd103, CSV rescued to
+## rescue/2026-07-22-anchorbench/; long ladder IN FLIGHT @ 1895aad)
+
+Jeff's protocol verbatim: weightless single attention layer, torch.randn
+inputs, fwd/bwd, Llama-8B dims (32 q / 8 kv heads, D=128), gamma 64,
+sink 1024 + window 2048. ALL numbers PER LAYER.
+
+Short ladder (8K / 32K), fwd+bwd ms unless noted:
+
+| cell               | 8K    | 32K   | reading |
+|--------------------|-------|-------|---------|
+| sparse-flex        | 3.69  | 16.73 | production sparse branch |
+| anchor-masked      | 4.53  | 43.36 | production anchor branch — DOMINATES at 32K |
+| anchor-flash!      | RAISED| RAISED| "No available kernel": the row mask provably knocks SDPA off the flash path (the smoking gun) |
+| anchor-mathonly    | 5.32  | 44.76 | forced math backend |
+| anchor-efficient   | 4.53  | 43.32 | == anchor-masked: SDPA silently picks mem-efficient, whose BACKWARD is the real cost |
+| anchor-flexrow     | 1.06  | 5.26  | reformulation: 8.2x faster than production anchor branch at 32K |
+| correction         | 0.58  | 1.98  | trivial, as designed |
+| full-delta-current | 9.16  | 63.12 | production delta_forward_train verbatim |
+| full-delta-flexrow | 5.67  | 25.08 | same math, flexrow anchor branch |
+| full-dense         | 6.70  | 95.20 | causal SDPA reference |
+
+- Verdict on Jeff's question: NOT flex (swabench §Q already exonerated
+  it); the anchor branch's masked SDPA falls to the mem-efficient
+  backend and its backward is ~2/3 of the whole per-layer cost at 32K
+  (43.4 of 63.1ms).
+- full-delta-current beats dense 1.5x at 32K but LOSES at 8K (9.2 vs
+  6.7) — the attention-layer view of O4's crossover. The flexrow
+  composition wins at BOTH lengths (5.67 vs 6.70 at 8K; 3.8x dense at
+  32K) — the "way faster" Jeff suspected exists, without any Triton
+  authoring, and it is a drop-in reformulation of the anchor branch.
+- headread cells (MiMo "is the head cheaper" question): dense one-token
+  read 0.06ms at 32K cache vs delta amortized ((63*0.07+0.06)/64 —
+  window-read dominated) — per-layer read cost is negligible at 32K;
+  the curve to 1M (where it stops being negligible) is in the long
+  ladder.
+- Long-ladder incident log (all recorded as data, fixes pushed):
+  (1) eager create_block_mask materializes the full s^2 bool mask —
+  128GB block-sum intermediate at 131K; fixed with _compile=True
+  (785c837), which also UN-CAPS the production composition: it RUNS at
+  262K (fwd+bwd 748.25ms vs flexrow 292.70ms, run nkz99x1e summary).
+  (2) flex triton templates are int32-indexed (torch 2.8): >=524K with
+  32 heads exceeds 2^31 elements per tensor -> RAISED-64BIT recorded as
+  the production formulation's per-GPU cap; head-chunked -hc4 cells
+  (1895aad) carry the delta curve to 1M.
