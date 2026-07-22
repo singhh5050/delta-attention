@@ -51,6 +51,10 @@ import torch
 TARGET = "google/gemma-4-31b-it"
 ASSISTANT = "google/gemma-4-31b-it-assistant"
 SINK, WINDOW = 1024, 2048  # project-standard delta read geometry
+SLIDING_CAP = 1025  # native hybrid-cache sliding-entry length (window+1):
+# with an uncapped/offloaded trunk cache the sliding shared-KV entry comes
+# back full-length, which is NOT what the drafter's flip-mask math was
+# built for — cap it to native semantics ourselves
 
 INSTR = ("Continue this story in the same style. Write a long, natural "
          "continuation.\n\n")
@@ -72,6 +76,12 @@ def parse_args():
                         "arm's tokens to match it exactly (smoke gate)")
     p.add_argument("--target", type=str, default=TARGET)
     p.add_argument("--assistant", type=str, default=ASSISTANT)
+    p.add_argument("--offload", action="store_true",
+                   help="CPU-offloaded uncapped trunk cache: the hybrid "
+                        "cache kept >=16K from fitting anyway (76GB "
+                        "allocated at the 16K prefill, box 44), and "
+                        "offloading fits any tier at a decode-speed cost "
+                        "that cannot affect acceptance")
     p.add_argument("--out", type=str, default="results/g1_tiers.csv")
     return p.parse_args()
 
@@ -92,6 +102,17 @@ def load_contexts(tokenizer, n, max_ctx_tokens):
             return out
     raise SystemExit(f"only {len(out)} PG19 docs long enough for tier "
                      f"{max_ctx_tokens}")
+
+
+def cap_sliding(kv):
+    """Restore native sliding-entry semantics (last window+1 rows) when the
+    trunk cache is uncapped/offloaded; no-op when already capped."""
+    k, v = kv["sliding_attention"]
+    if k.shape[2] <= SLIDING_CAP:
+        return kv
+    out = dict(kv)
+    out["sliding_attention"] = (k[:, :, -SLIDING_CAP:], v[:, :, -SLIDING_CAP:])
+    return out
 
 
 def arm_view(kv, arm, call_idx):
@@ -119,7 +140,7 @@ def arm_view(kv, arm, call_idx):
 
 
 @torch.no_grad()
-def plain_greedy(target, ids, max_new):
+def plain_greedy(target, ids, max_new, offload=False):
     """Reference chain via the EXACT forward pattern of run_arm — split
     prefill (bulk, then 1-token) + sequential q_len=1 decode + explicit
     hybrid cache — so every position's kernel shapes align, token 0
@@ -129,10 +150,7 @@ def plain_greedy(target, ids, max_new):
     divergences at >=24)."""
     from transformers import DynamicCache
 
-    try:
-        cache = DynamicCache(config=target.config)
-    except TypeError:
-        cache = DynamicCache(config=target.config.get_text_config())
+    cache = make_cache(target, offload)
     target(input_ids=ids[:, :-1], past_key_values=cache, use_cache=True,
            logits_to_keep=1)
     out = target(input_ids=ids[:, -1:], past_key_values=cache,
@@ -154,8 +172,22 @@ def _st(s):
     _LAST_STAGE = s
 
 
+def make_cache(target, offload):
+    from transformers import DynamicCache
+
+    kwargs = [{"config": target.config, "offloading": offload},
+              {"config": target.config}]
+    for kw in kwargs:
+        try:
+            return DynamicCache(**kw)
+        except TypeError:
+            continue
+    return DynamicCache(config=target.config.get_text_config())
+
+
 @torch.no_grad()
-def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
+def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
+            offload=False):
     """Our draft-verify loop. Returns per-prompt stats dict.
 
     Cache invariant: the trunk cache holds the validated prefix EXCLUDING
@@ -175,10 +207,7 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
     from transformers import DynamicCache
 
     dev = ids.device
-    try:
-        cache = DynamicCache(config=target.config)
-    except TypeError:  # older cache API
-        cache = DynamicCache(config=target.config.get_text_config())
+    cache = make_cache(target, offload)
     # two-step prefill: output_hidden_states over the whole prompt would
     # materialize every layer's hidden (~22GB at 32K x 63 layers); we only
     # need the LAST position's hidden, so the bulk runs without it and a
@@ -192,7 +221,7 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
                  return_shared_kv_states=True)
     pending_logit = out.logits[:, -1]
     last_hidden = out.hidden_states[-1][:, -1:]
-    kv = out.shared_kv_states
+    kv = cap_sliding(out.shared_kv_states)
     validated = ids[0].tolist()
     newest = None  # newest validated token, not yet in trunk cache
 
@@ -248,7 +277,7 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
                           return_shared_kv_states=True)
             nxt = int(vout.logits[0, -1].argmax(-1).item())
             last_hidden = vout.hidden_states[-1][:, -1:]
-            kv = vout.shared_kv_states
+            kv = cap_sliding(vout.shared_kv_states)
             if nxt == d:
                 n_match += 1
                 cur = d
@@ -263,7 +292,7 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
                           return_shared_kv_states=True)
             bonus = int(vout.logits[0, -1].argmax(-1).item())
             last_hidden = vout.hidden_states[-1][:, -1:]
-            kv = vout.shared_kv_states
+            kv = cap_sliding(vout.shared_kv_states)
         accepted += n_match
         bonus_ct += 1
         validated.extend(drafts[:n_match] + [bonus])
@@ -324,7 +353,8 @@ def main():
             add_generation_prompt=True, tokenize=False)
         ids_s = tok(sp, return_tensors="pt",
                     add_special_tokens=False)["input_ids"].cuda()
-        r_full = run_arm(target, assistant, embed, ids_s, "full", args.k, 32)
+        r_full = run_arm(target, assistant, embed, ids_s, "full", args.k,
+                         32, offload=args.offload)
         with torch.no_grad():
             nat = target.generate(input_ids=ids_s, max_new_tokens=32,
                                   do_sample=False, assistant_model=assistant,
@@ -358,7 +388,8 @@ def main():
             for arm in arms:
                 try:
                     r = run_arm(target, assistant, embed, ids, arm,
-                                args.k, args.max_new)
+                                args.k, args.max_new,
+                                offload=args.offload)
                 except torch.cuda.OutOfMemoryError as e:
                     w.writerow([tier, i, arm, ids.shape[1],
                                 f"OOM@{_LAST_STAGE}"] +
@@ -384,6 +415,10 @@ def main():
                     gc.collect()
                     torch.cuda.empty_cache()
                     continue
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()  # 48 arm-runs of allocator litter
+                # contributed to the 16K wall (59GB non-releasable, box 44)
                 if arm == "full":
                     ref_tokens = r["tokens"]
                 # every validated token is a trunk argmax, so all arms
@@ -413,7 +448,8 @@ def main():
                         "G1 GATE MISCONFIGURED: --parity-check needs a "
                         "successful 'full' arm run (it OOM'd or --arms "
                         "omits it) — cannot certify")
-                ref2 = plain_greedy(target, ids, args.max_new)
+                ref2 = plain_greedy(target, ids, args.max_new,
+                                    offload=args.offload)
                 n_cmp = min(len(ref2), len(ref_tokens))
                 m = 0
                 for a, b in zip(ref2, ref_tokens):

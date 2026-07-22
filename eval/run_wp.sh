@@ -1103,12 +1103,12 @@ if [ -n "$GEMMA4G1" ]; then
   # assisted decoding token-for-token (min prefix) before any arm runs
   stage "g1-smoke:running"
   "$G4PY" eval/gemma4_g1_eval.py --n 2 --tiers 4096,8192 --max-new 64 \
-    --arms full --parity-check --out results/g1_smoke.csv \
+    --arms full --parity-check --offload --out results/g1_smoke.csv \
     || { stage "g1-smoke:FAILED"; exit 1; }
   stage "g1-smoke:PASS"
   stage "g1-arms:running"
-  "$G4PY" eval/gemma4_g1_eval.py --n 6 --tiers 4096,8192,16384,32768,65536 \
-    --max-new 128 --k 5 --arms full,sparse,delta2,delta4 \
+  "$G4PY" eval/gemma4_g1_eval.py --n 4 --tiers 16384,32768,65536 \
+    --max-new 128 --k 5 --arms full,sparse,delta2,delta4 --offload \
     --out results/g1_tiers.csv \
     || { stage "g1-arms:FAILED"; exit 1; }
   stage "g1-arms:PASS"
