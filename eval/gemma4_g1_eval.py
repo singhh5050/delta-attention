@@ -16,8 +16,10 @@ recipe below is transcribed from transformers' Gemma4 candidate generator
       layer type) cropped to the validated prefix
 
 The arms differ ONLY in the shared_kv_states dict handed to the drafter:
-    full     — cropped, untouched (the certification arm: final tokens
-               must equal native generate(assistant_model=...) exactly)
+    full     — cropped, untouched (the certification arm: gated against
+               PLAIN trunk greedy computed with identical forward shapes
+               — the spec-decode exactness invariant; a short-context
+               native-assisted cross-check guards shared-bug blindness)
     sparse   — the full_attention entry subsampled to sink+window
                (StreamingLLM-style read; rope is baked into the trunk's
                cached keys, so gathering preserves positions)
@@ -116,6 +118,33 @@ def arm_view(kv, arm, call_idx):
     return out
 
 
+@torch.no_grad()
+def plain_greedy(target, ids, max_new):
+    """Reference chain via the EXACT forward pattern of run_arm — split
+    prefill (bulk, then 1-token) + sequential q_len=1 decode + explicit
+    hybrid cache — so every position's kernel shapes align, token 0
+    included. Against this, ANY divergence is a real loop bug (review
+    wf_8f9b74c6: the previous single-prefill reference could tie-flip
+    token 0, and the tolerance that excused it also passed real
+    divergences at >=24)."""
+    from transformers import DynamicCache
+
+    try:
+        cache = DynamicCache(config=target.config)
+    except TypeError:
+        cache = DynamicCache(config=target.config.get_text_config())
+    target(input_ids=ids[:, :-1], past_key_values=cache, use_cache=True,
+           logits_to_keep=1)
+    out = target(input_ids=ids[:, -1:], past_key_values=cache,
+                 use_cache=True)
+    toks = [int(out.logits[0, -1].argmax(-1).item())]
+    while len(toks) < max_new:
+        out = target(input_ids=torch.tensor([[toks[-1]]], device=ids.device),
+                     past_key_values=cache, use_cache=True)
+        toks.append(int(out.logits[0, -1].argmax(-1).item()))
+    return toks
+
+
 _LAST_STAGE = "?"  # which GPU call OOM'd (module-global; single-threaded)
 _OOM_DUMPED = False
 
@@ -138,8 +167,10 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new):
     on box 43), and stopping at the first mismatch removes cache
     cropping entirely. KNOWN 1-ROW DEVIATION from native: the native
     generator's KV slice exposes the rejected draft's KV at the bonus
-    position (we never forward rejected drafts); the parity gate
-    measures whether that row ever matters.
+    position (we never forward rejected drafts). This is a DOCUMENTED
+    RESIDUAL DIFFERENCE — structurally invisible to the plain-greedy
+    gate (it can only shift ACCEPTANCE, never validated tokens) — and
+    only the short-context native cross-check brushes against it.
     """
     from transformers import DynamicCache
 
@@ -278,6 +309,43 @@ def main():
         w.writerow(HEADER)
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+
+    if args.parity_check:
+        # independent cross-check vs NATIVE assisted decoding, once per
+        # run, at a context SHORTER than the sliding window (semantics
+        # coincide across cache types there) — guards the shared-bug
+        # blindness of a self-referential plain-greedy gate (wf_8f9b74c6
+        # finding 3). Batched-verify kernel shapes still differ, so the
+        # threshold tolerates late tie-flips but not systematic breakage.
+        from transformers import DynamicCache
+        ctx = load_contexts(tok, 1, 800)[0]
+        sp = tok.apply_chat_template(
+            [{"role": "user", "content": INSTR + ctx}],
+            add_generation_prompt=True, tokenize=False)
+        ids_s = tok(sp, return_tensors="pt",
+                    add_special_tokens=False)["input_ids"].cuda()
+        r_full = run_arm(target, assistant, embed, ids_s, "full", args.k, 32)
+        with torch.no_grad():
+            nat = target.generate(input_ids=ids_s, max_new_tokens=32,
+                                  do_sample=False, assistant_model=assistant,
+                                  past_key_values=DynamicCache())
+        nat_new = nat[0, ids_s.shape[1]:].tolist()
+        m = 0
+        for a, b in zip(nat_new, r_full["tokens"]):
+            if a != b:
+                break
+            m += 1
+        n_cmp = min(len(nat_new), len(r_full["tokens"]))
+        print(f"[g1] native cross-check (short ctx): prefix {m}/{n_cmp}",
+              flush=True)
+        run.summary["native_crosscheck_prefix"] = m
+        if m < min(16, n_cmp):
+            raise SystemExit(
+                f"G1 GATE FAILED: short-context native cross-check "
+                f"diverges at token {m} — loop deviates from the shipped "
+                "assisted-decoding behavior even where cache semantics "
+                "coincide")
+
     for tier in [int(x) for x in args.tiers.split(",")]:
         ctxs = load_contexts(tok, args.n, tier)
         for i, ctx in enumerate(ctxs):
@@ -340,43 +408,25 @@ def main():
                       flush=True)
 
             if args.parity_check:
-                # THE exactness invariant of speculative greedy decoding:
-                # the output must equal PLAIN trunk greedy. Plain decode
-                # uses the same hybrid cache and the same q_len=1 kernel
-                # shapes as our verify steps, so there is no tie-flip
-                # escape hatch — any mismatch is a real loop bug. (The
-                # earlier reference, native assisted generate on an
-                # UNCAPPED cache, differed in both cache semantics and
-                # verify kernel shapes and tie-flipped at 4K; it also
-                # could not run past 8K. Review wf_4081ce31 + box-44
-                # gate failure analysis.)
-                with torch.no_grad():
-                    nat = target.generate(
-                        input_ids=ids, max_new_tokens=args.max_new,
-                        do_sample=False)
-                nat_new = nat[0, ids.shape[1]:].tolist()
-                if ref_tokens is None:
+                if ref_tokens is None:  # BEFORE the expensive reference
                     raise SystemExit(
                         "G1 GATE MISCONFIGURED: --parity-check needs a "
                         "successful 'full' arm run (it OOM'd or --arms "
                         "omits it) — cannot certify")
+                ref2 = plain_greedy(target, ids, args.max_new)
+                n_cmp = min(len(ref2), len(ref_tokens))
                 m = 0
-                for a, b in zip(nat_new, ref_tokens):
+                for a, b in zip(ref2, ref_tokens):
                     if a != b:
                         break
                     m += 1
-                full_match = (m == min(len(nat_new), len(ref_tokens)))
-                print(f"[g1] parity vs plain-greedy: prefix {m}/"
-                      f"{min(len(nat_new), len(ref_tokens))}"
-                      f"{' (full common prefix)' if full_match else ''}",
-                      flush=True)
+                print(f"[g1] parity vs plain-greedy (shape-aligned): "
+                      f"prefix {m}/{n_cmp}", flush=True)
                 run.summary[f"parity_prefix_t{tier}_p{i}"] = m
-                # a short native output that matches END TO END (early
-                # eos) is perfect parity, not a failure
-                if not full_match and m < min(24, args.max_new // 2):
-                    raise SystemExit(
-                        "G1 GATE FAILED: our loop diverges from PLAIN trunk "
-                        f"greedy at token {m} — loop bug")
+                if m < n_cmp:  # ANY divergence is a loop bug — the
+                    raise SystemExit(  # reference is shape-identical
+                        "G1 GATE FAILED: our loop diverges from PLAIN "
+                        f"trunk greedy at token {m}/{n_cmp} — loop bug")
     fh.close()
     run.finish()
     print("[g1] DONE", flush=True)
