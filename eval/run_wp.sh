@@ -1087,6 +1087,11 @@ fi
 
 if [ -n "$GEMMA4G1" ]; then
   export CUDA_VISIBLE_DEVICES=0
+  # 16K sits ~1GB over the fragmented-allocator ceiling with both models
+  # loaded (box-45 v7: OOM asking 674MB with 467MB free at 78.7GB held;
+  # diag4 measured 75.8GB peak target-only). expandable_segments removes
+  # segment fragmentation; allocator policy only, no semantic effect.
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   gpu_preflight "g1-gpupreflight"
   stage "g1-venv:running"
   G4PY="$PWD/.venv-g4/bin/python"
