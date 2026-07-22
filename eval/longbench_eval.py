@@ -103,6 +103,7 @@ def lb_official():
     prompts = json.loads((LB_OFFICIAL_DIR / "dataset2prompt.json").read_text())
     maxlens = json.loads((LB_OFFICIAL_DIR / "dataset2maxlen.json").read_text())
     sys.path.insert(0, str(LB_OFFICIAL_DIR))
+    had_metrics = "metrics" in sys.modules
     try:
         spec = importlib.util.spec_from_file_location(
             "_lb_official_eval", LB_OFFICIAL_DIR / "eval.py")
@@ -110,6 +111,12 @@ def lb_official():
         spec.loader.exec_module(mod)
     finally:
         sys.path.remove(str(LB_OFFICIAL_DIR))
+        # eval.py's `from metrics import ...` installs the vendored file as
+        # top-level 'metrics'; evict it so a future unrelated `import
+        # metrics` can't silently bind to LongBench's (the from-imported
+        # functions keep their references regardless)
+        if not had_metrics:
+            sys.modules.pop("metrics", None)
     missing = [t for t in V1_FULL_EN
                if t not in prompts or t not in maxlens or t not in mod.dataset2metric]
     assert not missing, f"vendored LongBench files lack tasks: {missing}"
@@ -343,14 +350,22 @@ def build_model(arm: str, gamma: int, window: int, force_dense: bool = False):
 
 
 def generate_answer(model, tokenizer, prompt: str, max_new: int,
-                    first_line_only: bool = True, **gen_kwargs) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+                    first_line_only: bool = True, add_bos: bool = False,
+                    raw: bool = False, **gen_kwargs) -> str:
+    # add_bos: official LongBench pred.py tokenizes EVERY prompt with special
+    # tokens; chat-wrapped prompts already carry BOS as template text, but
+    # v1full's unwrapped few-shot/code prompts need it added here (review
+    # wf_0e865084: Llama degrades measurably without BOS)
+    inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=add_bos)
     inputs = {k: v.cuda() for k, v in inputs.items()}
     with torch.no_grad():
         ids = model.generate(**inputs, max_new_tokens=max_new, do_sample=False,
                              **gen_kwargs)
     text = tokenizer.decode(ids[0, inputs["input_ids"].size(1):],
-                            skip_special_tokens=True).strip()
+                            skip_special_tokens=True)
+    if raw:  # v1full: the official scorer scores the UNstripped decode
+        return text
+    text = text.strip()
     # short-answer QA: first line only; summarization: keep the whole thing
     return text.split("\n")[0] if first_line_only else text
 
@@ -422,12 +437,15 @@ def run_v1full(model, tokenizer, arm: str, n: int, log, slog=None):
                 prompt = chat_wrap(prompt, tokenizer)
             extra = {}
             if task == "samsum":
-                inp_len = len(tokenizer.encode(prompt, add_special_tokens=False))
+                # length WITH special tokens: official pred.py's
+                # context_length comes from the BOS-included input_ids
+                inp_len = len(tokenizer.encode(prompt, add_special_tokens=True))
                 extra = {"min_length": inp_len + 1,
                          "eos_token_id": [tokenizer.eos_token_id,
                                           tokenizer.encode("\n", add_special_tokens=False)[-1]]}
             pred = generate_answer(model, tokenizer, prompt, max_new,
-                                   first_line_only=False, **extra)
+                                   raw=True,
+                                   add_bos=(task in NO_CHAT_WRAP), **extra)
             scored = (pred.lstrip("\n").split("\n")[0]
                       if task in FIRST_LINE_ONLY else pred)
             vals.append(max(metric_fn(scored, gt,
@@ -443,6 +461,9 @@ def run_v1full(model, tokenizer, arm: str, n: int, log, slog=None):
         log(arm, "v1full", task, len(vals), scores[task])
         print(f"[lb-full] {arm}/{task}: {scores[task]:.4f} (n={len(vals)})",
               flush=True)
+        # 16 tasks x full long contexts pinned by the lru_cache = multiple
+        # GB of dead host RAM across a 5-arm run; only rows[:n] were used
+        load_v1.cache_clear()
     log(arm, "v1full", "MEAN", len(scores),
         sum(scores.values()) / len(scores))
     return scores

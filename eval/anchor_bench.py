@@ -102,6 +102,26 @@ def timed(fn, out_shape, warmup, iters, leaves, backward=True):
     return fwd, fb
 
 
+def timed_self(fn, warmup, iters, leaves):
+    """fwd+bwd ms for an fn that runs its OWN backward internally (the
+    chunked-backward cells: only one head-group's graph alive at a time,
+    which is what lets fwd+bwd fit at 1M). No separate fwd number — the
+    infer-* cells carry forward-only latency."""
+    def zero():
+        for t in leaves:
+            t.grad = None
+    for _ in range(warmup):
+        fn()
+        zero()
+    torch.cuda.synchronize()
+    t0 = time.monotonic()
+    for _ in range(iters):
+        fn()
+        zero()
+    torch.cuda.synchronize()
+    return (time.monotonic() - t0) / iters * 1000
+
+
 def bench_seq_len(s, warmup, iters, rows, run):
     assert s % Q_BLOCK == 0
     # long-ladder cells cost seconds per iteration — scale counts so 1M
@@ -124,19 +144,28 @@ def bench_seq_len(s, warmup, iters, rows, run):
           f"= {n_sel * s / 8 / 2**30:.2f} GB bool; materialized scores would "
           f"be {H_Q * n_sel * s * 2 / 2**30:.2f} GB bf16", flush=True)
 
+    needs_hc = H_Q * s * D >= 2 ** 31  # monolithic flex will RAISED-64BIT
+
     def cell(label, fn, out_shape, backward=True, expect_raise=False,
-             note=""):
+             note="", self_backward=False):
         try:
-            fwd, fb = timed(fn, out_shape, warmup, iters, leaves,
-                            backward=backward)
-            rows.append([label, s, "per-layer-fwd", f"{fwd:.2f}",
+            if self_backward:  # fn runs fwd+bwd internally (chunked bwd)
+                fb = timed_self(fn, warmup, iters, leaves)
+                fwd = None
+            else:
+                fwd, fb = timed(fn, out_shape, warmup, iters, leaves,
+                                backward=backward)
+            rows.append([label, s, "per-layer-fwd",
+                         f"{fwd:.2f}" if fwd is not None else "",
                          f"{fb:.2f}" if fb else "", note])
-            run.summary[f"{label}_{s}_fwd_ms"] = fwd
+            if fwd is not None:
+                run.summary[f"{label}_{s}_fwd_ms"] = fwd
             if fb:
                 run.summary[f"{label}_{s}_fwdbwd_ms"] = fb
             print(f"[anchorbench] {label:18s} s={s:>7} PER-LAYER "
-                  f"fwd {fwd:8.2f}ms" + (f"  fwd+bwd {fb:8.2f}ms" if fb
-                                          else "") + f"  {note}", flush=True)
+                  + (f"fwd {fwd:8.2f}ms" if fwd is not None else "")
+                  + (f"  fwd+bwd {fb:8.2f}ms" if fb else "")
+                  + f"  {note}", flush=True)
         except torch.cuda.OutOfMemoryError as e:
             rows.append([label, s, "per-layer-fwd", "OOM", "OOM",
                          "formulation cannot run at this length on 80GB"])
@@ -152,11 +181,14 @@ def bench_seq_len(s, warmup, iters, rows, run):
                 rows.append([label, s, "per-layer-fwd", "RAISED", "", msg])
                 print(f"[anchorbench] {label:18s} s={s:>7} RAISED: {msg} "
                       "(the smoking gun, recorded)", flush=True)
-            elif "64-bit indexing" in str(e):
+            elif needs_hc and "64-bit indexing" in str(e):
                 # torch 2.8 flex triton templates are int32-indexed: any
                 # tensor over 2^31 elements (q at s>=524288 with 32 heads)
                 # cannot compile. A formulation cap, so a RESULT — the
-                # -hc cells below carry the delta curve past it.
+                # -hc cells below carry the delta curve past it. Gated on
+                # needs_hc (review wf_0e865084): at lengths where the
+                # monolithic kernel is SUPPOSED to fit, this error is a
+                # regression and must fail the stage loudly.
                 rows.append([label, s, "per-layer-fwd", "RAISED-64BIT", "",
                              "flex triton templates lack 64-bit indexing "
                              "(torch 2.8): >2^31-element tensors"])
@@ -189,7 +221,23 @@ def bench_seq_len(s, warmup, iters, rows, run):
                          enable_gqa=enable_gqa)
              for i in range(HC)], dim=1)
 
-    needs_hc = H_Q * s * D >= 2 ** 31  # monolithic flex will RAISED-64BIT
+    if s == 8192:
+        # one-time numeric certification of head-chunking, BOTH kv modes
+        # (review wf_0e865084: the GQA-native chunk alignment was untested):
+        # chunked outputs must match the monolithic kernel to bf16 noise
+        with torch.no_grad():
+            ref = _get_flex()(q, k8.repeat_interleave(rep, dim=1),
+                              v8.repeat_interleave(rep, dim=1),
+                              block_mask=bm, scale=scaling)
+            for tag, hc_out in (
+                    ("expanded", flex_hc(q, k8.repeat_interleave(rep, dim=1),
+                                         v8.repeat_interleave(rep, dim=1), bm)),
+                    ("gqa-native", flex_hc(q, k8, v8, bm, enable_gqa=True))):
+                md = (ref - hc_out).abs().max().item()
+                assert md < 2e-2, f"flex_hc {tag} parity FAILED: maxdiff {md}"
+                print(f"[anchorbench] flex_hc {tag} parity OK "
+                      f"(maxdiff {md:.2e})", flush=True)
+        torch.cuda.empty_cache()
 
     # ---- production sparse branch: expansion IN-GRAPH (backward pays the
     # 32->8 grad reduction, exactly as delta_forward_train does)
@@ -308,38 +356,38 @@ def bench_seq_len(s, warmup, iters, rows, run):
                                      sink=SINK),
          (1, s, H_Q, D), note="production composition, verbatim")
 
-    def full_delta_flexrow():
-        kr = k8.repeat_interleave(rep, dim=1)
-        vr = v8.repeat_interleave(rep, dim=1)
-        sparse = _get_flex()(q, kr, vr, block_mask=bm, scale=scaling)
-        sparse = sparse.transpose(1, 2)
-        dense_sel = _get_flex()(q[:, :, sel], k8, v8, block_mask=bm_row,
-                                scale=scaling, enable_gqa=True)             .transpose(1, 2)
+    # shared correction broadcast — ONE copy of the composition math, so
+    # spliced curves can never silently measure different math (review
+    # wf_0e865084). h = head count of the slice being composed.
+    def delta_compose(sparse, dense_sel, h):
         n_a = idx.numel()
         delta = dense_sel[:, :n_a] - sparse[:, idx_dev]
-        corrected = (sparse[:, :s_p].reshape(1, n_a, GAMMA, H_Q, D)
-                     + delta.reshape(1, n_a, 1, H_Q, D))             .reshape(1, s_p, H_Q, D)
+        corrected = (sparse[:, :s_p].reshape(1, n_a, GAMMA, h, D)
+                     + delta.reshape(1, n_a, 1, h, D)) \
+            .reshape(1, s_p, h, D)
         return torch.cat((corrected, dense_sel[:, n_a:]), dim=1)
+
+    def anchor_rows_flexrow():
+        return _get_flex()(q[:, :, sel], k8, v8, block_mask=bm_row,
+                           scale=scaling, enable_gqa=True).transpose(1, 2)
+
+    def full_delta_flexrow():
+        sparse = _get_flex()(q, k8.repeat_interleave(rep, dim=1),
+                             v8.repeat_interleave(rep, dim=1),
+                             block_mask=bm, scale=scaling).transpose(1, 2)
+        return delta_compose(sparse, anchor_rows_flexrow(), H_Q)
     cell("full-delta-flexrow", full_delta_flexrow, (1, s, H_Q, D),
          note="anchor branch reformulated (flexrow), same math")
 
     if needs_hc:
         # same composition with the sparse branch head-chunked (the anchor
         # branch's n_sel x s shapes stay far below the int32 limit) — the
-        # cell that carries the whole-function delta number to 1M
+        # cell that carries the whole-function delta number past 262K
         def full_delta_flexrow_hc():
             sparse = flex_hc(q, k8.repeat_interleave(rep, dim=1),
                              v8.repeat_interleave(rep, dim=1), bm) \
                 .transpose(1, 2)
-            dense_sel = _get_flex()(q[:, :, sel], k8, v8, block_mask=bm_row,
-                                    scale=scaling, enable_gqa=True) \
-                .transpose(1, 2)
-            n_a = idx.numel()
-            delta = dense_sel[:, :n_a] - sparse[:, idx_dev]
-            corrected = (sparse[:, :s_p].reshape(1, n_a, GAMMA, H_Q, D)
-                         + delta.reshape(1, n_a, 1, H_Q, D)) \
-                .reshape(1, s_p, H_Q, D)
-            return torch.cat((corrected, dense_sel[:, n_a:]), dim=1)
+            return delta_compose(sparse, anchor_rows_flexrow(), H_Q)
         cell(f"full-delta-flexrow-hc{HC}", full_delta_flexrow_hc,
              (1, s, H_Q, D),
              note=f"flexrow composition, sparse branch in {HC} head chunks")
@@ -349,6 +397,76 @@ def bench_seq_len(s, warmup, iters, rows, run):
              q, k8, v8, is_causal=True, scale=scaling,
              enable_gqa=True).transpose(1, 2),
          (1, s, H_Q, D), note="causal dense reference")
+
+    # ---- inference-latency cells (no_grad fwd): the paper's own framing —
+    # "the biggest experiment we could do was 131K but we reported latency
+    # on 1M". Without autograd state (no grads, no saved activations, no
+    # gradient seed) 1M fits on 80GB; the fwd+bwd training number at 1M
+    # comes from the chunked-backward cells below.
+    def nograd(fn):
+        def f():
+            with torch.no_grad():
+                return fn()
+        return f
+
+    cell("infer-dense",
+         nograd(lambda: F.scaled_dot_product_attention(
+             q, k8, v8, is_causal=True, scale=scaling, enable_gqa=True)),
+         None, backward=False, note="no-grad fwd")
+    cell("infer-delta-current",
+         nograd(lambda: delta_forward_train(q, k8, v8, gamma=GAMMA,
+                                            window=WINDOW, sink=SINK)),
+         None, backward=False, note="no-grad fwd, production verbatim")
+
+    def infer_delta_flexrow():
+        sparse = (flex_hc(q, k8, v8, bm, enable_gqa=True) if needs_hc
+                  else _get_flex()(q, k8, v8, block_mask=bm, scale=scaling,
+                                   enable_gqa=True)).transpose(1, 2)
+        return delta_compose(sparse, anchor_rows_flexrow(), H_Q)
+    cell("infer-delta-flexrow", nograd(infer_delta_flexrow), None,
+         backward=False,
+         note="no-grad fwd, GQA-native sparse"
+              + (f", {HC} head chunks" if needs_hc else ""))
+
+    if needs_hc:
+        # ---- fwd+bwd at lengths where no monolithic graph fits: backward
+        # per head group, so only one group's graph is alive at a time.
+        # GQA-native sparse (no 32-head K/V copies — those are what OOM'd
+        # the expanded -hc4 cell at 1M); flexgqa == flex within 0.5%
+        # (swabench §Q), and flex_hc gqa-native parity is asserted at 8K.
+        g_cb = torch.randn(1, s, H_Q, D, device=dev, dtype=dt)
+        gq, gkv = H_Q // HC, H_KV // HC
+
+        def full_delta_chunkbwd():
+            for i in range(HC):
+                qs = q[:, i * gq:(i + 1) * gq]
+                ks = k8[:, i * gkv:(i + 1) * gkv]
+                vs = v8[:, i * gkv:(i + 1) * gkv]
+                sparse = _get_flex()(qs, ks, vs, block_mask=bm,
+                                     scale=scaling, enable_gqa=True) \
+                    .transpose(1, 2)
+                dsel = _get_flex()(qs[:, :, sel], ks, vs, block_mask=bm_row,
+                                   scale=scaling, enable_gqa=True) \
+                    .transpose(1, 2)
+                delta_compose(sparse, dsel, gq) \
+                    .backward(g_cb[:, :, i * gq:(i + 1) * gq])
+        cell(f"full-delta-chunkbwd{HC}", full_delta_chunkbwd, None,
+             self_backward=True,
+             note=f"GQA-native, backward per head group x{HC}")
+
+        def full_dense_chunkbwd():
+            for i in range(HC):
+                out_i = F.scaled_dot_product_attention(
+                    q[:, i * gq:(i + 1) * gq],
+                    k8[:, i * gkv:(i + 1) * gkv],
+                    v8[:, i * gkv:(i + 1) * gkv],
+                    is_causal=True, scale=scaling, enable_gqa=True) \
+                    .transpose(1, 2)
+                out_i.backward(g_cb[:, :, i * gq:(i + 1) * gq])
+        cell(f"full-dense-chunkbwd{HC}", full_dense_chunkbwd, None,
+             self_backward=True,
+             note=f"causal dense reference, backward per head group x{HC}")
+        del g_cb
 
     del q, k8, v8, sparse_out, anchor_out, q1
     gc.collect()
