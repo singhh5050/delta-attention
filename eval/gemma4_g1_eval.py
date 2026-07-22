@@ -223,12 +223,20 @@ def plain_greedy(target, ids, max_new, offload=False, chunk=0):
     divergences at >=24)."""
     cache = make_cache(target, offload)
     bulk_prefill(target, ids[:, :-1], cache, chunk)
+    # SAME kwargs as run_arm's forwards (output_hidden_states +
+    # return_shared_kv_states): "exact forward pattern" must include the
+    # flags — they demonstrably perturb numerics under offload, and a
+    # flag-mismatched reference would blame the loop for it (review
+    # wf_31d5f03b finding 10)
     out = target(input_ids=ids[:, -1:], past_key_values=cache,
-                 use_cache=True)
+                 use_cache=True, output_hidden_states=True,
+                 return_shared_kv_states=True)
     toks = [int(out.logits[0, -1].argmax(-1).item())]
     while len(toks) < max_new:
         out = target(input_ids=torch.tensor([[toks[-1]]], device=ids.device),
-                     past_key_values=cache, use_cache=True)
+                     past_key_values=cache, use_cache=True,
+                     output_hidden_states=True,
+                     return_shared_kv_states=True)
         toks.append(int(out.logits[0, -1].argmax(-1).item()))
     return toks
 
@@ -442,6 +450,9 @@ def main():
         w.writerow(HEADER)
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    if "full" in arms:  # pairing anchor must run first — every other
+        arms.remove("full")  # arm's rows are interpreted against it
+        arms.insert(0, "full")
 
     if args.parity_check:
         # independent cross-check vs NATIVE assisted decoding, once per
@@ -593,6 +604,21 @@ def main():
                 gc.collect()
                 torch.cuda.empty_cache()
                 if oomed:
+                    if arm == "full":
+                        # no pairing anchor for this prompt: the other
+                        # arms' rows would enter per-arm means UNPAIRED
+                        # and silently skew the cross-arm comparison
+                        # (review wf_31d5f03b finding 7) — skip them,
+                        # visibly
+                        for a2 in arms[arms.index(arm) + 1:]:
+                            w.writerow([tier, i, a2, ids.shape[1],
+                                        "SKIPPED-no-full-pair"] +
+                                       [""] * (len(HEADER) - 6) + [run.id])
+                        fh.flush()
+                        print(f"[g1] tier {tier} #{i}: remaining arms "
+                              "SKIPPED (full arm OOM'd — no pair)",
+                              flush=True)
+                        break
                     continue
                 if arm == "full":
                     ref_tokens = r["tokens"]
