@@ -449,3 +449,56 @@ validated at 131K where both exist: 430.0 vs 432.5, <1% apart):
   speculation depths. Direction/magnitude small (walls are consistent
   across rows); G1 re-measures under our own loop. Do not quote v3
   speedups beyond "~1.2-1.5x ballpark".
+
+## V. Gemma 4 G1 — delta-reading the native MTP drafter (07-22, boxes
+## 42-44; CERTIFIED run 92y2luja @711817f, CSVs
+## rescue/2026-07-22-g1-v3/ + archive ogv8a0ra; earlier iterations
+## f9juentk/zmqfnu2f superseded — see caveats)
+
+Design: our own draft-verify loop (transcribed verbatim from
+transformers' Gemma4 candidate generator; eval/gemma4_g1_eval.py). The
+drafter is NEVER modified — arms differ only in the shared_kv_states
+view it is handed: full / sparse (full_attention entry subsampled to
+sink1024+window2048) / deltaN (full read every Nth drafter call). The
+trunk verifies greedily, so acceptance is exact and outputs are the
+trunk-greedy chain BY CONSTRUCTION (output "quality" cannot differ
+across arms; acceptance is the metric).
+
+Gates (all green on 92y2luja): zero-tolerance parity vs plain trunk
+greedy computed with IDENTICAL forward shapes (64/64 x4 at 4K+8K);
+independent short-context native-assisted cross-check 32/32.
+
+| tier | arm    | acc/round | acc_rate | draft ms | n |
+|------|--------|-----------|----------|----------|---|
+| 4096 | full   | 1.97      | 0.40     | 4.4      | 6 |
+| 4096 | sparse | 1.95      | 0.39     | 4.2      | 6 |
+| 4096 | delta2 | 1.96      | 0.39     | 4.3      | 6 |
+| 4096 | delta4 | 1.96      | 0.39     | 4.2      | 6 |
+| 8192 | full   | 1.18      | 0.24     | 5.0      | 6 |
+| 8192 | sparse | 1.19      | 0.24     | 4.2      | 6 |
+| 8192 | delta2 | 1.20      | 0.24     | 4.6      | 6 |
+| 8192 | delta4 | 1.18      | 0.24     | 4.4      | 6 |
+
+- **HEADLINE (as far as measured): the sparse read of the trunk cache is
+  FREE for the trained multi-step drafter** — at 8K only 37% of the
+  cache is visible to the sparse arm and acceptance is indistinguishable
+  from the full read (1.19 vs 1.18/round), while the drafter call is
+  ~16% cheaper (4.2 vs 5.0ms; gap grows with cache length).
+- The earlier apparent 8K gap (sparse 1.01 vs full 1.08, box-43 run
+  zmqfnu2f) VANISHED under corrected sliding-entry semantics — it was an
+  artifact of handing the drafter full-length sliding states (uncapped
+  workaround cache), not a delta effect. Boxes 42/43 absolute numbers
+  are superseded; their arm-deltas were directionally fine.
+- Acceptance drops with context for ALL arms including full (1.97 ->
+  1.18/round from 4K to 8K): a property of the native drafter on long
+  PG19 continuations, not of delta-ification.
+- >=16K blocked twice: uncapped cache = 62GB weights + 16.6GB KV @32K
+  (box 43); native hybrid cache still 76GB ALLOCATED at 16K prefill
+  (box 44 memory dump — prefill transients + allocator litter). v4
+  (in flight, box 45): CPU-offloaded uncapped cache + drafter sliding
+  entry capped to native window+1 by us + inter-arm cleanup; offload
+  slows decode but cannot affect acceptance.
+- Parity above 8K is structurally unverifiable against native (native
+  assisted OOMs >=16K on the uncapped cache and crashes on hybrid —
+  upstream bug, §U); the zero-tolerance plain-greedy gate covers our
+  loop at every tier it runs.
