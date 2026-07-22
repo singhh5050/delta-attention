@@ -202,8 +202,13 @@ def bench_seq_len(s, warmup, iters, rows, run):
     # anchor-masked: both pay gather fwd + scatter bwd into q.grad)
     def flexrow_mask(b, h, q_idx, kv_idx):
         return kv_idx <= sel[q_idx]
+    # _compile=True: the eager path materializes the full n_sel x s bool
+    # mask plus an O(n_sel*s) block-sum intermediate (~17GB+ at 1M) before
+    # compressing — same class of OOM that killed the 07-22 long ladder on
+    # the causal mask (fixed in flex_delta.get_block_mask the same way)
     bm_row = create_block_mask(flexrow_mask, B=None, H=None,
-                               Q_LEN=n_sel, KV_LEN=s, device=dev)
+                               Q_LEN=n_sel, KV_LEN=s, device=dev,
+                               _compile=True)
     cell("anchor-flexrow",
          lambda: _get_flex()(q[:, :, sel], k8, v8, block_mask=bm_row,
                              scale=scaling, enable_gqa=True),

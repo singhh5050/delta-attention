@@ -60,7 +60,13 @@ def get_block_mask(s: int, window: int, sink: int, device: str):
         block_last = (q_idx // Q_BLOCK) * Q_BLOCK + (Q_BLOCK - 1)
         return (q_idx >= kv_idx) & ((kv_idx < sink) | (kv_idx + window > block_last))
 
-    return create_block_mask(mask_mod, B=None, H=None, Q_LEN=s, KV_LEN=s, device=device)
+    # _compile=True builds the BlockMask directly from mask_mod; the eager
+    # path first materializes the full s x s boolean mask, whose block-sum
+    # intermediate is O(s^2) — 128GB at 131K (OOM'd the anchorbench long
+    # ladder, 07-22). Same BlockMask either way; lru_cache pays the compile
+    # once per shape.
+    return create_block_mask(mask_mod, B=None, H=None, Q_LEN=s, KV_LEN=s,
+                             device=device, _compile=True)
 
 
 def anchor_layout(s: int, gamma: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
