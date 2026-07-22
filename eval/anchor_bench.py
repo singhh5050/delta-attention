@@ -56,7 +56,20 @@ from torch.nn.attention.flex_attention import create_block_mask  # noqa: E402
 SINK, WINDOW, GAMMA = 1024, 2048, 64
 H_Q, H_KV, D = 32, 8, 128  # Llama-3.1-8B geometry
 _HC_CERTIFIED = False  # flex_hc parity cert ran in THIS process
-SKIP_CELLS = ()  # label prefixes skipped via --skip (rows say SKIPPED)
+SKIP_CELLS = ()  # EXACT cell labels skipped via --skip (rows say SKIPPED)
+# every cell label that can appear, for --skip validation: a typo'd entry
+# silently no-ops and the known-fatal cell it meant to skip executes
+# (review wf_feecd1bf — at 1M that poisons the CUDA context). cell()
+# asserts against this list so it can never go stale.
+KNOWN_CELLS = (
+    "sparse-flex", "sparse-flex-hc4", "gqa-expand",
+    "anchor-masked", "anchor-flash!", "anchor-mathonly", "anchor-efficient",
+    "anchor-flexrow", "correction", "headread-dense", "headread-delta",
+    "full-delta-current", "full-delta-flexrow", "full-delta-flexrow-hc4",
+    "full-dense", "infer-dense", "infer-delta-current", "infer-delta-flexrow",
+    "infer-delta-flexrow-lowmem", "full-delta-chunkbwd4",
+    "full-dense-chunkbwd4", "hc-parity-cert",
+)
 
 
 def gpu_state():
@@ -154,7 +167,11 @@ def bench_seq_len(s, warmup, iters, rows, run):
 
     def cell(label, fn, out_shape, backward=True, expect_raise=False,
              note="", self_backward=False):
-        if any(label.startswith(sk) for sk in SKIP_CELLS):
+        assert label in KNOWN_CELLS, \
+            f"cell label {label!r} missing from KNOWN_CELLS — add it"
+        # EXACT match (review wf_feecd1bf: prefix matching made 'full-dense'
+        # silently swallow 'full-dense-chunkbwd4' and siblings)
+        if label in SKIP_CELLS:
             # e.g. anchor-masked at 1M: its mem-efficient backward hits an
             # ILLEGAL MEMORY ACCESS under expandable_segments (07-22 box
             # 41), which poisons the CUDA context for every later cell —
@@ -338,7 +355,7 @@ def bench_seq_len(s, warmup, iters, rows, run):
     n_anchor = idx.numel()
     idx_dev = idx.to(dev)  # needed by delta_compose even when skipping
     sparse_out = anchor_out = None
-    if not any("correction".startswith(sk) for sk in SKIP_CELLS):
+    if "correction" not in SKIP_CELLS:
         # leaves allocated ONLY when the cell runs: sparse_out alone is
         # ~8.6GB at 1M and skipping the cell but keeping its residue
         # defeats the minimal-residue --skip run (review wf_feecd1bf)
@@ -361,6 +378,12 @@ def bench_seq_len(s, warmup, iters, rows, run):
         cell("correction", correction, (1, s, H_Q, D))
         leaves.clear()
         leaves.extend(old_leaves)
+        # free the ~8.7GB leaves NOW, not at end-of-function: they were
+        # pushing later OOM-marginal cells (the reason lowmem exists) into
+        # false OOM rows on every long-length run (review wf_feecd1bf)
+        sparse_out = anchor_out = leaves_c = correction = None  # noqa: F841
+        gc.collect()
+        torch.cuda.empty_cache()
     else:
         rows.append(["correction", s, "per-layer-fwd", "SKIPPED", "",
                      "skipped via --skip (leaf alloc avoided)"])
@@ -502,19 +525,31 @@ def bench_seq_len(s, warmup, iters, rows, run):
         # the expanded -hc4 cell at 1M); flexgqa == flex within 0.5%
         # (swabench §Q), and flex_hc gqa-native parity is asserted once per
         # process at the smallest non-capped length.
-        try:
-            # the seed alone is ~8.6GB at 1M — its OOM is a result for BOTH
-            # chunkbwd cells, not a crash that loses the length's rows
-            g_cb = torch.randn(1, s, H_Q, D, device=dev, dtype=dt)
-        except torch.cuda.OutOfMemoryError:
-            for lbl in (f"full-delta-chunkbwd{HC}", f"full-dense-chunkbwd{HC}"):
-                rows.append([lbl, s, "per-layer-fwd", "OOM", "OOM",
-                             "gradient seed alone does not fit"])
-                print(f"[anchorbench] {lbl:18s} s={s:>7} OOM on grad seed "
-                      "(recorded as data)", flush=True)
+        cb_labels = [f"full-delta-chunkbwd{HC}", f"full-dense-chunkbwd{HC}"]
+        if all(lbl in SKIP_CELLS for lbl in cb_labels):
+            # both cells skipped -> never allocate the ~8.6GB seed (review
+            # wf_feecd1bf: allocating despite --skip can OOM and misreport
+            # an explicitly-skipped cell as an OOM result)
+            for lbl in cb_labels:
+                rows.append([lbl, s, "per-layer-fwd", "SKIPPED", "",
+                             "skipped via --skip (seed alloc avoided)"])
+                print(f"[anchorbench] {lbl:18s} s={s:>7} SKIPPED (--skip, "
+                      "seed not allocated)", flush=True)
             g_cb = None
-            gc.collect()
-            torch.cuda.empty_cache()
+        else:
+            try:
+                # the seed alone is ~8.6GB at 1M — its OOM is a result for
+                # BOTH chunkbwd cells, not a crash losing the length's rows
+                g_cb = torch.randn(1, s, H_Q, D, device=dev, dtype=dt)
+            except torch.cuda.OutOfMemoryError:
+                g_cb = None
+                for lbl in cb_labels:
+                    rows.append([lbl, s, "per-layer-fwd", "OOM", "OOM",
+                                 "gradient seed alone does not fit"])
+                    print(f"[anchorbench] {lbl:18s} s={s:>7} OOM on grad "
+                          "seed (recorded as data)", flush=True)
+                gc.collect()
+                torch.cuda.empty_cache()
         gq, gkv = H_Q // HC, H_KV // HC
 
         def full_delta_chunkbwd():
@@ -567,6 +602,11 @@ def main():
     args = p.parse_args()
     global SKIP_CELLS
     SKIP_CELLS = tuple(x.strip() for x in args.skip.split(",") if x.strip())
+    unknown = [x for x in SKIP_CELLS if x not in KNOWN_CELLS]
+    if unknown:  # a typo'd --skip must fail HERE, not let the known-fatal
+        raise SystemExit(  # cell run and poison the CUDA context
+            f"--skip entries match no known cell: {unknown}\n"
+            f"known cells: {', '.join(KNOWN_CELLS)}")
 
     import wandb
     run = wandb.init(project=os.environ.get("WANDB_PROJECT", "delta-attention"),

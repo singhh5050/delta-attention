@@ -148,18 +148,35 @@ def main():
         args.assistant, dtype=torch.bfloat16, device_map="cuda")
     target.eval()
     assistant.eval()
-    nat = getattr(target.generation_config, "num_assistant_tokens", None)
-    print(f"[g4] generation_config.num_assistant_tokens={nat}", flush=True)
+    # transformers' heuristic schedule MUTATES num_assistant_tokens across
+    # generate() calls, so the second (full-length) call would run at a
+    # different speculation depth than the first — snapshot the initial
+    # value and restore it before every assisted call so each measurement
+    # starts from the same operating point (review wf_feecd1bf)
+    nat0 = {}
+    for m in (target, assistant):
+        v = getattr(m.generation_config, "num_assistant_tokens", None)
+        if v is not None:
+            nat0[m] = v
+    print(f"[g4] num_assistant_tokens (initial): "
+          f"{[v for v in nat0.values()] or None}", flush=True)
+
+    def reset_schedule():
+        for m, v in nat0.items():
+            m.generation_config.num_assistant_tokens = v
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists():  # appending 17-col rows under an older header
+    # zero-byte files (touched by orchestration, or a run that died between
+    # open and header write) are NEW, not mismatched
+    has_data = out_path.exists() and out_path.stat().st_size > 0
+    if has_data:  # appending 17-col rows under an older header
         with out_path.open() as f:  # silently misaligns every column
             first = f.readline().strip().split(",")
         if first != HEADER:
             raise SystemExit(f"CSV schema mismatch in {out_path} — move or "
                              "delete the old file (or pass a fresh --out)")
-    new = not out_path.exists()
+    new = not has_data
     fh = out_path.open("a", newline="")
     w = csv.writer(fh)
     if new:
@@ -172,7 +189,10 @@ def main():
         fh.flush()
 
     half = max(args.max_new // 2, 8)
-    gate_rows = []  # bool per measured row
+    gate_rows = {}  # tier -> [bool per measured row]: the gate is PER TIER
+    # (a pooled fraction lets one fully-broken tier hide behind a clean
+    # one — tier-correlated breakage is exactly the upstream-cache class
+    # of bug this harness works around; review wf_feecd1bf)
     for tier in [int(x) for x in args.tiers.split(",")]:
         ctxs = load_contexts(tok, args.n, tier)
         rows_done = 0
@@ -185,19 +205,56 @@ def main():
             inputs = tok(prompt, return_tensors="pt",
                          add_special_tokens=False).to("cuda")
             n_prompt = inputs["input_ids"].shape[1]
+            # each call individually OOM-attributed: "plain fits, assisted
+            # doesn't" is a memory-boundary RESULT, not a discarded row
+            stage = "warmup"
             try:
                 if not warmed:  # compile/cache paths, both modes
                     gen(target, inputs, 16)
+                    reset_schedule()
                     gen(target, inputs, 16, assistant)
                     warmed = True
+                stage = "plain_half"
                 plain_h, t_ph = gen(target, inputs, half)
+                stage = "plain_full"
                 plain, t_p = gen(target, inputs, args.max_new)
+                stage = "assisted_half"
+                reset_schedule()
                 asst_h, t_ah = gen(target, inputs, half, assistant)
+                stage = "assisted_full"
+                reset_schedule()
                 assisted, t_a = gen(target, inputs, args.max_new, assistant)
             except torch.cuda.OutOfMemoryError:
-                row(tier, i, n_prompt, plain_toks="OOM")
-                print(f"[g4] tier {tier} #{i}: OOM (recorded)", flush=True)
+                partial = {}
+                if stage in ("plain_full", "assisted_half", "assisted_full"):
+                    partial.update(plain_half_toks=plain_h.numel(),
+                                   plain_half_s=f"{t_ph:.2f}")
+                if stage in ("assisted_half", "assisted_full"):
+                    partial.update(plain_toks=plain.numel(),
+                                   plain_s=f"{t_p:.2f}")
+                if stage == "assisted_full":
+                    partial.update(asst_half_toks=asst_h.numel(),
+                                   asst_half_s=f"{t_ah:.2f}")
+                partial[{"warmup": "plain_toks", "plain_half": "plain_toks",
+                         "plain_full": "plain_toks",
+                         "assisted_half": "asst_half_toks",
+                         "assisted_full": "assisted_toks"}[stage]] = \
+                    f"OOM@{stage}"
+                row(tier, i, n_prompt, **partial)
+                print(f"[g4] tier {tier} #{i}: OOM at {stage} (recorded)",
+                      flush=True)
                 torch.cuda.empty_cache()
+                continue
+            if plain.numel() < 2 or assisted.numel() < 2:
+                # degenerate (immediate eos): record, but NEVER count it
+                # toward the parity gate — two empty outputs are vacuously
+                # "exact" and would certify a harness that measured nothing
+                # (review wf_feecd1bf)
+                row(tier, i, n_prompt,
+                    plain_toks=plain.numel(), plain_s=f"{t_p:.2f}",
+                    assisted_toks=assisted.numel(), assisted_s=f"{t_a:.2f}")
+                print(f"[g4] tier {tier} #{i}: near-empty generation — "
+                      "recorded, excluded from gate/stats", flush=True)
                 continue
             pp = parity_prefix(plain, assisted)
             # exact requires SAME length AND full match — a matching prefix
@@ -217,8 +274,8 @@ def main():
                 decode_speedup=f"{sp:.3f}" if sp else "",
                 parity_prefix=pp, exact_match=exact)
             if args.min_parity_prefix:
-                gate_rows.append(bool(exact)
-                                 or pp >= args.min_parity_prefix)
+                gate_rows.setdefault(tier, []).append(
+                    bool(exact) or pp >= args.min_parity_prefix)
             rows_done += 1
             print(f"[g4] tier {tier} #{i}: decode plain "
                   f"{dp:.1f} tok/s" if dp else
@@ -235,16 +292,19 @@ def main():
         if not gate_rows:
             raise SystemExit(
                 "G0 GATE FAILED: no parity measurements at all (every row "
-                "OOM'd) — the gate cannot certify an unmeasured harness")
-        frac = sum(gate_rows) / len(gate_rows)
-        run.summary["parity_pass_frac"] = frac
-        if frac < 0.5:
-            raise SystemExit(
-                f"G0 GATE FAILED: only {sum(gate_rows)}/{len(gate_rows)} "
-                "rows parity-pass — assisted greedy diverges from plain "
-                "greedy systematically; harness or upstream bug")
-        print(f"[g4] G0 gate PASS ({sum(gate_rows)}/{len(gate_rows)} rows)",
-              flush=True)
+                "OOM'd or degenerate) — the gate cannot certify an "
+                "unmeasured harness")
+        for tier, gr in sorted(gate_rows.items()):
+            frac = sum(gr) / len(gr)
+            run.summary[f"parity_pass_frac_{tier}"] = frac
+            if frac < 0.5:
+                raise SystemExit(
+                    f"G0 GATE FAILED: tier {tier} has only "
+                    f"{sum(gr)}/{len(gr)} rows parity-passing — assisted "
+                    "greedy diverges systematically at this tier; harness "
+                    "or upstream bug")
+            print(f"[g4] G0 gate tier {tier}: PASS ({sum(gr)}/{len(gr)} "
+                  "rows)", flush=True)
     run.finish()
     print("[g4] DONE", flush=True)
 
