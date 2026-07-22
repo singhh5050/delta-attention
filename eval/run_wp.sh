@@ -1099,17 +1099,23 @@ if [ -n "$GEMMA4G1" ]; then
     && "$G4PY" -c "from transformers import Gemma4AssistantForCausalLM; print('gemma4_assistant import OK')" \
     || { stage "g1-venv:FAILED"; exit 1; }
   stage "g1-venv:PASS"
-  # gate: OUR loop with the untouched-KV arm must reproduce native
-  # assisted decoding token-for-token (min prefix) before any arm runs
+  # gate: zero-tolerance parity vs PLAIN trunk greedy (shape-aligned
+  # reference) + one short-context native-assisted cross-check, run on
+  # the offload path at the already-certified 4K/8K tiers first — the
+  # full-arm acceptance here must also reproduce run 92y2luja
+  # (4K 1.97, 8K 1.18 acc/round) as the offload-vs-native anchor
   stage "g1-smoke:running"
   "$G4PY" eval/gemma4_g1_eval.py --n 2 --tiers 4096,8192 --max-new 64 \
     --arms full --parity-check --offload --out results/g1_smoke.csv \
     || { stage "g1-smoke:FAILED"; exit 1; }
   stage "g1-smoke:PASS"
+  # --parity-check STAYS ON at the long tiers: these are the tiers the
+  # results come from, so the gate must run where they run (review
+  # 2026-07-22: an ungated 16K+ arms run would certify nothing)
   stage "g1-arms:running"
   "$G4PY" eval/gemma4_g1_eval.py --n 4 --tiers 16384,32768,65536 \
     --max-new 128 --k 5 --arms full,sparse,delta2,delta4 --offload \
-    --out results/g1_tiers.csv \
+    --parity-check --out results/g1_tiers.csv \
     || { stage "g1-arms:FAILED"; exit 1; }
   stage "g1-arms:PASS"
 fi

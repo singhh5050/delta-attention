@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import os
 import time
 from pathlib import Path
@@ -61,7 +62,7 @@ INSTR = ("Continue this story in the same style. Write a long, natural "
 
 HEADER = ["tier", "idx", "arm", "prompt_toks", "rounds", "drafted",
           "accepted", "acc_per_round", "acc_rate", "bonus", "total_new",
-          "draft_call_ms", "match_vs_full", "run_id"]
+          "draft_call_ms", "draft_call_ms_warm", "match_vs_full", "run_id"]
 
 
 def parse_args():
@@ -72,8 +73,10 @@ def parse_args():
     p.add_argument("--k", type=int, default=5, help="drafts per round")
     p.add_argument("--arms", type=str, default="full,sparse,delta4")
     p.add_argument("--parity-check", action="store_true",
-                   help="also run native generate() and require the full "
-                        "arm's tokens to match it exactly (smoke gate)")
+                   help="zero-tolerance parity gate: the full arm must match "
+                        "PLAIN trunk greedy (shape-aligned reference) at "
+                        "every tier, plus one short-context native-assisted "
+                        "cross-check per run")
     p.add_argument("--target", type=str, default=TARGET)
     p.add_argument("--assistant", type=str, default=ASSISTANT)
     p.add_argument("--offload", action="store_true",
@@ -115,6 +118,17 @@ def cap_sliding(kv):
     return out
 
 
+def kv_to_dev(kv, dev):
+    """Materialize a shared_kv_states view on the compute device. The
+    drafter's own forward would do this move INSIDE our timed window
+    (modeling_gemma4_assistant moves shared_kv_states to target_device),
+    which under --offload charges the full arm a whole-cache H2D copy per
+    call while sparse pays a tiny one — a PCIe artifact, not read cost.
+    No-op (returns the same tensors) when the view is already resident."""
+    return {k_: (kk.to(dev, non_blocking=True), vv.to(dev, non_blocking=True))
+            for k_, (kk, vv) in kv.items()}
+
+
 def arm_view(kv, arm, call_idx):
     """The intervention: how THIS drafter call sees the trunk KV (already
     exactly the validated prefix). call_idx is GLOBAL across rounds
@@ -142,14 +156,12 @@ def arm_view(kv, arm, call_idx):
 @torch.no_grad()
 def plain_greedy(target, ids, max_new, offload=False):
     """Reference chain via the EXACT forward pattern of run_arm — split
-    prefill (bulk, then 1-token) + sequential q_len=1 decode + explicit
-    hybrid cache — so every position's kernel shapes align, token 0
+    prefill (bulk, then 1-token) + sequential q_len=1 decode + the same
+    make_cache — so every position's kernel shapes align, token 0
     included. Against this, ANY divergence is a real loop bug (review
     wf_8f9b74c6: the previous single-prefill reference could tie-flip
     token 0, and the tolerance that excused it also passed real
     divergences at >=24)."""
-    from transformers import DynamicCache
-
     cache = make_cache(target, offload)
     target(input_ids=ids[:, :-1], past_key_values=cache, use_cache=True,
            logits_to_keep=1)
@@ -175,14 +187,21 @@ def _st(s):
 def make_cache(target, offload):
     from transformers import DynamicCache
 
-    kwargs = [{"config": target.config, "offloading": offload},
-              {"config": target.config}]
-    for kw in kwargs:
+    if offload:
+        # NEVER fall back silently: a non-offloaded hybrid cache is exactly
+        # the >=16K OOM wall (76GB at 16K prefill, box 44), and a silent
+        # fallback would also mislabel the cache config of every result
         try:
-            return DynamicCache(**kw)
-        except TypeError:
-            continue
-    return DynamicCache(config=target.config.get_text_config())
+            return DynamicCache(config=target.config, offloading=True)
+        except TypeError as e:
+            raise SystemExit(
+                f"--offload requested but DynamicCache rejects offloading= "
+                f"({e}) — installed transformers-main drifted; refusing to "
+                "run non-offloaded under an offload label")
+    try:
+        return DynamicCache(config=target.config)
+    except TypeError:
+        return DynamicCache(config=target.config.get_text_config())
 
 
 @torch.no_grad()
@@ -193,19 +212,19 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
     Cache invariant: the trunk cache holds the validated prefix EXCLUDING
     the newest validated token. VERIFY IS SEQUENTIAL (one token per
     forward): q_len=1 never triggers the upstream sliding-mask/shared-KV
-    length bug, so the trunk runs on its NATIVE hybrid cache
-    (DynamicCache(config=...), window-capped sliding layers — the
-    uncapped-cache workaround was what OOM'd the trunk prefill at >=16K
-    on box 43), and stopping at the first mismatch removes cache
-    cropping entirely. KNOWN 1-ROW DEVIATION from native: the native
+    length bug, and stopping at the first mismatch removes cache cropping
+    entirely. Cache: without --offload the trunk runs on its NATIVE hybrid
+    cache (DynamicCache(config=...), window-capped sliding layers); with
+    --offload it runs on an UNCAPPED CPU-offloaded cache (the hybrid cache
+    allocates 76GB at a 16K prefill, box 44) whose full-length sliding
+    shared-KV entry we re-cap to native length (window+1) via cap_sliding
+    before the drafter ever sees it. KNOWN 1-ROW DEVIATION from native: the native
     generator's KV slice exposes the rejected draft's KV at the bonus
     position (we never forward rejected drafts). This is a DOCUMENTED
     RESIDUAL DIFFERENCE — structurally invisible to the plain-greedy
     gate (it can only shift ACCEPTANCE, never validated tokens) — and
     only the short-context native cross-check brushes against it.
     """
-    from transformers import DynamicCache
-
     dev = ids.device
     cache = make_cache(target, offload)
     # two-step prefill: output_hidden_states over the whole prompt would
@@ -240,6 +259,7 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
         # rejected draft) — no cropping exists or is needed; see the
         # docstring for the deliberate 1-row deviation from native
         kv_c = kv
+        moved_full = None  # per-round memo: the full read's on-device copy
         last_tok = torch.tensor([[newest]], device=dev)
         pos = torch.tensor([[L - 1]], dtype=torch.long, device=dev)
         drafts = []
@@ -251,6 +271,12 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
             inp = torch.cat([emb, h], dim=-1)
             view = arm_view(kv_c, arm, g_call)  # OUTSIDE the timed window
             g_call += 1                         # (review wf_4081ce31)
+            if view is kv_c:  # full read: identical every call this round
+                if moved_full is None:
+                    moved_full = kv_to_dev(view, dev)
+                view = moved_full
+            else:
+                view = kv_to_dev(view, dev)
             torch.cuda.synchronize()
             tt0 = time.monotonic()
             o = assistant(inputs_embeds=inp, attention_mask=None,
@@ -299,10 +325,15 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
         newest = bonus
 
     new_tokens = validated[ids.shape[1]:]
+    # warm mean drops the first timed call: after the inter-arm
+    # empty_cache every arm's call 0 pays allocator-pool growth (and
+    # prompt 0's first arm pays one-time kernel autotune) — report both
+    warm = call_ms[1:] if len(call_ms) > 1 else call_ms
     return dict(rounds=rounds, drafted=drafted, accepted=accepted,
                 bonus=bonus_ct, total_new=len(new_tokens),
                 tokens=new_tokens,
-                draft_call_ms=sum(call_ms) / max(len(call_ms), 1))
+                draft_call_ms=sum(call_ms) / max(len(call_ms), 1),
+                draft_call_ms_warm=sum(warm) / max(len(warm), 1))
 
 
 def main():
@@ -324,6 +355,17 @@ def main():
     assistant = AutoModelForCausalLM.from_pretrained(
         args.assistant, dtype=torch.bfloat16, device_map="cuda").eval()
     embed = target.get_input_embeddings()
+
+    # derive the native sliding-entry cap from the ACTUAL config instead of
+    # trusting the hand-derived 1025 (window+1): a different --target or an
+    # upstream window change would silently re-create the box-42/43
+    # sliding-semantics artifact class
+    sw = getattr(target.config.get_text_config(), "sliding_window", None)
+    if sw:
+        globals()["SLIDING_CAP"] = sw + 1
+    print(f"[g1] sliding cap {SLIDING_CAP} (config sliding_window={sw}), "
+          f"offload={args.offload}", flush=True)
+    run.summary["sliding_cap"] = SLIDING_CAP
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,6 +411,11 @@ def main():
         print(f"[g1] native cross-check (short ctx): prefix {m}/{n_cmp}",
               flush=True)
         run.summary["native_crosscheck_prefix"] = m
+        if n_cmp < 16:
+            raise SystemExit(
+                f"G1 GATE MISCONFIGURED: native cross-check compared only "
+                f"{n_cmp} tokens (early EOS?) — too short to certify "
+                "anything; pick a different context or raise max_new")
         if m < min(16, n_cmp):
             raise SystemExit(
                 f"G1 GATE FAILED: short-context native cross-check "
@@ -385,12 +432,21 @@ def main():
             ids = tok(prompt, return_tensors="pt",
                       add_special_tokens=False)["input_ids"].cuda()
             ref_tokens = None
+            full_oomed = False
             for arm in arms:
                 try:
                     r = run_arm(target, assistant, embed, ids, arm,
                                 args.k, args.max_new,
                                 offload=args.offload)
-                except torch.cuda.OutOfMemoryError as e:
+                except (torch.cuda.OutOfMemoryError, MemoryError,
+                        RuntimeError) as e:
+                    # --offload can fail host-side (pinned/pageable alloc),
+                    # surfacing as MemoryError or a RuntimeError — treat
+                    # those as OOM rows too, but never mask a real bug
+                    if (isinstance(e, RuntimeError)
+                            and not isinstance(e, torch.cuda.OutOfMemoryError)
+                            and "out of memory" not in str(e).lower()):
+                        raise
                     w.writerow([tier, i, arm, ids.shape[1],
                                 f"OOM@{_LAST_STAGE}"] +
                                [""] * (len(HEADER) - 6) + [run.id])
@@ -405,20 +461,19 @@ def main():
                         print(torch.cuda.memory_summary(abbreviated=True),
                               flush=True)
                     oomed = True
+                    if arm == "full":
+                        full_oomed = True
                 else:
                     oomed = False
-                if oomed:
-                    # empty_cache INSIDE the handler ran while the live
-                    # exception still pinned run_arm's multi-GB locals —
-                    # cleanup only works after the frame is released
-                    import gc
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    continue
-                import gc
+                # ONE cleanup for both paths, AFTER the except frame is
+                # released (empty_cache inside the handler ran while the
+                # live exception still pinned run_arm's multi-GB locals);
+                # 48 arm-runs of allocator litter contributed to the 16K
+                # wall (59GB non-releasable, box 44)
                 gc.collect()
-                torch.cuda.empty_cache()  # 48 arm-runs of allocator litter
-                # contributed to the 16K wall (59GB non-releasable, box 44)
+                torch.cuda.empty_cache()
+                if oomed:
+                    continue
                 if arm == "full":
                     ref_tokens = r["tokens"]
                 # every validated token is a trunk argmax, so all arms
@@ -436,7 +491,8 @@ def main():
                 w.writerow([tier, i, arm, ids.shape[1], r["rounds"],
                             r["drafted"], r["accepted"], f"{apr:.3f}",
                             f"{rate:.3f}", r["bonus"], r["total_new"],
-                            f"{r['draft_call_ms']:.2f}", match, run.id])
+                            f"{r['draft_call_ms']:.2f}",
+                            f"{r['draft_call_ms_warm']:.2f}", match, run.id])
                 fh.flush()
                 print(f"[g1] tier {tier} #{i} {arm}: acc/round {apr:.2f} "
                       f"rate {rate:.2f} draft-call {r['draft_call_ms']:.1f}ms",
@@ -444,10 +500,17 @@ def main():
 
             if args.parity_check:
                 if ref_tokens is None:  # BEFORE the expensive reference
+                    if full_oomed:
+                        # nothing to certify for this prompt (its OOM row
+                        # is already written) — skip, don't kill the chain
+                        print(f"[g1] tier {tier} #{i}: parity SKIPPED — "
+                              "full arm OOM'd, no result to certify",
+                              flush=True)
+                        run.summary[f"parity_prefix_t{tier}_p{i}"] = "oom"
+                        continue
                     raise SystemExit(
-                        "G1 GATE MISCONFIGURED: --parity-check needs a "
-                        "successful 'full' arm run (it OOM'd or --arms "
-                        "omits it) — cannot certify")
+                        "G1 GATE MISCONFIGURED: --parity-check needs the "
+                        "'full' arm in --arms — cannot certify")
                 ref2 = plain_greedy(target, ids, args.max_new,
                                     offload=args.offload)
                 n_cmp = min(len(ref2), len(ref_tokens))

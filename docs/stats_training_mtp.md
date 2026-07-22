@@ -502,3 +502,25 @@ independent short-context native-assisted cross-check 32/32.
   assisted OOMs >=16K on the uncapped cache and crashes on hybrid —
   upstream bug, §U); the zero-tolerance plain-greedy gate covers our
   loop at every tier it runs.
+- v4 review amendments (2026-07-22, pre box-45 relaunch; 8-angle review
+  of 711817f/12bf1da/b8a180e): (1) the long-tier arms run now carries
+  --parity-check — the original v4 chain gated ONLY the 4K/8K smoke, so
+  16K+ numbers would have been produced with no gate at their own tier;
+  (2) make_cache fails LOUDLY if the offloading kwarg is rejected
+  (silent fallback would relabel a non-offloaded run as offloaded);
+  (3) the drafter's shared-KV view is moved to GPU OUTSIDE the timed
+  window (the drafter forward otherwise pays the full-cache H2D copy
+  inside draft_call_ms under offload — full arm charged GBs, sparse
+  KBs: a PCIe artifact that would inflate the "sparse cheaper" gap);
+  (4) SLIDING_CAP derived from config at runtime, not the hand-derived
+  1025; (5) new draft_call_ms_warm column (drops each arm-run's first
+  timed call: post-empty_cache allocator growth landed in call 0, and
+  fixed arm order made "full" absorb it every time); (6) native
+  cross-check now rejects runs where early EOS leaves <16 comparable
+  tokens. CAVEATS THAT REMAIN BY DESIGN: at 16K+ the plain-greedy gate
+  shares the offloaded cache + cap_sliding path with the loop (self-
+  referential — a trunk-side semantics shift under the uncapped cache
+  would be invisible to it); the offload-path anchor is the 4K/8K smoke,
+  whose full-arm acc/round must reproduce 92y2luja (4K 1.97, 8K 1.18).
+  Do NOT compare 16K+ absolute draft-ms against the non-offloaded 4K/8K
+  rows; within-tier arm gaps are the valid comparison.
