@@ -23,8 +23,15 @@ The arms differ ONLY in the shared_kv_states dict handed to the drafter:
     sparse   — the full_attention entry subsampled to sink+window
                (StreamingLLM-style read; rope is baked into the trunk's
                cached keys, so gathering preserves positions)
-    deltaN   — sparse, but every N-th drafter call in a round reads the
-               full entry (anchor-refresh cadence)
+    deltaN   — sparse, but every N-th drafter call reads the full entry
+               (anchor-refresh cadence, global counter)
+    deltacorrN — THE DELTA CORRECTION: sparse reads, but round-call 0
+               (and every N-th call after, within the round) anchors —
+               the drafter runs on both views, delta = full - sparse at
+               the full-attention layer output (captured via forward
+               hook; post-o_proj == pre-o_proj correction by linearity),
+               and delta is ADDED to subsequent sparse calls' outputs.
+               deltacorr5 with k=5 -> one anchor per round.
 Acceptance is verified by the TRUNK (greedy, strict prefix + bonus), so
 "accepted tokens per round" is exact and comparable across arms. Per-call
 drafter latency is logged per arm — that is the G2 read-cost data.
@@ -177,19 +184,28 @@ def kv_to_dev(kv, dev):
             for k_, (kk, vv) in kv.items()}
 
 
-def arm_view(kv, arm, call_idx):
-    """The intervention: how THIS drafter call sees the trunk KV (already
-    exactly the validated prefix). call_idx is GLOBAL across rounds
-    (review wf_4081ce31: a per-round index made the first call of every
-    round a full read — delta2 was 60% full reads and any N>k collapsed
-    to the same arm). deltaN = full read on every N-th drafter call over
-    the whole generation, 1/N full-read fraction."""
-    if arm == "full":
-        return kv
-    if arm.startswith("delta"):
-        n = int(arm[len("delta"):])
-        if call_idx % n == n - 1:  # every N-th call reads everything
-            return kv
+import re as _re
+
+ARM_RE = _re.compile(r"^(full|sparse|delta[1-9][0-9]*|deltacorr[1-9][0-9]*)$")
+
+
+def validate_arms(arms):
+    """Fail fast on unknown arm names: arm_view used to treat ANY
+    unrecognized string as the sparse arm, so a typo ('detla4') silently
+    produced plausible-looking rows under a fake label (review a15f950a
+    finding 2)."""
+    bad = [a for a in arms if not ARM_RE.match(a)]
+    if bad:
+        raise SystemExit(
+            f"unknown arm(s) {bad}; valid: full | sparse | deltaN "
+            "(full read every Nth call) | deltacorrN (sparse reads with "
+            "the delta CORRECTION, anchor every Nth call per round)")
+
+
+def sparse_view(kv):
+    """sink+window subsample of the full_attention entry (StreamingLLM
+    read; rope is baked into the trunk's cached keys, so gathering
+    preserves positions). No-op when the prefix fits inside sink+window."""
     k, v = kv["full_attention"]
     L = k.shape[2]
     if L <= SINK + WINDOW:
@@ -199,6 +215,79 @@ def arm_view(kv, arm, call_idx):
     out = dict(kv)
     out["full_attention"] = (ksub, vsub)
     return out
+
+
+def arm_view(kv, arm, call_idx):
+    """The intervention: how THIS drafter call sees the trunk KV (already
+    exactly the validated prefix). call_idx is GLOBAL across rounds
+    (review wf_4081ce31: a per-round index made the first call of every
+    round a full read — delta2 was 60% full reads and any N>k collapsed
+    to the same arm). deltaN = full read on every N-th drafter call over
+    the whole generation, 1/N full-read fraction. deltacorrN is handled
+    in the draft loop (it needs BOTH views at anchor calls)."""
+    if arm == "full":
+        return kv
+    if arm.startswith("delta") and not arm.startswith("deltacorr"):
+        n = int(arm[len("delta"):])
+        if call_idx % n == n - 1:  # every N-th call reads everything
+            return kv
+    return sparse_view(kv)
+
+
+class DeltaCorrState:
+    """Output-space delta correction for the drafter's full-attention
+    layer(s), via forward hooks — THE DRAFTER IS NEVER MODIFIED; the hook
+    only reads or adds to the module's output tensor.
+
+    Mechanism (the correction we previously skipped): at an ANCHOR call
+    the drafter runs twice — once on the full KV view (its output is the
+    draft), once on the sparse view (bookkeeping) — and the hook captures
+    the full-attention module's output under each; delta = full - sparse.
+    On the following sparse calls the hook ADDS delta to the module
+    output. The module output is post-o_proj; o_proj is linear, so
+    correcting there is mathematically identical to the paper's
+    pre-o_proj correction (the projection of the difference equals the
+    difference of the projections; bias cancels in the subtraction).
+
+    Cadence is PER ROUND, anchor on round-call 0 by default: within a
+    drafting round the KV view is frozen (only the query changes), so
+    delta staleness is pure query drift — the well-posed regime, unlike
+    decode-time correction over a growing cache."""
+
+    def __init__(self):
+        self.mode = "off"  # off | capture | apply
+        self.buf = {}
+        self.delta = {}
+
+    def hook(self, module, args, kwargs, output):
+        is_tuple = isinstance(output, tuple)
+        out0 = output[0] if is_tuple else output
+        if self.mode == "capture":
+            self.buf[id(module)] = out0
+            return None
+        if self.mode == "apply" and id(module) in self.delta:
+            corrected = out0 + self.delta[id(module)]
+            return ((corrected,) + tuple(output[1:])) if is_tuple else corrected
+        return None
+
+
+def full_attn_modules(assistant):
+    """The drafter's full_attention self-attn module(s), located via
+    config.layer_types — no hardcoded layer index."""
+    mdl = assistant
+    for _ in range(4):
+        if hasattr(mdl, "layers"):
+            break
+        mdl = (mdl.language_model if hasattr(mdl, "language_model")
+               else mdl.model)
+    else:
+        raise SystemExit("deltacorr: no decoder .layers found on assistant")
+    lts = assistant.config.get_text_config().layer_types
+    mods = [mdl.layers[i].self_attn for i, t in enumerate(lts)
+            if t == "full_attention"]
+    if not mods:
+        raise SystemExit("deltacorr: assistant has no full_attention layer")
+    return mods
 
 
 def bulk_prefill(target, ids_prefix, cache, chunk):
@@ -223,20 +312,17 @@ def plain_greedy(target, ids, max_new, offload=False, chunk=0):
     divergences at >=24)."""
     cache = make_cache(target, offload)
     bulk_prefill(target, ids[:, :-1], cache, chunk)
-    # SAME kwargs as run_arm's forwards (output_hidden_states +
-    # return_shared_kv_states): "exact forward pattern" must include the
-    # flags — they demonstrably perturb numerics under offload, and a
-    # flag-mismatched reference would blame the loop for it (review
-    # wf_31d5f03b finding 10)
-    out = target(input_ids=ids[:, -1:], past_key_values=cache,
-                 use_cache=True, output_hidden_states=True,
-                 return_shared_kv_states=True)
+    # SAME kwargs as run_arm's forwards via the shared trunk_kwargs owner
+    # — including the OFFLOAD GATING of return_shared_kv_states (a
+    # hand-copied always-on flag here ran the documented corruption path
+    # in the reference while the loop omitted it, so the gate blamed the
+    # loop; review a15f950a finding 1)
+    kw = trunk_kwargs(offload)
+    out = target(input_ids=ids[:, -1:], past_key_values=cache, **kw)
     toks = [int(out.logits[0, -1].argmax(-1).item())]
     while len(toks) < max_new:
         out = target(input_ids=torch.tensor([[toks[-1]]], device=ids.device),
-                     past_key_values=cache, use_cache=True,
-                     output_hidden_states=True,
-                     return_shared_kv_states=True)
+                     past_key_values=cache, **kw)
         toks.append(int(out.logits[0, -1].argmax(-1).item()))
     return toks
 
@@ -248,6 +334,18 @@ _OOM_DUMPED = False
 def _st(s):
     global _LAST_STAGE
     _LAST_STAGE = s
+
+
+def trunk_kwargs(offload):
+    """THE single owner of trunk-forward kwargs. Five call sites drifted
+    twice under hand-copying (reviews wf_8f9b74c6/wf_31d5f03b, then the
+    offload gating desync): under --offload, return_shared_kv_states
+    corrupts the trunk forward itself (see shared_kv_from_cache), so the
+    flag is gated identically for the LOOP and its parity REFERENCE."""
+    kw = {"use_cache": True, "output_hidden_states": True}
+    if not offload:
+        kw["return_shared_kv_states"] = True
+    return kw
 
 
 def make_cache(target, offload):
@@ -293,9 +391,7 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
     """
     dev = ids.device
     cache = make_cache(target, offload)
-    # under offload, NEVER pass return_shared_kv_states — it corrupts the
-    # trunk forward (see shared_kv_from_cache); read the cache instead
-    kvflag = {} if offload else {"return_shared_kv_states": True}
+    kw = trunk_kwargs(offload)  # owns the offload kvflag gating
 
     def grab_kv(o):
         return cap_sliding(shared_kv_from_cache(target, cache) if offload
@@ -308,8 +404,7 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
     _st("prefill_bulk")
     bulk_prefill(target, ids[:, :-1], cache, chunk)
     _st("prefill_last")
-    out = target(input_ids=ids[:, -1:], past_key_values=cache,
-                 use_cache=True, output_hidden_states=True, **kvflag)
+    out = target(input_ids=ids[:, -1:], past_key_values=cache, **kw)
     pending_logit = out.logits[:, -1]
     last_hidden = out.hidden_states[-1][:, -1:]
     kv = grab_kv(out)
@@ -324,6 +419,14 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
     rounds = drafted = accepted = bonus_ct = 0
     call_ms = []
     g_call = 0  # global drafter-call counter (deltaN cadence)
+    corr = None
+    corr_n = 0
+    hooks = []
+    if arm.startswith("deltacorr"):
+        corr = DeltaCorrState()
+        corr_n = int(arm[len("deltacorr"):])
+        hooks = [m.register_forward_hook(corr.hook, with_kwargs=True)
+                 for m in full_attn_modules(assistant)]
     while len(validated) - ids.shape[1] < max_new:
         L = len(validated)
         # kv from the last 1-token forward covers EXACTLY the L-1
@@ -337,26 +440,57 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
         drafts = []
         h = last_hidden
         t = last_tok
+        moved_sparse = None  # per-round memo (kv frozen within a round)
         for c in range(k_drafts):
             _st("draft_call")
             emb = embed(t)
             inp = torch.cat([emb, h], dim=-1)
-            view = arm_view(kv_c, arm, g_call)  # OUTSIDE the timed window
-            g_call += 1                         # (review wf_4081ce31)
-            if view is kv_c:  # full read: identical every call this round
-                if moved_full is None:
-                    moved_full = kv_to_dev(view, dev)
-                view = moved_full
+            if corr is not None:
+                # deltacorr: cadence is PER ROUND (kv frozen within a
+                # round -> delta staleness is pure query drift); anchor
+                # on round-call 0 and every corr_n-th call after
+                if moved_sparse is None:
+                    moved_sparse = kv_to_dev(sparse_view(kv_c), dev)
+                anchor = (c % corr_n == 0)
+                if anchor and moved_full is None:
+                    moved_full = kv_to_dev(kv_c, dev)
+                view = moved_full if anchor else moved_sparse
             else:
-                view = kv_to_dev(view, dev)
+                view = arm_view(kv_c, arm, g_call)  # OUTSIDE timed window
+                if view is kv_c:  # full read: identical each call
+                    if moved_full is None:
+                        moved_full = kv_to_dev(view, dev)
+                    view = moved_full
+                else:
+                    view = kv_to_dev(view, dev)
+            g_call += 1                             # (review wf_4081ce31)
             torch.cuda.synchronize()
             tt0 = time.monotonic()
+            if corr is not None:
+                corr.mode = "apply" if not anchor else "off"
             o = assistant(inputs_embeds=inp, attention_mask=None,
                           position_ids=pos,
                           shared_kv_states=view,
                           use_cache=False)
             torch.cuda.synchronize()
             call_ms.append((time.monotonic() - tt0) * 1000)
+            if corr is not None and anchor:
+                # bookkeeping (UNtimed — the timed call above produced the
+                # draft): capture full-attn outputs under full then sparse
+                # view for the SAME input, delta = full - sparse
+                corr.mode = "capture"
+                corr.buf = {}
+                assistant(inputs_embeds=inp, attention_mask=None,
+                          position_ids=pos, shared_kv_states=moved_full,
+                          use_cache=False)
+                full_buf = corr.buf
+                corr.buf = {}
+                assistant(inputs_embeds=inp, attention_mask=None,
+                          position_ids=pos, shared_kv_states=moved_sparse,
+                          use_cache=False)
+                corr.delta = {mid: full_buf[mid] - corr.buf[mid]
+                              for mid in full_buf}
+                corr.mode = "off"
             t = o.logits.argmax(dim=-1)
             h = o.last_hidden_state
             drafts.append(int(t.item()))
@@ -370,8 +504,7 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
         for d in drafts:
             _st("verify_step")
             vout = target(input_ids=torch.tensor([[cur]], device=dev),
-                          past_key_values=cache, use_cache=True,
-                          output_hidden_states=True, **kvflag)
+                          past_key_values=cache, **kw)
             nxt = int(vout.logits[0, -1].argmax(-1).item())
             last_hidden = vout.hidden_states[-1][:, -1:]
             kv = grab_kv(vout)
@@ -384,8 +517,7 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
         else:  # every draft matched: one more step for the bonus
             _st("verify_step")
             vout = target(input_ids=torch.tensor([[cur]], device=dev),
-                          past_key_values=cache, use_cache=True,
-                          output_hidden_states=True, **kvflag)
+                          past_key_values=cache, **kw)
             bonus = int(vout.logits[0, -1].argmax(-1).item())
             last_hidden = vout.hidden_states[-1][:, -1:]
             kv = grab_kv(vout)
@@ -394,6 +526,8 @@ def run_arm(target, assistant, embed, ids, arm, k_drafts, max_new,
         validated.extend(drafts[:n_match] + [bonus])
         newest = bonus
 
+    for hk in hooks:
+        hk.remove()
     new_tokens = validated[ids.shape[1]:]
     # warm mean drops the first timed call: after the inter-arm
     # empty_cache every arm's call 0 pays allocator-pool growth (and
@@ -449,7 +583,15 @@ def main():
     if not has_data:
         w.writerow(HEADER)
 
+    def status_row(tier_, i_, arm_, ptoks, status):
+        # single owner of the non-numeric row shape: the padded template
+        # previously lived in two copies (review a15f950a finding 7)
+        w.writerow([tier_, i_, arm_, ptoks, status] +
+                   [""] * (len(HEADER) - 6) + [run.id])
+        fh.flush()
+
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    validate_arms(arms)  # typos used to silently run as 'sparse'
     if "full" in arms:  # pairing anchor must run first — every other
         arms.remove("full")  # arm's rows are interpreted against it
         arms.insert(0, "full")
@@ -563,6 +705,7 @@ def main():
 
             ref_tokens = None
             full_oomed = False
+            prompt_oomed = False
             for arm in arms:
                 try:
                     r = run_arm(target, assistant, embed, ids, arm,
@@ -578,10 +721,8 @@ def main():
                             and not isinstance(e, torch.cuda.OutOfMemoryError)
                             and "out of memory" not in str(e).lower()):
                         raise
-                    w.writerow([tier, i, arm, ids.shape[1],
-                                f"OOM@{_LAST_STAGE}"] +
-                               [""] * (len(HEADER) - 6) + [run.id])
-                    fh.flush()
+                    status_row(tier, i, arm, ids.shape[1],
+                               f"OOM@{_LAST_STAGE}")
                     print(f"[g1] tier {tier} #{i} {arm}: OOM at stage "
                           f"{_LAST_STAGE}: {str(e)[:200]}", flush=True)
                     global _OOM_DUMPED
@@ -604,6 +745,7 @@ def main():
                 gc.collect()
                 torch.cuda.empty_cache()
                 if oomed:
+                    prompt_oomed = True
                     if arm == "full":
                         # no pairing anchor for this prompt: the other
                         # arms' rows would enter per-arm means UNPAIRED
@@ -611,10 +753,8 @@ def main():
                         # (review wf_31d5f03b finding 7) — skip them,
                         # visibly
                         for a2 in arms[arms.index(arm) + 1:]:
-                            w.writerow([tier, i, a2, ids.shape[1],
-                                        "SKIPPED-no-full-pair"] +
-                                       [""] * (len(HEADER) - 6) + [run.id])
-                        fh.flush()
+                            status_row(tier, i, a2, ids.shape[1],
+                                       "SKIPPED-no-full-pair")
                         print(f"[g1] tier {tier} #{i}: remaining arms "
                               "SKIPPED (full arm OOM'd — no pair)",
                               flush=True)
@@ -643,6 +783,17 @@ def main():
                 print(f"[g1] tier {tier} #{i} {arm}: acc/round {apr:.2f} "
                       f"rate {rate:.2f} draft-call {r['draft_call_ms']:.1f}ms",
                       flush=True)
+
+            if prompt_oomed and not full_oomed:
+                # a NON-full arm OOM'd after full's row was flushed: mark
+                # the prompt so aggregation excludes it — one-directional
+                # pairing left full's mean including prompts the other
+                # arms' means excluded (review a15f950a finding 3).
+                # Aggregate rule: drop any (tier, idx) with a marker row.
+                status_row(tier, i, "PROMPT-UNPAIRED", ids.shape[1],
+                           "drop this prompt from per-arm means")
+                print(f"[g1] tier {tier} #{i}: marked UNPAIRED (a non-full "
+                      "arm OOM'd)", flush=True)
 
             if args.parity_check:
                 if ref_tokens is None:  # BEFORE the expensive reference

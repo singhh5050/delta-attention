@@ -1114,11 +1114,13 @@ if [ -n "$GEMMA4G1" ]; then
   # (32K/65K would only churn OOM rows). Box 44's "16K wall" was
   # allocator litter across 48 arm runs, fixed by the b156083 cleanup.
   # Smoke gates: parity (zero-tolerance vs shape-aligned plain greedy),
-  # native cross-check, and the acceptance anchor:
-  # smoke acceptance anchor AT SMOKE PARAMS (max_new 64, n=2): full-arm
-  # acc/round ~1.48 @4K, ~1.17 @8K (box-46 recert). Do NOT compare to
-  # the n=6/max_new-128 table values (1.97/1.18) — different params
-  # read lower/differently; a large drop vs 1.48/1.17 is the regression.
+  # native cross-check. NOTE on acceptance in the smoke logs: at n=2 /
+  # max_new 64 the per-prompt spread is huge (box-46 recert: 1.481/1.200
+  # at 4K, 1.172/1.462 at 8K) — there is NO usable numeric anchor at
+  # smoke params (review a15f950a: quoting single-prompt values here
+  # false-flagged healthy runs). The smoke stage gates on parity + the
+  # native cross-check ONLY; acceptance regressions are judged from the
+  # n=6 arms tables, never the smoke rows.
   stage "g1-smoke:running"
   "$G4PY" eval/gemma4_g1_eval.py --n 2 --tiers 4096,8192 --max-new 64 \
     --arms full --parity-check --out results/g1_smoke.csv \

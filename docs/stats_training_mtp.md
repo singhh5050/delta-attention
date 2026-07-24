@@ -521,7 +521,8 @@ independent short-context native-assisted cross-check 32/32.
   shares the offloaded cache + cap_sliding path with the loop (self-
   referential — a trunk-side semantics shift under the uncapped cache
   would be invisible to it); the offload-path anchor is the 4K/8K smoke,
-  whose full-arm acc/round must reproduce 92y2luja (4K 1.97, 8K 1.18).
+  smoke logs have NO usable acceptance anchor (n=2 spread 1.17-1.48;
+  see run_wp.sh gemma4g1 comment) — judge acceptance from n=6 tables.
   Do NOT compare 16K+ absolute draft-ms against the non-offloaded 4K/8K
   rows; within-tier arm gaps are the valid comparison.
 
