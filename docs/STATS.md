@@ -1,7 +1,10 @@
 # STATS — the single results ledger
 
 Every headline number in this project, with its wandb run ID. Raw CSVs
-are triple-archived (wandb run + box_final_state artifact + rescue/).
+are triple-archived: the wandb run, the run's box_final_state artifact,
+and a local rescue/ archive. NOTE: rescue/ paths below refer to the
+operator's LOCAL archive, not this repo — external readers should pull
+the box_final_state artifact of the cited run instead.
 Conventions: raw numbers only; paired = per-chunk/per-sample diffs on
 identical inputs, mean ± sem. Quick reference: PROJECT_CHEATSHEET.md;
 how to rerun anything: ../REPRODUCING.md.
@@ -534,7 +537,7 @@ independent short-context native-assisted cross-check 32/32.
   rows; within-tier arm gaps are the valid comparison.
 
 ### V2. 16K extension CERTIFIED (07-22 evening, box 46, runs dmeohmup
-### smoke / xxk5nkqv arms @fa3bf57; CSVs rescue/2026-07-22-g1-16k/)
+### smoke / xxk5nkqv arms @fa3bf57; CSVs archived OUTSIDE the repo: wandb box-46 box_final_state artifact + local rescue archive)
 
 The ≥16K campaign burned three strategies before landing (full incident
 log in the campaign memory + commits 7d99331/db29d06/408b167/99ad69d):

@@ -1,5 +1,0 @@
-tier,idx,arm,prompt_toks,rounds,drafted,accepted,acc_per_round,acc_rate,bonus,total_new,draft_call_ms,draft_call_ms_warm,match_vs_full,run_id
-4096,0,full,4125,27,135,40,1.481,0.296,27,68,4.43,4.43,,dmeohmup
-4096,1,full,4124,30,150,36,1.200,0.240,30,67,4.40,4.40,,dmeohmup
-8192,0,full,8221,29,145,34,1.172,0.234,29,64,5.03,5.03,,dmeohmup
-8192,1,full,8220,26,130,38,1.462,0.292,26,65,5.01,5.01,,dmeohmup
