@@ -85,11 +85,8 @@ bash env/setup.sh            # installs pins, verifies hip-attn + HF access,
 
 ```bash
 # Gate 2 — single-sample end-to-end through the real server + RULER client:
-python eval/smoke_e2e.py
-
-# Gate 3 — smoke mini-matrix (4K, 3 tasks, 50 samples) + assertions:
-python eval/run_matrix.py --configs night1_all --smoke
-python eval/check_smoke.py
+python -m pytest tests/  # offline gates
+# full reproduction guide for the fork's results: REPRODUCING.md
 
 # Full runs (only after Gates 1–3 are green):
 python eval/run_matrix.py --configs night1_all

@@ -211,7 +211,7 @@ ${PY} -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punkt_
 # ------------------------------------------------------------ 5. Gate 1
 log "running Gate 1: pytest tests/test_math_identities.py -v (per-test PASS/FAIL below)"
 if ${PY} -m pytest "${REPO_ROOT}/tests/test_math_identities.py" -v; then
-  log "Gate 1 PASS — environment is good. Next: Gate 2 (python eval/smoke_e2e.py)."
+  log "Gate 1 PASS — environment is good. Next: pytest tests/ (offline gates), then see REPRODUCING.md."
 else
   die "Gate 1 FAILED — do not proceed to Gate 2. Write a failure report per WP0 §3."
 fi

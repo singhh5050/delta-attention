@@ -29,41 +29,44 @@ SERVER_FIELDS = frozenset({
     "model_str", "attn_implementation", "mode", "hip_attn_args", "port",
     "host", "trust_remote_code", "temperature", "top_k", "top_p",
     "stop_words", "max_new_tokens", "repetition_penalty", "delta_lambda",
-    "sliding_window", "log_drift",
+    "sliding_window", "log_drift", "checkpoint",
 })
 
 
 def test_yaml_merge_keys_resolve():
+    """experiments.yaml is dumped RESOLVED (no merge anchors since the
+    live-arms prune) — assert the equivalent semantics: every config
+    carries the default fields run_matrix expects."""
     doc = load_experiments()
     by_name = {c["name"]: c for c in doc["configs"]}
-    # merged from defaults:
-    assert by_name["base_delta_g64"]["sliding_window"] == 2048
-    assert by_name["base_delta_g64"]["attn_implementation"] == "window"
-    # overridden per-config:
-    assert by_name["base_dense_fa2"]["attn_implementation"] == "flash_attention_2"
-    assert by_name["base_dense_fa2"]["mode"] == "none"
-    assert by_name["t1_fixed_g32"]["delta_lambda"] == 32
-    assert by_name["t3_delta_dec_g16"]["decode_mode"] == "delta"
+    assert by_name["p32_delta_g64"]["sliding_window"] == 2048
+    assert by_name["p32_delta_g64"]["attn_implementation"] == "window"
+    assert by_name["p32_dense_fa2"]["mode"] == "none"
+    assert by_name["p32_ft32k_delta"]["checkpoint"] == \
+        "checkpoints/pilot_delta_32k"
+    for c in doc["configs"]:
+        for field in ("mode", "delta_lambda", "context_lengths", "tasks"):
+            assert field in c, (c["name"], field)
 
 
 def test_group_and_name_resolution():
     doc = load_experiments()
-    names = resolve_config_names(doc, "night1_all")
-    assert names == doc["groups"]["night1_all"]
+    names = resolve_config_names(doc, "ruler32k")
+    assert names == doc["groups"]["ruler32k"]
     # mixing group + name dedupes while preserving order:
-    mixed = resolve_config_names(doc, "base_delta_g64,night1_all")
-    assert mixed[0] == "base_delta_g64"
-    assert len(mixed) == len(set(mixed)) == len(doc["groups"]["night1_all"])
+    mixed = resolve_config_names(doc, "p32_dense_fa2,ruler32k")
+    assert mixed[0] == "p32_dense_fa2"
+    assert len(mixed) == len(set(mixed)) == len(doc["groups"]["ruler32k"])
     assert set(resolve_config_names(doc, "all")) == {c["name"] for c in doc["configs"]}
     with pytest.raises(SystemExit):
         resolve_config_names(doc, "no_such_config")
 
 
 def test_smoke_overrides():
-    rows_full = load_configs("base_delta_g64", smoke=False)
-    rows_smoke = load_configs("base_delta_g64", smoke=True)
+    rows_full = load_configs("p32_delta_g64", smoke=False)
+    rows_smoke = load_configs("p32_delta_g64", smoke=True)
     full, smoke = rows_full[0], rows_smoke[0]
-    assert full["context_lengths"] == [4096, 32768, 131072]
+    assert full["context_lengths"] == [32768]  # arm-level override
     assert smoke["context_lengths"] == [4096]
     assert smoke["n_samples"] == 50
     assert set(smoke["tasks"]) == {"niah_single_1", "niah_multikey_2", "qa_1"}
@@ -76,13 +79,13 @@ def test_smoke_overrides():
 
 
 def test_implicit_defaults_applied():
-    row = load_configs("base_delta_g64", smoke=False)[0]
+    row = load_configs("p32_delta_g64", smoke=False)[0]
     for k, v in IMPLICIT_ROW_DEFAULTS.items():
         assert row[k] == v
 
 
 def test_mode_none_maps_to_fa2_delta():
-    row = load_configs("base_dense_fa2", smoke=False)[0]
+    row = load_configs("p32_dense_fa2", smoke=False)[0]
     cmd, passed, unknown, notes = build_server_cmd(row, 1234, SERVER_FIELDS)
     assert passed["mode"] == "delta"
     assert passed["attn_implementation"] == "flash_attention_2"
@@ -97,7 +100,7 @@ def test_mode_none_maps_to_fa2_delta():
 
 
 def test_unknown_keys_recorded_not_passed():
-    row = load_configs("base_delta_g64", smoke=False)[0]
+    row = load_configs("p32_delta_g64", smoke=False)[0]
     cmd, passed, unknown, _ = build_server_cmd(row, 1234, SERVER_FIELDS)
     # decode_mode / stride_policy are not (yet) Config fields:
     assert "decode_mode" in unknown and "stride_policy" in unknown
@@ -108,8 +111,8 @@ def test_unknown_keys_recorded_not_passed():
 def test_bool_flags_are_presence_only():
     # argparse_dataclass bools are store_true flags: "--log-drift True" is a
     # parse error, so True -> bare flag, False -> omitted entirely.
-    on = load_configs("base_delta_g64", smoke=False)[0]   # log_drift: true
-    off = load_configs("base_delta_g128", smoke=False)[0]  # log_drift: false (default)
+    on = load_configs("p32_delta_g64", smoke=False)[0]   # log_drift: true
+    off = load_configs("p32_ft32k_delta", smoke=False)[0]  # log_drift: false
     cmd_on, passed_on, _, _ = build_server_cmd(on, 1234, SERVER_FIELDS)
     cmd_off, passed_off, _, _ = build_server_cmd(off, 1234, SERVER_FIELDS)
     assert passed_on["log_drift"] is True and passed_off["log_drift"] is False
@@ -143,24 +146,25 @@ def test_aggregate_drift():
 
 
 def test_unsupported_detection():
+    """Every LIVE arm must be runnable against the server's Config surface;
+    a synthetic row with a field the server lacks must be flagged (the
+    WP-era arms that exercised real unsupported fields are retired)."""
     rows = {r["name"]: r for r in load_configs("all", smoke=False)}
-    assert unsupported_reason(rows["base_delta_g64"], SERVER_FIELDS) is None
-    assert unsupported_reason(rows["base_dense_fa2"], SERVER_FIELDS) is None
-    assert "WP-3" in unsupported_reason(rows["t3_delta_dec_g16"], SERVER_FIELDS)
-    assert "WP-1" in unsupported_reason(rows["t1_adaptive_thr95"], SERVER_FIELDS)
-    assert "WP-2" in unsupported_reason(rows["t2_ce_15k_g64"], SERVER_FIELDS)
-    # once the Config field lands, the same row becomes runnable automatically:
-    wp3_fields = SERVER_FIELDS | {"decode_mode", "gamma_dec", "refresh_policy",
-                                  "drift_threshold", "gamma_dec_max", "log_drift"}
-    assert unsupported_reason(rows["t3_delta_dec_g16"], wp3_fields) is None
-
+    for name, row in rows.items():
+        assert unsupported_reason(row, SERVER_FIELDS) is None, name
+    # negative case: a MEANINGFUL non-default field the server surface
+    # lacks (arbitrary unknown keys go through build_server_cmd's unknown
+    # bucket instead — tested separately)
+    fake = dict(rows["p32_delta_g64"], name="fake", decode_mode="delta",
+                gamma_dec=16)
+    assert unsupported_reason(fake, SERVER_FIELDS) is not None
 
 def test_validation_row_schema():
     from delta_attention.validation import ValidationError, validate_config_row
 
     for row in load_configs("all", smoke=False):
         validate_config_row(row)  # every real row must pass
-    good = load_configs("base_delta_g64", smoke=False)[0]
+    good = load_configs("p32_delta_g64", smoke=False)[0]
     with pytest.raises(ValidationError, match="missing"):
         validate_config_row({k: v for k, v in good.items() if k != "mode"})
     with pytest.raises(ValidationError, match="unknown keys"):
@@ -172,14 +176,14 @@ def test_validation_row_schema():
 def test_results_csv_row_shape(tmp_path):
     path = tmp_path / "results.csv"
     ensure_results_csv(path)
-    row = base_result_row(load_configs("base_delta_g64", smoke=False)[0])
+    row = base_result_row(load_configs("p32_delta_g64", smoke=False)[0])
     row.update(status="ok", accuracy=96.5)
     append_result_row(row, path)
     with open(path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     assert len(rows) == 1
     assert list(rows[0]) == CSV_COLUMNS
-    assert rows[0]["config_name"] == "base_delta_g64"
+    assert rows[0]["config_name"] == "p32_delta_g64"
     assert rows[0]["status"] == "ok"
     assert rows[0]["git_sha"] != ""
 

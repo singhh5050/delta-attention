@@ -1,329 +1,125 @@
-# Delta Attention Extensions — Experiment Matrix
-# Agents execute rows verbatim. Editing values = human-only.
-# All configs: model=meta-llama/Llama-3.1-8B-Instruct, seed=0, temperature=0, max_new_tokens=128
-
-defaults: &defaults
-  attn_implementation: window        # Streaming-LLM-style: sink 1024 + sliding window
+# RULER arm definitions — LIVE arms only (the evalgaps ruler32k
+# group). Every retired WP-era arm/group lives in git history;
+# their results are final in docs/STATS.md.
+# NOTE: earlier revisions used YAML merge anchors (<<: *defaults);
+# this file is dumped resolved — run_matrix consumes it identically.
+defaults:
+  attn_implementation: window
   sliding_window: 2048
-  mode: delta                        # prefill mode
-  delta_lambda: 64                   # prefill gamma
-  decode_mode: dense                 # repo default (sdpa_rectangle)
+  mode: delta
+  delta_lambda: 64
+  decode_mode: dense
   stride_policy: fixed
-  context_lengths: [4096, 32768, 131072]
-  tasks: [niah_single_1, niah_single_2, niah_single_3, niah_multikey_1, niah_multikey_2,
-          niah_multikey_3, niah_multivalue, niah_multiquery, vt, fwe, qa_1, qa_2]
+  context_lengths:
+  - 4096
+  - 32768
+  - 131072
+  tasks:
+  - niah_single_1
+  - niah_single_2
+  - niah_single_3
+  - niah_multikey_1
+  - niah_multikey_2
+  - niah_multikey_3
+  - niah_multivalue
+  - niah_multiquery
+  - vt
+  - fwe
+  - qa_1
+  - qa_2
   n_samples: 250
   log_drift: false
-
 smoke_overrides:
-  context_lengths: [4096]
-  tasks: [niah_single_1, niah_multikey_2, qa_1]
+  context_lengths:
+  - 4096
+  tasks:
+  - niah_single_1
+  - niah_multikey_2
+  - qa_1
   n_samples: 50
-
 configs:
-  # ---- baselines (paper reproduction; our Table-1 columns) ----
-  - name: base_dense_fa2
-    <<: *defaults
-    attn_implementation: flash_attention_2
-    mode: none
-    expected_anchor: {4096: 96.7, 32768: 85.8, 131072: 73.2}   # paper Table 1, tolerance ±3pt at full samples
-  - name: base_sparse_only
-    <<: *defaults
-    mode: sparse-only
-    expected_anchor: {4096: 90.5, 32768: 30.3, 131072: 27.5}
-  - name: base_delta_g64
-    <<: *defaults
-    log_drift: true                  # prefill inter-anchor telemetry on
-    expected_anchor: {4096: 96.5, 32768: 81.3, 131072: 64.4}
-  - name: base_delta_g128
-    <<: *defaults
-    delta_lambda: 128
-
-  # ---- Track 3: delta decode (prefill fixed at delta g64) ----
-  - name: t3_sparse_decode
-    <<: *defaults
-    decode_mode: sparse
-  - name: t3_delta_dec_g8
-    <<: *defaults
-    decode_mode: delta
-    gamma_dec: 8
-    refresh_policy: fixed
-    log_drift: true
-  - name: t3_delta_dec_g16
-    <<: *defaults
-    decode_mode: delta
-    gamma_dec: 16
-    refresh_policy: fixed
-    log_drift: true
-  - name: t3_delta_dec_g32
-    <<: *defaults
-    decode_mode: delta
-    gamma_dec: 32
-    refresh_policy: fixed
-    log_drift: true
-  - name: t3_delta_dec_g64
-    <<: *defaults
-    decode_mode: delta
-    gamma_dec: 64
-    refresh_policy: fixed
-    log_drift: true
-  - name: t3_delta_dec_drift90
-    <<: *defaults
-    decode_mode: delta
-    refresh_policy: drift
-    drift_threshold: 0.90
-    gamma_dec_max: 128
-    log_drift: true
-  - name: t3_delta_dec_drift95
-    <<: *defaults
-    decode_mode: delta
-    refresh_policy: drift
-    drift_threshold: 0.95
-    gamma_dec_max: 128
-    log_drift: true
-  - name: t3_latency
-    <<: *defaults
-    decode_mode: delta
-    gamma_dec: 32
-    refresh_policy: fixed
-    log_drift: false               # clean latency numbers
-    context_lengths: [131072]
-    tasks: [niah_single_1]
-    n_samples: 25
-    max_new_tokens: 512
-
-  # ---- Track 1: dynamic stride (decode stays dense) ----
-  - name: t1_fixed_g32
-    <<: *defaults
-    delta_lambda: 32
-  - name: t1_fixed_g256
-    <<: *defaults
-    delta_lambda: 256
-  - name: t1_adaptive_thr90
-    <<: *defaults
-    stride_policy: adaptive
-    adapt_threshold: 0.90
-    gamma_min: 16
-    gamma_max: 256
-    adapt_chunk: 4096
-    log_drift: true
-  - name: t1_adaptive_thr95
-    <<: *defaults
-    stride_policy: adaptive
-    adapt_threshold: 0.95
-    gamma_min: 16
-    gamma_max: 256
-    adapt_chunk: 4096
-    log_drift: true
-  - name: t1_adaptive_thr98
-    <<: *defaults
-    stride_policy: adaptive
-    adapt_threshold: 0.98
-    gamma_min: 16
-    gamma_max: 256
-    adapt_chunk: 4096
-    log_drift: true
-
-  # ---- Track 2: post-training evals (checkpoints from WP-2; run after training) ----
-  - name: t2_ce_15k_g64
-    <<: *defaults
-    checkpoint: CHECKPOINT_PATH_CE_15K
-    log_drift: true
-  - name: t2_ce_15k_g128
-    <<: *defaults
-    delta_lambda: 128
-    checkpoint: CHECKPOINT_PATH_CE_15K
-  - name: t2_distill_15k_g64
-    <<: *defaults
-    checkpoint: CHECKPOINT_PATH_DISTILL_15K
-    log_drift: true
-  - name: t2_distill_15k_g128
-    <<: *defaults
-    delta_lambda: 128
-    checkpoint: CHECKPOINT_PATH_DISTILL_15K
-
-  # ---- PoC-32K (user-approved 2026-07-07): first real-signal runs for all
-  # inference tracks at the context length where drift is smooth (cos 0.6-0.7).
-  # thr60 is the data-informed adaptive threshold (measured drift means);
-  # thr95 (the original spec value) is retained as the collapse-to-min arm.
-  - name: p32_dense_fa2
-    <<: *defaults
-    attn_implementation: flash_attention_2
-    mode: none
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_delta_g64
-    <<: *defaults
-    log_drift: true
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_fixed_g256
-    <<: *defaults
-    delta_lambda: 256
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_adaptive_thr60
-    <<: *defaults
-    stride_policy: adaptive
-    adapt_threshold: 0.60
-    gamma_min: 16
-    gamma_max: 256
-    adapt_chunk: 4096
-    log_drift: true
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_adaptive_thr95
-    <<: *defaults
-    stride_policy: adaptive
-    adapt_threshold: 0.95
-    gamma_min: 16
-    gamma_max: 256
-    adapt_chunk: 4096
-    log_drift: true
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_sparse_decode
-    <<: *defaults
-    decode_mode: sparse
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_delta_dec_g16
-    <<: *defaults
-    decode_mode: delta
-    gamma_dec: 16
-    refresh_policy: fixed
-    log_drift: true
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  # falsification test (user-approved 2026-07-08): anchors are provably exact
-  # (all 753 telemetry anchor rows cos=1.0), so gamma_dec=1 MUST reproduce
-  # dense decode (76.7). ~76 = pipeline exonerated; ~25 = off-anchor bug.
-  - name: p32_delta_dec_g1
-    <<: *defaults
-    decode_mode: delta
-    gamma_dec: 1
-    refresh_policy: fixed
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  # staleness curve (user-approved 2026-07-08): how fast does decode accuracy
-  # decay with delta staleness between the exact g1 (78.0) and g16 (24.7)?
-  - name: p32_delta_dec_g2
-    <<: *defaults
-    decode_mode: delta
-    gamma_dec: 2
-    refresh_policy: fixed
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_delta_dec_g4
-    <<: *defaults
-    decode_mode: delta
-    gamma_dec: 4
-    refresh_policy: fixed
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_delta_dec_g8
-    <<: *defaults
-    decode_mode: delta
-    gamma_dec: 8
-    refresh_policy: fixed
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_delta_dec_g64
-    <<: *defaults
-    decode_mode: delta
-    gamma_dec: 64
-    refresh_policy: fixed
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-
-  # WP-2 post-training eval (user-approved 2026-07-09, per Jeff's feedback):
-  # trained CE-pilot adapter served through the pipeline vs base, at gamma 64
-  # and 128 (tolerance-for-coarser-stride test). Adapter fetched from wandb.
-  - name: p32_base_g128
-    <<: *defaults
-    delta_lambda: 128
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_t2ce_g64
-    <<: *defaults
-    checkpoint: checkpoints/pilot_delta
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_t2ce_g128
-    <<: *defaults
-    delta_lambda: 128
-    checkpoint: checkpoints/pilot_delta
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-
-  # per Jeff (2026-07-09): retry delta decode with the finetuned model
-  - name: p32_t2ce_dec_g2
-    <<: *defaults
-    checkpoint: checkpoints/pilot_delta
-    decode_mode: delta
-    gamma_dec: 2
-    refresh_policy: fixed
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_t2ce_dec_g16
-    <<: *defaults
-    checkpoint: checkpoints/pilot_delta
-    decode_mode: delta
-    gamma_dec: 16
-    refresh_policy: fixed
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-
-  # RULER on the 32K-TRAINED arms (Jeff 07-21: "some real task aside from
-  # just perplexity ... Ruler stays the same"; user-approved 07-22 as eval
-  # gap 2 — the only trained-arm RULER to date was the 8K-era t2eval).
-  # Same tasks/lengths/n as t2eval so rows are comparable across eras.
-  - name: p32_ft32k_delta
-    <<: *defaults
-    checkpoint: checkpoints/pilot_delta_32k
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_ft32k_dense
-    <<: *defaults
-    checkpoint: checkpoints/pilot_dense_32k
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-  - name: p32_ft32k_detach
-    <<: *defaults
-    checkpoint: checkpoints/pilot_detach_32k
-    context_lengths: [32768]
-    tasks: [niah_single_1, niah_multikey_2, qa_1]
-    n_samples: 50
-
+- attn_implementation: flash_attention_2
+  sliding_window: 2048
+  mode: none
+  delta_lambda: 64
+  decode_mode: dense
+  stride_policy: fixed
+  context_lengths:
+  - 32768
+  tasks:
+  - niah_single_1
+  - niah_multikey_2
+  - qa_1
+  n_samples: 50
+  log_drift: false
+  name: p32_dense_fa2
+- attn_implementation: window
+  sliding_window: 2048
+  mode: delta
+  delta_lambda: 64
+  decode_mode: dense
+  stride_policy: fixed
+  context_lengths:
+  - 32768
+  tasks:
+  - niah_single_1
+  - niah_multikey_2
+  - qa_1
+  n_samples: 50
+  log_drift: true
+  name: p32_delta_g64
+- attn_implementation: window
+  sliding_window: 2048
+  mode: delta
+  delta_lambda: 64
+  decode_mode: dense
+  stride_policy: fixed
+  context_lengths:
+  - 32768
+  tasks:
+  - niah_single_1
+  - niah_multikey_2
+  - qa_1
+  n_samples: 50
+  log_drift: false
+  name: p32_ft32k_delta
+  checkpoint: checkpoints/pilot_delta_32k
+- attn_implementation: window
+  sliding_window: 2048
+  mode: delta
+  delta_lambda: 64
+  decode_mode: dense
+  stride_policy: fixed
+  context_lengths:
+  - 32768
+  tasks:
+  - niah_single_1
+  - niah_multikey_2
+  - qa_1
+  n_samples: 50
+  log_drift: false
+  name: p32_ft32k_dense
+  checkpoint: checkpoints/pilot_dense_32k
+- attn_implementation: window
+  sliding_window: 2048
+  mode: delta
+  delta_lambda: 64
+  decode_mode: dense
+  stride_policy: fixed
+  context_lengths:
+  - 32768
+  tasks:
+  - niah_single_1
+  - niah_multikey_2
+  - qa_1
+  n_samples: 50
+  log_drift: false
+  name: p32_ft32k_detach
+  checkpoint: checkpoints/pilot_detach_32k
 groups:
-  t2eval:      [p32_base_g128, p32_t2ce_g64, p32_t2ce_g128, p32_t2ce_dec_g2, p32_t2ce_dec_g16]
-  # base refs (dense ceiling + untrained pipeline) + the three 32K adapters
-  ruler32k:    [p32_dense_fa2, p32_delta_g64, p32_ft32k_delta, p32_ft32k_dense, p32_ft32k_detach]
-  decsweep:    [p32_delta_dec_g2, p32_delta_dec_g4, p32_delta_dec_g8, p32_delta_dec_g64]
-  poc32k:     [p32_dense_fa2, p32_delta_g64, p32_fixed_g256, p32_adaptive_thr60,
-               p32_adaptive_thr95, p32_sparse_decode, p32_delta_dec_g16]
-  night1_all: [base_dense_fa2, base_sparse_only, base_delta_g64, t3_sparse_decode,
-               t3_delta_dec_g16, t3_delta_dec_g32, t3_delta_dec_g64, t1_adaptive_thr95, t1_fixed_g32]
-  t3_full:    [t3_sparse_decode, t3_delta_dec_g8, t3_delta_dec_g16, t3_delta_dec_g32,
-               t3_delta_dec_g64, t3_delta_dec_drift90, t3_delta_dec_drift95, t3_latency]
-  t1_full:    [t1_fixed_g32, base_delta_g64, base_delta_g128, t1_fixed_g256,
-               t1_adaptive_thr90, t1_adaptive_thr95, t1_adaptive_thr98]
+  ruler32k:
+  - p32_dense_fa2
+  - p32_delta_g64
+  - p32_ft32k_delta
+  - p32_ft32k_dense
+  - p32_ft32k_detach

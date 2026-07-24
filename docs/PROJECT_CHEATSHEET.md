@@ -1,7 +1,7 @@
 # Delta Attention — project cheat sheet (as of 2026-07-16)
 
 One page of everything you need cold in a meeting. Every number has a
-source; deep detail lives in `stats_2026-07-15.md`.
+source; deep detail lives in `STATS.md` (Part II for pre-pivot numbers).
 
 ## The mechanism (30-second version)
 

@@ -4,7 +4,7 @@ Three self-contained entry points, in the order you'll likely want them.
 General notes:
 - We log to wandb by default; set `WANDB_MODE=disabled` to run fully
   offline (results still land in the `--out` CSV).
-- All numbers we report are in `docs/stats_training_mtp.md` with run IDs;
+- All numbers we report are in `docs/STATS.md` with run IDs;
   the raw CSVs behind every table are archived per-run.
 
 ## 1. Attention-layer latency ladder (the 12–47× numbers)
@@ -52,7 +52,7 @@ subsequent calls via a forward hook — drafter weights untouched).
 
 Known limits, please read before burning GPU-hours:
 - **16K is the single-80GB ceiling for the 31B trunk** (fit ladder in
-  docs/stats_training_mtp.md §V2: 16K peaks 75.8GB; 32K/65K OOM; CPU
+  docs/STATS.md §V2: 16K peaks 75.8GB; 32K/65K OOM; CPU
   cache offload is upstream-broken — nondeterministic — on current
   transformers main). For 32K+: 2×H100 with `device_map="auto"` should
   lift it, but that path is UNTESTED by us — treat first results as
